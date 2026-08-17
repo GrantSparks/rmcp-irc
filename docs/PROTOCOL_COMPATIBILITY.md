@@ -158,6 +158,11 @@ Requirements:
 - IRC formatting and CTCP are parsed additively without removing original text;
 - server-advertised line limits apply, with 512 bytes including CRLF when none
   is advertised and the configured ceiling always enforced;
+- outbound message text reserves the `:nick!user@host ` prefix the server adds
+  when it relays the line, using the hostmask observed on the self JOIN and
+  falling back to the advertised `NICKLEN`, `USERLEN`, and `HOSTLEN` maxima
+  until one is seen, because a server truncates an overlong relayed line
+  instead of rejecting it;
 - outbound encoding never splits a UTF-8 code point and rejects NUL, CR, LF,
   duplicate tags, reserved bridge tags, invalid middle/trailing structure, and
   overlong output.

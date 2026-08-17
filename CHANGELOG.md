@@ -7,6 +7,14 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ## [Unreleased]
 
+### Fixed
+
+- `irc.send` now reserves the `:nick!user@host ` prefix the server prepends
+  when it relays a message, so text that previously overran the 512-byte body
+  budget is split instead of being silently truncated by the server. The self
+  JOIN echo is recorded as the identity's hostmask so the reservation matches
+  what the server actually sends.
+
 ## [0.1.0] - 2026-08-17
 
 Initial public release.

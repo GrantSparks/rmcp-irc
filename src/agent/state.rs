@@ -284,6 +284,18 @@ impl AgentState {
                     // A self JOIN starts a fresh authoritative membership
                     // snapshot; subsequent NAMES chunks rebuild the set.
                     state.members.clear();
+                    // The echoed JOIN carries the hostmask the server will put
+                    // in front of this identity's relayed messages, which is
+                    // the first authoritative sighting of the rewritten
+                    // username and the resolved host.
+                    if subject.is_none() {
+                        if let Some(username) = &source.user {
+                            self.identity.username = Some(username.clone());
+                        }
+                        if let Some(hostname) = &source.host {
+                            self.identity.hostname = Some(hostname.clone());
+                        }
+                    }
                 }
                 state
                     .members
@@ -597,5 +609,51 @@ mod tests {
         assert_eq!(channel.members["carol"].away, Some(true));
         assert!(state.monitored_presence["alice"]);
         assert!(state.monitored_presence["bob"]);
+    }
+
+    #[test]
+    fn a_self_join_records_the_hostmask_the_server_will_relay() {
+        let isupport = IsupportRegistry::new();
+        let mut state = AgentState::new(AgentId::new(), Timestamp::now());
+        state.identity.nickname = Some("Mnemosyne".into());
+        fn join(state: &mut AgentState, isupport: &IsupportRegistry, line: &str) {
+            let message = wire(line);
+            let projection = crate::irc::semantic::project(&message, isupport);
+            state.reduce(
+                &projection,
+                EventCursor {
+                    stream_id: "stream".into(),
+                    sequence: 1,
+                },
+                isupport.case_mapping(),
+                Timestamp::now(),
+            );
+        }
+
+        join(
+            &mut state,
+            &isupport,
+            ":Mnemosyne!~mcp-agent-f372cdb8-@127.0.0.1 JOIN #control",
+        );
+
+        // The requested username is not what the server relays; only the echoed
+        // JOIN reveals the rewritten form and the resolved host.
+        assert_eq!(
+            state.identity.username.as_deref(),
+            Some("~mcp-agent-f372cdb8-")
+        );
+        assert_eq!(state.identity.hostname.as_deref(), Some("127.0.0.1"));
+
+        join(
+            &mut state,
+            &isupport,
+            ":Fimafeng!~Fimafeng@172.18.0.4 JOIN #control",
+        );
+
+        assert_eq!(
+            state.identity.username.as_deref(),
+            Some("~mcp-agent-f372cdb8-")
+        );
+        assert_eq!(state.identity.hostname.as_deref(), Some("127.0.0.1"));
     }
 }

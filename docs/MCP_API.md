@@ -211,6 +211,13 @@ extension. Splitting occurs only for
 remains visible as `observed_unnegotiated`. Required reply semantics are never
 silently downgraded to plain text.
 
+The active byte limit is the body budget minus the `:nick!user@host ` prefix
+the server prepends when it relays the line, so a message is measured against
+the form other clients receive rather than the shorter form this client writes.
+Until a self JOIN reveals the hostmask, the reservation uses the advertised
+`NICKLEN`, `USERLEN`, and `HOSTLEN` maxima, which can split a message earlier
+than the eventual hostmask strictly requires.
+
 `reply_to` requires negotiated `message-tags` and is encoded as the IRCv3
 client-only `+reply` tag. The full logical text and resulting line count remain
 bounded by `limits.max_message_bytes` and `limits.max_message_parts`.

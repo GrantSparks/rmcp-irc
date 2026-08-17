@@ -563,6 +563,7 @@ impl IrcMcpService {
         let messages = build_send_messages(
             &input,
             snapshot.line_budget.max_body_bytes,
+            relay_prefix_reservation(&snapshot),
             self.gateway.config().limits.max_message_bytes,
             self.gateway.config().limits.max_message_parts,
         )?;
@@ -814,9 +815,17 @@ fn query_message(query: Query) -> Result<OutboundMessage, GatewayError> {
     Ok(message)
 }
 
+/// Split one logical message into lines that survive relay intact.
+///
+/// A client writes prefix-less lines, but the body budget applies to the form
+/// the server relays, which carries `:nick!user@host ` ahead of the command.
+/// `relay_prefix_bytes` reserves that room, because a server that overruns the
+/// budget truncates the tail rather than rejecting the line, and the sender
+/// sees only a successful write.
 fn build_send_messages(
     input: &SendInput,
     max_body_bytes: usize,
+    relay_prefix_bytes: usize,
     max_message_bytes: usize,
     max_message_parts: usize,
 ) -> Result<Vec<OutboundMessage>, GatewayError> {
@@ -859,7 +868,12 @@ fn build_send_messages(
         trailing: Some(String::new()),
     };
     let available = max_body_bytes
-        .checked_sub(template.body_overhead().saturating_add(action_overhead))
+        .checked_sub(
+            template
+                .body_overhead()
+                .saturating_add(action_overhead)
+                .saturating_add(relay_prefix_bytes),
+        )
         .ok_or_else(|| {
             GatewayError::InvalidMessage("target leaves no room for message text".into())
         })?;
@@ -985,6 +999,49 @@ fn history_anchor(anchor: &HistoryAnchor) -> Result<String, GatewayError> {
             Ok(format!("msgid={value}"))
         }
     }
+}
+
+/// Bytes a server prepends to this identity's messages when it relays them.
+///
+/// The observed hostmask is authoritative, and a self JOIN or CHGHOST records
+/// it. Before either is seen the username is still the requested one, which a
+/// server may rewrite (commonly by prefixing `~`), so this falls back to the
+/// advertised maxima instead. Over-reserving only splits a message earlier than
+/// strictly required; under-reserving loses its tail.
+fn relay_prefix_reservation(snapshot: &crate::agent::actor::AgentSnapshot) -> usize {
+    let identity = &snapshot.state.identity;
+    let nickname = identity
+        .nickname
+        .as_ref()
+        .map_or_else(|| isupport_numeric(snapshot, "NICKLEN", 9), String::len);
+    let (username, hostname) = match (&identity.username, &identity.hostname) {
+        (Some(username), Some(hostname)) => (username.len(), hostname.len()),
+        _ => (
+            // One further byte covers the `~` an unidentified username gains.
+            isupport_numeric(snapshot, "USERLEN", 18).saturating_add(1),
+            isupport_numeric(snapshot, "HOSTLEN", 63),
+        ),
+    };
+    // ':' + nickname + '!' + username + '@' + hostname + ' '
+    nickname
+        .saturating_add(username)
+        .saturating_add(hostname)
+        .saturating_add(4)
+}
+
+/// Numeric ISUPPORT token, or `default` until the server advertises one.
+fn isupport_numeric(
+    snapshot: &crate::agent::actor::AgentSnapshot,
+    name: &str,
+    default: usize,
+) -> usize {
+    snapshot
+        .protocol
+        .isupport
+        .get(name)
+        .and_then(|token| token.value.as_deref())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
 }
 
 fn capability_active(snapshot: &crate::agent::actor::AgentSnapshot, feature: &str) -> bool {
@@ -1119,11 +1176,97 @@ mod tests {
             multiline: MultilinePolicy::Split,
             timeout_ms: 1_000,
         };
-        let messages = build_send_messages(&input, 512, 5, 1).expect("message");
+        let messages = build_send_messages(&input, 512, 0, 5, 1).expect("message");
         assert_eq!(messages[0].tags[0].key, "+reply");
         assert!(matches!(
-            build_send_messages(&input, 512, 4, 1),
+            build_send_messages(&input, 512, 4, 4, 1),
             Err(GatewayError::ResourceLimit(_))
+        ));
+    }
+
+    /// Bytes the relayed line spends outside the message text itself.
+    fn relayed_overhead(prefix: &str, target: &str) -> usize {
+        // ':' nick!user@host ' ' + "PRIVMSG" + ' ' + target + " :" + CRLF
+        prefix.len() + 1 + "PRIVMSG".len() + 1 + target.len() + 2 + 2
+    }
+
+    #[test]
+    fn outbound_text_reserves_the_relayed_source_prefix() {
+        let prefix = "Mnemosyne!~mcp-agent-f372cdb8-@127.0.0.1";
+        let target = "#control";
+        let reservation = prefix.len() + 4;
+        let text = "y".repeat(463);
+        let input = SendInput {
+            agent_id: crate::agent::AgentId::new(),
+            target: target.parse().expect("target"),
+            kind: SendKind::Privmsg,
+            text: Some(text.clone()),
+            tags: Vec::new(),
+            reply_to: None,
+            multiline: MultilinePolicy::Split,
+            timeout_ms: 1_000,
+        };
+
+        // Without the reservation this text fits one line, which is exactly how
+        // the tail used to be lost: 463 bytes clears the 492-byte prefix-less
+        // budget, then the relayed line overruns 512 and the server trims it.
+        let unreserved = build_send_messages(&input, 512, 0, 64 * 1024, 256).expect("unreserved");
+        assert_eq!(unreserved.len(), 1);
+        assert!(relayed_overhead(prefix, target) + text.len() > 512);
+
+        let messages = build_send_messages(&input, 512, reservation, 64 * 1024, 256).expect("send");
+        assert_eq!(messages.len(), 2);
+        let carried: String = messages
+            .iter()
+            .map(|message| message.trailing.clone().expect("trailing"))
+            .collect();
+        assert_eq!(carried, text);
+        for message in &messages {
+            let body = message.trailing.as_deref().expect("trailing").len();
+            assert!(
+                relayed_overhead(prefix, target) + body <= 512,
+                "relayed line must fit the server's body budget"
+            );
+        }
+    }
+
+    #[test]
+    fn an_action_reserves_its_ctcp_wrapper_alongside_the_prefix() {
+        let prefix = "Mnemosyne!~mcp-agent-f372cdb8-@127.0.0.1";
+        let target = "#control";
+        let input = SendInput {
+            agent_id: crate::agent::AgentId::new(),
+            target: target.parse().expect("target"),
+            kind: SendKind::Action,
+            text: Some("z".repeat(600)),
+            tags: Vec::new(),
+            reply_to: None,
+            multiline: MultilinePolicy::Split,
+            timeout_ms: 1_000,
+        };
+        let messages =
+            build_send_messages(&input, 512, prefix.len() + 4, 64 * 1024, 256).expect("send");
+        for message in &messages {
+            let body = message.trailing.as_deref().expect("trailing").len();
+            assert!(relayed_overhead(prefix, target) + body <= 512);
+        }
+    }
+
+    #[test]
+    fn a_reservation_that_swallows_the_budget_is_rejected_not_truncated() {
+        let input = SendInput {
+            agent_id: crate::agent::AgentId::new(),
+            target: "#control".parse().expect("target"),
+            kind: SendKind::Privmsg,
+            text: Some("hello".into()),
+            tags: Vec::new(),
+            reply_to: None,
+            multiline: MultilinePolicy::Split,
+            timeout_ms: 1_000,
+        };
+        assert!(matches!(
+            build_send_messages(&input, 512, 512, 64 * 1024, 256),
+            Err(GatewayError::InvalidMessage(_))
         ));
     }
 }
