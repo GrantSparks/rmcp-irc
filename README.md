@@ -30,7 +30,7 @@ connection, state snapshot, and bounded event stream.
 - Correlated command replies, caller-owned event cursors, and explicit stream
   reset and retention-gap handling.
 - Equivalent stdio and Streamable HTTP surfaces, with HTTP agent/watch handles
-  isolated by bearer identity or MCP session.
+  isolated by authenticated bearer identity.
 - Reconnection, channel restoration, state resynchronization, and history
   recovery when the server supports it.
 - Bounded in-memory queues, journals, collectors, and DCC sessions.
@@ -44,9 +44,9 @@ policy, and retained history.
 > [!IMPORTANT]
 > Streamable HTTP binds every agent and watch handle to its caller. Configure
 > repeatable `--http-bearer-token` values for durable authenticated identities;
-> without them, callers are isolated by MCP session. Non-loopback binding still
-> requires an explicit trusted-network opt-in and allowed Host values. Agent
-> IDs remain routing handles, not credentials.
+> without them the endpoint is trusted and every caller shares one local owner.
+> Non-loopback binding still requires an explicit trusted-network opt-in and
+> allowed Host values. Agent IDs remain routing handles, not credentials.
 
 ## Quick start
 
@@ -172,9 +172,10 @@ Both transports expose the same service. Every operation after `irc.connect`
 requires an explicit `agent_id`; an HTTP connection is not an IRC identity.
 For shared HTTP, pass one or more `--http-bearer-token TOKEN` options and send
 the corresponding `Authorization: Bearer TOKEN` header. Each token sees and
-operates only its own agents, watches, and resources. Without configured
-tokens, separate MCP sessions remain isolated but have no durable identity
-across a session restart. Browser `Origin` requests are denied unless explicitly
+operates only its own agents, watches, and resources, and keeps that identity
+across process restarts. Without configured tokens there is nothing to separate
+callers by — this protocol revision has no sessions — so every caller shares the
+single local owner. Browser `Origin` requests are denied unless explicitly
 allowlisted. A trusted container-network deployment must additionally pass
 `--allow-unauthenticated-network --allow-host HOST`; the bundled image already
 does this for its `irc` network alias. HTTP responses are marked

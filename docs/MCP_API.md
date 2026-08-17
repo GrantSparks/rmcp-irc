@@ -36,17 +36,24 @@ connection is never an IRC identity.
 ### Caller ownership
 
 Stdio has one trusted local owner. Streamable HTTP identifies an owner by an
-accepted bearer token when `--http-bearer-token` is configured, or otherwise
-by the MCP session. Agent and watch handles are bound to that owner: other
-owners cannot list, read, subscribe to, or operate them, and an unauthorized
-handle is reported exactly like a missing one. This prevents a handle from
-becoming a bearer credential or an existence oracle.
+accepted bearer token when `--http-bearer-token` is configured; without
+configured tokens the endpoint is a trusted single-caller endpoint and exposes
+that same one shared local owner. Agent and watch handles are bound to their
+owner: other owners cannot list, read, subscribe to, or operate them, and an
+unauthorized handle is reported exactly like a missing one. This prevents a
+handle from becoming a bearer credential or an existence oracle.
 
-Bearer ownership is durable across MCP sessions that present the same token;
-session-only ownership is not. HTTP responses use `Cache-Control: private,
-no-store` because their contents are caller-specific. These checks are MCP
-caller authorization only; Ergo remains authoritative for IRC accounts,
-channel privileges, and command policy.
+Identity is evaluated per request and is always a credential. This protocol
+revision has no session, so nothing about a previous request on the same
+connection contributes; a bearer token is the only durable principal, and it is
+durable across process restarts. The `clientInfo` and `clientCapabilities` a
+request declares in `_meta` are self-reported and never authorization identity.
+Configure bearer credentials before sharing an endpoint: separating callers
+requires one.
+
+HTTP responses use `Cache-Control: private, no-store` because their contents are
+caller-specific. These checks are MCP caller authorization only; Ergo remains
+authoritative for IRC accounts, channel privileges, and command policy.
 
 ## Errors and command outcomes
 
@@ -228,7 +235,7 @@ sessions closed.
 
 Input contains `agent_id` and optional `result_detail`, which defaults to
 `compact`. Returns `{ state, advertised_capabilities, negotiated_capabilities,
-events, resources, result_detail }`. `state` contains the `agent_id`,
+events, resources, result_detail, caller }`. `state` contains the `agent_id`,
 connection/registration and reconnect state, identity, joined channels, latest
 MOTD, reducer cursor, and last error. In compact mode the latest MOTD retains
 its status, joined text, source, and receive time while its duplicate `lines`
@@ -249,6 +256,15 @@ journal's eviction accounting: `retained_events`, `retained_bytes`,
 sampling them twice tells a caller whether the window moved under it between
 reads. See
 [EVENTS_AND_STATE.md](EVENTS_AND_STATE.md#retention-and-backpressure).
+
+`caller` reports what the calling request declared about itself:
+`protocol_version`, whether the required `_meta` was complete
+(`request_metadata_complete`), the declared extension ids (`extensions`),
+whether form-mode elicitation was declared (`form_elicitation`), and whether a
+progress token was supplied (`progress_requested`). Because capabilities travel
+per request, this is the way to tell a capability the server declined to use from
+one that never reached it. These values are self-reported diagnostics and are
+never an authorization identity.
 
 ## Channel and messaging tools
 
@@ -570,9 +586,10 @@ resources are visible only to their caller owner.
 
 Contains the same connection/protocol summary as `irc.status`, including
 reconnect state with its scheduled `next_attempt_at`, the journal's retention
-and eviction accounting under `events`, and stable resource links. Resource
-reads are explicitly lossless and therefore include the complete MOTD state
-regardless of the tool's default compact detail.
+and eviction accounting under `events`, and stable resource links — but not the
+tool's `caller` field, which describes the calling request rather than the
+guest. Resource reads are explicitly lossless and therefore include the
+complete MOTD state regardless of the tool's default compact detail.
 
 This resource is notified on every connection-lifecycle transition, on every
 change to the reconnect schedule, and whenever a journal-pressure record is

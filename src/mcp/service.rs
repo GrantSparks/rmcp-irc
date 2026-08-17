@@ -18,10 +18,10 @@ use rmcp::{
         Annotations, CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
         CompleteRequestParams, CompleteResult, CompletionInfo, ContentBlock, CreateTaskResult,
         GetTaskParams, GetTaskResult, Implementation, ListResourceTemplatesResult,
-        ListResourcesResult, PaginatedRequestParams, PromptMessage, ReadResourceRequestParams,
-        ReadResourceResponse, ReadResourceResult, Reference, Resource, ResourceContents,
-        ResourceTemplate, Role, ServerCapabilities, ServerInfo, SubscriptionFilter,
-        TASKS_EXTENSION_ID, UpdateTaskParams,
+        ListResourcesResult, PaginatedRequestParams, PromptMessage, ProtocolVersion,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Reference, Resource,
+        ResourceContents, ResourceTemplate, Role, ServerCapabilities, ServerInfo,
+        SubscriptionFilter, TASKS_EXTENSION_ID, UpdateTaskParams,
     },
     prompt, prompt_handler, prompt_router,
     service::{RequestContext, RoleServer, SubscriptionContext},
@@ -49,6 +49,7 @@ use crate::{
     },
     mcp::{
         authorization::{CallerPolicy, OwnerId},
+        request_profile::RequestProfile,
         resources::{
             AgentResourceUri, ResourceDescriptor, ResourceKind, ResourcePayload, ResourceUris,
             describe as describe_resource, descriptors_for_agent, encode_channel_segment,
@@ -92,6 +93,9 @@ const PROMPT_NAMES: &[&str] = &[
     "irc-join",
     "irc-summarize-respond",
 ];
+
+/// The single MCP revision this server implements.
+const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
 
 /// Tools that can be run as MCP tasks.
 ///
@@ -449,7 +453,11 @@ impl IrcMcpService {
             open_world_hint = false
         )
     )]
-    async fn irc_status(&self, Parameters(input): Parameters<AgentInput>) -> CallToolResult {
+    async fn irc_status(
+        &self,
+        Parameters(input): Parameters<AgentInput>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
         match self.gateway.snapshot(&input.agent_id).await {
             Ok(snapshot) => {
                 let output = StatusOutput {
@@ -464,6 +472,7 @@ impl IrcMcpService {
                     resources: ResourceUris::for_agent(&input.agent_id),
                     state: snapshot.state,
                     result_detail: input.result_detail,
+                    caller: Some(caller_profile(&RequestProfile::from_context(&context))),
                 };
                 let mut output = output;
                 output.state.motd = motd_for_tool_result(output.state.motd, output.result_detail);
@@ -2114,11 +2123,27 @@ impl ServerHandler for IrcMcpService {
                 .enable_tasks()
                 .build(),
         )
+        // `ServerInfo::new` defaults to whichever revision the SDK calls
+        // latest, which trails the one this server implements.
+        .with_protocol_version(ProtocolVersion::V_2026_07_28)
         .with_server_info(Implementation::new(
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
         ))
         .with_instructions(MCP_INSTRUCTIONS)
+    }
+
+    /// This server speaks exactly one protocol revision.
+    ///
+    /// Everything it exposes assumes the stateless request model: identity and
+    /// capabilities arrive per request, cross-request state is named by an
+    /// explicit handle, and there is no handshake to remember. Advertising an
+    /// older revision would promise a lifecycle none of that implements, so the
+    /// narrower list is the honest one — and it is what makes a per-request
+    /// version outside the set an explicit `-32022` instead of a request served
+    /// under assumptions the caller does not share.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
     /// Route one tool call, running the long DCC operations as MCP tasks when
@@ -3421,6 +3446,26 @@ fn history_result_summary(failure: Option<CommandOutcome>) -> String {
     )
 }
 
+/// Project one request's declarations into the reportable status field.
+///
+/// Kept next to the other result shaping so the wire form of a diagnostic stays
+/// separate from the per-request evaluation the rest of the service reads.
+fn caller_profile(profile: &RequestProfile) -> CallerProfile {
+    CallerProfile {
+        protocol_version: profile
+            .protocol_version()
+            .map(|version| version.as_str().to_owned()),
+        request_metadata_complete: profile.declares_required_metadata(),
+        extensions: profile
+            .extension_ids()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        form_elicitation: profile.supports_form_elicitation(),
+        progress_requested: profile.progress_token().is_some(),
+    }
+}
+
 fn tool_success(summary: impl Into<String>, value: &impl Serialize) -> CallToolResult {
     structured_result(summary, value, false)
 }
@@ -3603,6 +3648,45 @@ mod tests {
         let info = service.get_info();
         assert_eq!(info.instructions.as_deref(), Some(MCP_INSTRUCTIONS));
         assert!(!MCP_INSTRUCTIONS.contains("AGENT"));
+    }
+
+    #[test]
+    fn the_server_speaks_only_the_stateless_protocol_revision() {
+        let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
+        assert_eq!(
+            service.supported_protocol_versions().as_ref(),
+            [ProtocolVersion::V_2026_07_28]
+        );
+        assert_eq!(
+            service.get_info().protocol_version,
+            ProtocolVersion::V_2026_07_28,
+            "the advertised version must match what the handler will accept"
+        );
+    }
+
+    #[test]
+    fn status_reports_the_declarations_its_own_request_carried() {
+        let mut meta = rmcp::model::RequestMetaObject::new();
+        meta.set_protocol_version(ProtocolVersion::V_2026_07_28);
+        let mut capabilities = rmcp::model::ClientCapabilities::builder()
+            .enable_tasks()
+            .build();
+        capabilities.elicitation = Some(rmcp::model::ElicitationCapability::new());
+        meta.set_client_capabilities(capabilities);
+        let reported = caller_profile(&RequestProfile::from_meta(&meta));
+        assert_eq!(reported.protocol_version.as_deref(), Some("2026-07-28"));
+        assert!(reported.request_metadata_complete);
+        assert_eq!(reported.extensions, [TASKS_EXTENSION_ID]);
+        assert!(reported.form_elicitation);
+        assert!(!reported.progress_requested);
+
+        // A caller that declared nothing sees exactly that, which is how a host
+        // whose metadata never arrives can tell the difference.
+        let silent = caller_profile(&RequestProfile::default());
+        assert_eq!(silent.protocol_version, None);
+        assert!(!silent.request_metadata_complete);
+        assert!(silent.extensions.is_empty());
+        assert!(!silent.form_elicitation);
     }
 
     #[test]

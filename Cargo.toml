@@ -40,6 +40,7 @@ percent-encoding = "2.3"
 rand = "0.10"
 rmcp = { version = "~3.1.2", default-features = false, features = [
     "macros",
+    "request-state",
     "server",
     "transport-io",
     "transport-streamable-http-server",
@@ -71,6 +72,9 @@ uuid = { version = "1.18", features = ["serde", "v4"] }
 [dev-dependencies]
 proptest = "1.7"
 tempfile = "3.23"
+# Drives the real Streamable HTTP router in-process, so protocol-level tests
+# exercise the same tower service the binary serves.
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

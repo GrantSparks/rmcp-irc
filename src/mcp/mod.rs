@@ -2,6 +2,8 @@
 
 pub mod authorization;
 pub mod conversation;
+pub mod mrtr;
+pub mod request_profile;
 pub mod resources;
 pub mod service;
 pub mod tools;

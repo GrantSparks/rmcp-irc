@@ -13,9 +13,19 @@
 //! comes from the transport:
 //!
 //! * stdio has exactly one caller, which owns everything;
-//! * HTTP identifies callers by bearer token when tokens are configured, and
-//!   otherwise by MCP session, so two sessions on an unauthenticated loopback
-//!   endpoint still cannot reach each other's agents.
+//! * HTTP with configured bearer credentials identifies each caller by the
+//!   token it presents, which is a durable authenticated principal;
+//! * HTTP without configured credentials is a *trusted* endpoint — the process
+//!   refuses to bind one off loopback without an explicit network opt-in — and
+//!   therefore exposes exactly one shared local owner.
+//!
+//! There is deliberately no third, weaker identity. MCP 2026-07-28 has no
+//! session lifecycle: `Mcp-Session-Id` is gone from the protocol, so deriving
+//! an owner from it separated nobody and only failed closed. The per-request
+//! `clientInfo` and `clientCapabilities` a caller declares in `_meta` are
+//! self-reported and MUST NOT be treated as authorization identity either;
+//! they describe what a client can *handle*, not who it *is*. Separating
+//! callers on a shared endpoint requires a credential.
 
 use std::{
     collections::BTreeSet,
@@ -45,11 +55,6 @@ impl OwnerId {
         token.hash(&mut hasher);
         Self(format!("bearer-{:016x}", hasher.finish()))
     }
-
-    /// Identity derived from one MCP session.
-    pub fn from_session(session: &str) -> Self {
-        Self(format!("session-{session}"))
-    }
 }
 
 impl std::fmt::Display for OwnerId {
@@ -68,8 +73,8 @@ pub enum CallerPolicy {
     /// credential from a configured set.
     Http {
         /// Accepted bearer tokens, already reduced to owner identities. Empty
-        /// means the endpoint does not require a credential and callers are
-        /// separated by session instead.
+        /// means the endpoint requires no credential, and every caller shares
+        /// the single local owner.
         accepted: BTreeSet<OwnerId>,
     },
 }
@@ -87,65 +92,55 @@ impl CallerPolicy {
 
     /// Identify the caller behind one request.
     ///
-    /// Fails closed: a request without either an accepted configured
-    /// credential or an initialized session is rejected rather than falling
-    /// back to a weaker identity.
+    /// Every request is judged on its own: nothing about a previous request on
+    /// the same connection contributes, because in this protocol a connection
+    /// is not a session.
     pub fn identify(&self, context: &RequestContext<RoleServer>) -> Result<OwnerId, McpError> {
         let Self::Http { accepted } = self else {
             return Ok(OwnerId::local());
         };
-        let parts = context.extensions.get::<axum::http::request::Parts>();
-        let presented = parts
-            .and_then(|parts| parts.headers.get(axum::http::header::AUTHORIZATION))
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-            .map(OwnerId::from_bearer);
-
-        if accepted.is_empty() {
-            // No credential is required, so callers are separated strictly by
-            // their negotiated MCP session. Never fall back to the stdio-local
-            // owner here: two malformed or pre-initialization HTTP requests
-            // without a session header would otherwise collapse into the same
-            // identity. An unconfigured Authorization header is not accepted
-            // as a self-issued durable identity either.
-            return session_owner(parts);
-        }
-        match presented {
-            Some(owner) if accepted.contains(&owner) => Ok(owner),
-            Some(_) => Err(McpError::invalid_request(
-                "bearer credential is not authorized for this service",
-                None,
-            )),
-            None => Err(McpError::invalid_request(
-                "this endpoint requires an Authorization: Bearer credential",
-                None,
-            )),
-        }
+        http_owner(
+            accepted,
+            context.extensions.get::<axum::http::request::Parts>(),
+        )
     }
 }
 
-/// The MCP session a request belongs to, when the transport names one.
-fn session_id(parts: &axum::http::request::Parts) -> Option<String> {
-    parts
-        .headers
-        .get("mcp-session-id")
+/// Resolve the owner of one HTTP request under a [`CallerPolicy::Http`] policy.
+///
+/// Split out from [`CallerPolicy::identify`] so the decision can be tested
+/// without fabricating a whole `RequestContext`.
+fn http_owner(
+    accepted: &BTreeSet<OwnerId>,
+    parts: Option<&axum::http::request::Parts>,
+) -> Result<OwnerId, McpError> {
+    if accepted.is_empty() {
+        // An endpoint with no configured credentials is not a shared endpoint:
+        // startup refuses to bind one off loopback without an explicit
+        // trusted-network opt-in. There is nothing left to separate callers
+        // by — the protocol has no sessions, and self-declared client identity
+        // is not authorization — so this is deliberately one shared owner
+        // rather than a weaker per-request identity or a closed door.
+        return Ok(OwnerId::local());
+    }
+    let presented = parts
+        .and_then(|parts| parts.headers.get(axum::http::header::AUTHORIZATION))
         .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
-        .filter(|session| !session.is_empty())
-        .map(str::to_owned)
-}
-
-/// Resolve the fail-closed owner used by an HTTP endpoint without bearer
-/// credentials.
-fn session_owner(parts: Option<&axum::http::request::Parts>) -> Result<OwnerId, McpError> {
-    parts
-        .and_then(session_id)
-        .map(|session| OwnerId::from_session(&session))
-        .ok_or_else(|| {
-            McpError::invalid_request("this endpoint requires an initialized MCP session", None)
-        })
+        .filter(|token| !token.is_empty())
+        .map(OwnerId::from_bearer);
+    match presented {
+        Some(owner) if accepted.contains(&owner) => Ok(owner),
+        Some(_) => Err(McpError::invalid_request(
+            "bearer credential is not authorized for this service",
+            None,
+        )),
+        None => Err(McpError::invalid_request(
+            "this endpoint requires an Authorization: Bearer credential",
+            None,
+        )),
+    }
 }
 
 /// The error returned when a caller names a handle it does not own.
@@ -169,10 +164,20 @@ mod tests {
         assert_ne!(owner, OwnerId::from_bearer("hunter3"));
     }
 
+    /// Build the request parts an HTTP caller would arrive with.
+    fn parts(headers: &[(&str, &str)]) -> axum::http::request::Parts {
+        let mut request = axum::http::Request::builder();
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let (parts, ()) = request.body(()).expect("request").into_parts();
+        parts
+    }
+
     #[test]
     fn stdio_has_exactly_one_owner() {
         assert_eq!(OwnerId::local(), OwnerId::local());
-        assert_ne!(OwnerId::local(), OwnerId::from_session("abc"));
+        assert_ne!(OwnerId::local(), OwnerId::from_bearer("abc"));
     }
 
     #[test]
@@ -193,23 +198,51 @@ mod tests {
     }
 
     #[test]
-    fn session_only_http_fails_closed_without_a_session_header() {
-        let request = axum::http::Request::new(());
-        let (parts, _) = request.into_parts();
-        let error = session_owner(Some(&parts)).expect_err("missing session must fail");
-        assert!(error.message.contains("initialized MCP session"));
+    fn trusted_unauthenticated_http_exposes_one_shared_local_owner() {
+        // Startup already restricts this shape to loopback unless the operator
+        // opted a trusted network in, so the endpoint has exactly one caller
+        // and every request must land on the same owner as stdio does.
+        let accepted = BTreeSet::new();
+        let first = http_owner(&accepted, Some(&parts(&[]))).expect("first request");
+        let second = http_owner(&accepted, None).expect("second request");
+        assert_eq!(first, OwnerId::local());
+        assert_eq!(first, second);
     }
 
     #[test]
-    fn session_only_http_uses_the_negotiated_session_as_owner() {
-        let request = axum::http::Request::builder()
-            .header("mcp-session-id", "session-a")
-            .body(())
-            .expect("request");
-        let (parts, _) = request.into_parts();
+    fn an_mcp_session_id_header_never_contributes_to_identity() {
+        // The header does not exist in this protocol revision. Honoring it
+        // would let a caller mint its own owner by inventing a value.
+        let accepted = BTreeSet::new();
+        let claimed = http_owner(&accepted, Some(&parts(&[("mcp-session-id", "session-a")])))
+            .expect("session header is ignored, not rejected");
+        assert_eq!(claimed, OwnerId::local());
+
+        let configured = CallerPolicy::http(&["good".to_string()]);
+        let CallerPolicy::Http { accepted } = &configured else {
+            panic!("expected an HTTP policy");
+        };
+        let error = http_owner(accepted, Some(&parts(&[("mcp-session-id", "session-a")])))
+            .expect_err("a session header is not a credential");
+        assert!(error.message.contains("Authorization: Bearer"));
+    }
+
+    #[test]
+    fn a_credentialed_endpoint_owns_handles_per_accepted_token() {
+        let policy = CallerPolicy::http(&["good".to_string()]);
+        let CallerPolicy::Http { accepted } = &policy else {
+            panic!("expected an HTTP policy");
+        };
         assert_eq!(
-            session_owner(Some(&parts)).expect("session owner"),
-            OwnerId::from_session("session-a")
+            http_owner(accepted, Some(&parts(&[("authorization", "Bearer good")])))
+                .expect("accepted credential"),
+            OwnerId::from_bearer("good")
         );
+        let wrong = http_owner(accepted, Some(&parts(&[("authorization", "Bearer bad")])))
+            .expect_err("an unconfigured credential is not a self-issued identity");
+        assert!(wrong.message.contains("not authorized"));
+        let missing =
+            http_owner(accepted, Some(&parts(&[]))).expect_err("a credential is required");
+        assert!(missing.message.contains("Authorization: Bearer"));
     }
 }

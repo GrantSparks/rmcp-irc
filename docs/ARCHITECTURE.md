@@ -23,7 +23,7 @@ agent actors.
 | Term | Meaning |
 | --- | --- |
 | MCP client | A local or internal-network caller. |
-| Caller owner | The local stdio identity, an authenticated HTTP bearer identity, or an isolated HTTP MCP session. |
+| Caller owner | An authenticated HTTP bearer identity, or the single local identity used by stdio and by a trusted HTTP endpoint with no configured credentials. Resolved per request; never inferred from self-declared client metadata. |
 | `agent_id` | A process-local routing handle for an IRC identity created by `irc.connect`; it is not an account or credential. |
 | IRC connection | The current TCP/TLS connection owned by an agent actor. |
 | Command ID | A gateway-generated identifier for one outbound operation. |

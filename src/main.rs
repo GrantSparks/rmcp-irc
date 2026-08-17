@@ -70,9 +70,10 @@ struct ServeArgs {
     #[arg(long = "allow-origin", value_name = "ORIGIN")]
     allow_origin: Vec<String>,
     /// Bearer credential accepted on the HTTP endpoint; repeatable. Each
-    /// credential is a distinct caller identity, and handles created by one
-    /// are invisible to the others. Without any, callers are separated by MCP
-    /// session instead.
+    /// credential is a distinct caller identity, and handles created by one are
+    /// invisible to the others. Without any, the endpoint is trusted and every
+    /// caller shares one local owner, so configure credentials before sharing
+    /// it.
     #[arg(long = "http-bearer-token", value_name = "TOKEN")]
     http_bearer_token: Vec<String>,
 }
@@ -199,6 +200,45 @@ fn http_security(args: &ServeArgs) -> anyhow::Result<(Vec<String>, Vec<String>)>
     Ok((allowed_hosts, allowed_origins))
 }
 
+/// Assemble the Streamable HTTP router this binary serves.
+///
+/// Separate from [`serve_http`] so tests can drive the real router — the same
+/// transport validation, the same per-request handler factory, the same
+/// middleware — through one in-process request instead of a socket.
+pub(crate) fn http_service(
+    gateway: Arc<Gateway>,
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+    callers: CallerPolicy,
+    cancellation: CancellationToken,
+) -> axum::Router {
+    let service: StreamableHttpService<IrcMcpService, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || {
+                Ok(IrcMcpService::with_caller_policy(
+                    gateway.clone(),
+                    callers.clone(),
+                ))
+            },
+            Default::default(),
+            StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(false)
+                // This server implements only 2026-07-28, so a request that
+                // does not declare its protocol version and capabilities is
+                // rejected at the transport rather than dispatched under
+                // guessed defaults.
+                .with_stateless_protocol_metadata_required(true)
+                .with_allowed_hosts(allowed_hosts)
+                .with_allowed_origins(allowed_origins)
+                .with_cancellation_token(cancellation),
+        );
+    // Every response carries per-caller IRC state, so no shared cache may
+    // retain or reuse it for anyone else.
+    axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(mark_responses_private))
+}
+
 async fn serve_http(
     gateway: Arc<Gateway>,
     listen: SocketAddr,
@@ -207,28 +247,13 @@ async fn serve_http(
     callers: CallerPolicy,
 ) -> anyhow::Result<()> {
     let cancellation = CancellationToken::new();
-    let factory_gateway = gateway.clone();
-    let factory_callers = callers.clone();
-    let service: StreamableHttpService<IrcMcpService, LocalSessionManager> =
-        StreamableHttpService::new(
-            move || {
-                Ok(IrcMcpService::with_caller_policy(
-                    factory_gateway.clone(),
-                    factory_callers.clone(),
-                ))
-            },
-            Default::default(),
-            StreamableHttpServerConfig::default()
-                .with_legacy_session_mode(false)
-                .with_allowed_hosts(allowed_hosts)
-                .with_allowed_origins(allowed_origins)
-                .with_cancellation_token(cancellation.child_token()),
-        );
-    // Every response carries per-caller IRC state, so no shared cache may
-    // retain or reuse it for anyone else.
-    let router = axum::Router::new()
-        .nest_service("/mcp", service)
-        .layer(axum::middleware::from_fn(mark_responses_private));
+    let router = http_service(
+        gateway,
+        allowed_hosts,
+        allowed_origins,
+        callers,
+        cancellation.child_token(),
+    );
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("bind Streamable HTTP listener at {listen}"))?;

@@ -33,6 +33,7 @@ use crate::{
     mcp::{
         authorization::{OwnerId, not_authorized},
         conversation::CompactEvent,
+        mrtr::RequestStateSealer,
         resources::{ConversationResource, WireResource},
         watch::{
             WatchDescriptor, WatchEventsResource, WatchFilter, WatchId, WatchLimits, WatchRegistry,
@@ -105,6 +106,7 @@ pub struct Gateway {
     capacity: Arc<Semaphore>,
     resource_updates: broadcast::Sender<String>,
     watches: Arc<WatchRegistry>,
+    request_states: RequestStateSealer,
 }
 
 impl Gateway {
@@ -123,12 +125,27 @@ impl Gateway {
             capacity,
             resource_updates,
             watches: Arc::new(WatchRegistry::new(watch_limits)),
+            request_states: RequestStateSealer::generate(),
         }
     }
 
     /// Shared registry of watch handles.
     pub fn watches(&self) -> &Arc<WatchRegistry> {
         &self.watches
+    }
+
+    /// Sealer for multi round-trip request state.
+    ///
+    /// It lives here because the gateway is the one object every per-request
+    /// service instance shares: Streamable HTTP builds a fresh handler for each
+    /// POST, so a key held by the handler would change between the round that
+    /// sealed a state and the round that must open it.
+    #[allow(
+        dead_code,
+        reason = "the elicitation flows that seal and open request state land separately"
+    )]
+    pub fn request_states(&self) -> &RequestStateSealer {
+        &self.request_states
     }
 
     /// Shared immutable process configuration.

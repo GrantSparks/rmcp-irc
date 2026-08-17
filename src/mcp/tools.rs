@@ -166,6 +166,30 @@ pub struct DisconnectOutput {
     pub dcc_sessions_closed: usize,
 }
 
+/// What the calling request declared about itself.
+///
+/// There is no handshake to inspect in this protocol, so a client that cannot
+/// tell why the server withheld a feature has nowhere to look. This echoes the
+/// declarations the current request actually arrived with, which is the
+/// difference between "the server ignored my capability" and "my capability
+/// never reached the server". These are self-reported values for diagnostics
+/// only; they are never an authorization identity.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct CallerProfile {
+    /// MCP protocol version declared in this request's `_meta`.
+    pub protocol_version: Option<String>,
+    /// Whether this request carried every `_meta` field the protocol requires.
+    pub request_metadata_complete: bool,
+    /// Extension identifiers declared in this request's client capabilities.
+    pub extensions: Vec<String>,
+    /// Whether the client declared it can answer a form-mode elicitation.
+    pub form_elicitation: bool,
+    /// Whether this request supplied a progress token. Progress notifications
+    /// may only name a token an active request opted in with, so `false` means
+    /// no progress can be sent for it.
+    pub progress_requested: bool,
+}
+
 /// Complete status tool output.
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct StatusOutput {
@@ -181,6 +205,11 @@ pub struct StatusOutput {
     pub resources: ResourceUris,
     /// Detail actually included in this result.
     pub result_detail: ToolResultDetail,
+    /// Capability picture of the request that asked. Absent when the status was
+    /// produced outside a request, since it describes the caller rather than
+    /// the guest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<CallerProfile>,
 }
 
 /// Join one channel.
