@@ -1,0 +1,82 @@
+[package]
+name = "rmcp-irc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Grant Sparks <grant@grafton.ai>"]
+description = "Relay IRC server sessions via MCP for native LLM collaboration"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/GrantSparks/rmcp-irc"
+homepage = "https://www.grafton.ai"
+categories = ["command-line-utilities", "network-programming"]
+keywords = ["mcp", "irc", "ircv3", "gateway", "ergo"]
+readme = "README.md"
+exclude = [
+    ".editorconfig",
+    ".github/",
+    ".git-hooks/",
+    ".pre-commit-config.yaml",
+    # Contributor and CI policy files. Excluded so `cargo install` never picks
+    # up the MSRV toolchain pin meant for this repository's own checkouts.
+    "deny.toml",
+    "rust-toolchain.toml",
+    "target/",
+]
+
+[[bin]]
+name = "irc-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+base64 = "0.23"
+bytes = "1.11"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+ircv3_parse = "4.0.0"
+percent-encoding = "2.3"
+rand = "0.10"
+rmcp = { version = "~3.1.2", default-features = false, features = [
+    "macros",
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "prefer-post-quantum", "std", "tls12"] }
+rustls-native-certs = "0.8"
+schemars = "1.1"
+secrecy = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.52", features = [
+    "io-util",
+    "fs",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-rustls = "0.26"
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+toml = { version = "1.1", default-features = false, features = ["parse", "serde", "std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18", features = ["serde", "v4"] }
+
+[dev-dependencies]
+proptest = "1.7"
+tempfile = "3.23"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"

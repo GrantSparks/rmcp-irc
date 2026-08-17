@@ -1,0 +1,15 @@
+# Build context for examples/docker/Dockerfile. Keeping build artefacts and
+# local state out of the context keeps `docker build` fast and reproducible.
+target/
+.git/
+.github/
+.local/
+downloads/
+config/local.toml
+*.crate
+**/mutants.out*/
+.claude/
+.codex/
+.serena/
+.idea/
+.vscode/

@@ -1,0 +1,76 @@
+# Minimal Ergo configuration for the rmcp-irc Docker quick start.
+# The Docker network is internal-only, so plain IRC is intentional here.
+
+network:
+    name: rmcp-local
+
+server:
+    name: irc.rmcp.local
+    listeners:
+        ":6667":
+    lookup-hostnames: false
+    motd: /ircd/ircd.motd
+    motd-formatting: false
+    casemapping: ascii
+    enforce-utf8: true
+    max-sendq: 96k
+    ip-limits:
+        # Development containers can create many agents from one IP address.
+        count: false
+        throttle: false
+
+accounts:
+    authentication-enabled: true
+    require-sasl:
+        # rmcp-irc creates ephemeral guest identities by default.
+        enabled: false
+
+channels:
+    default-modes: +nt
+    auto-join:
+        - "#agents"
+
+datastore:
+    path: /ircd/ircd.db
+    autoupgrade: true
+
+languages:
+    enabled: false
+    default: en
+    path: /ircd-bin/languages
+
+lock-file: /ircd/ircd.lock
+
+limits:
+    nicklen: 32
+    identlen: 20
+    realnamelen: 150
+    channellen: 64
+    awaylen: 390
+    kicklen: 390
+    topiclen: 390
+    monitor-entries: 100
+    whowas-entries: 100
+    chan-list-modes: 100
+    registration-messages: 1024
+    multiline:
+        max-bytes: 4096
+        max-lines: 100
+
+fakelag:
+    enabled: false
+
+history:
+    enabled: true
+    channel-length: 2048
+    client-length: 256
+    autoreplay-on-join: 32
+    chathistory-maxmessages: 1000
+    restrictions:
+        expire-time: 1w
+        query-cutoff: 'none'
+        grace-period: 1h
+    persistent:
+        enabled: false
+
+allow-environment-overrides: true

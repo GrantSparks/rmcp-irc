@@ -1,0 +1,16 @@
+# Gateway configuration baked into the single-container image.
+#
+# Ergo and the gateway share a network namespace here, so the upstream endpoint
+# is loopback: no DNS, no alias, and nothing to configure per deployment. Mount
+# your own file over /etc/rmcp-irc/rmcp-irc.toml (or set MCP_CONFIG) to override.
+#
+# Deliberately omitted: [dcc]. The entrypoint appends that table with the
+# container's own address when MCP_DCC_ADVERTISED_ADDRESS is set (the image
+# default is "auto"), because a loopback upstream would otherwise make the
+# gateway advertise DCC listeners as 127.0.0.1, which no peer can reach. If you
+# supply a [dcc] table yourself, the entrypoint leaves DCC entirely to you.
+
+[irc]
+host = "127.0.0.1"
+port = 6667
+transport = "plain"

@@ -1,0 +1,57 @@
+[irc]
+host = "irc"
+port = 6667
+transport = "plain"
+
+# Reference secrets through environment variables; do not store values here.
+# server_password = { env = "ERGO_SERVER_PASSWORD" }
+# sasl = { username = "guest", password = { env = "ERGO_SASL_PASSWORD" } }
+
+[onboarding]
+nickname_instruction = "Choose a nickname based on a mythological character."
+username_template = "mcp-{agent_id}"
+real_name_template = "rmcp-irc guest {nickname}"
+initial_channels = []
+nickname_attempts = 8
+connect_timeout_ms = 15000
+
+[reconnect]
+initial_delay_ms = 500
+max_delay_ms = 30000
+multiplier = 2.0
+jitter = 0.2
+
+[limits]
+max_agents = 64
+command_queue = 256
+pending_commands = 128
+active_batches = 64
+replies_per_command = 512
+event_count = 4096
+event_bytes = 4194304
+max_line_bytes = 8192
+max_message_bytes = 65536
+max_message_parts = 256
+max_command_timeout_ms = 30000
+max_event_wait_ms = 30000
+max_event_page_size = 1000
+
+[dcc]
+bind_address = "0.0.0.0"
+# Set this when automatic route discovery is not reachable by DCC peers.
+# advertised_address = "10.0.0.5"
+port_start = 50000
+port_end = 50100
+download_directory = "downloads"
+max_sessions = 16
+max_offers_per_peer = 4
+transfer_buffer_bytes = 65536
+max_transfer_bytes = 1073741824
+offer_ttl_ms = 120000
+connect_timeout_ms = 15000
+idle_timeout_ms = 300000
+automatic_accept_chat = false
+automatic_accept_send = false
+allow_private_addresses = false
+chat_queue = 64
+chat_line_bytes = 8192

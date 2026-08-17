@@ -1,0 +1,260 @@
+name: Rust CI/CD
+
+# Build, lint, and release pipeline for the rmcp-irc crate.
+#
+# Notes for contributors:
+# - `rust-toolchain.toml` pins bare `cargo` invocations to the MSRV. Every job
+#   below therefore selects its toolchain explicitly with `cargo +<toolchain>`
+#   so the matrix is not silently collapsed onto the pinned version.
+# - `--locked` is used everywhere so CI fails on an out-of-date `Cargo.lock`
+#   instead of quietly resolving different dependency versions than a release.
+# - Tag pushes (`vX.Y.Z`) run the full pipeline and then publish to crates.io.
+
+on:
+  push:
+    branches: ["main", "feature/**"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    name: Format Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          components: rustfmt
+
+      - run: cargo +stable fmt --all -- --check
+
+  test:
+    name: Test (${{ matrix.os }} / ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, beta]
+        exclude:
+          # Beta only needs one platform to give early warning of regressions.
+          - os: macos-latest
+            rust: beta
+          - os: windows-latest
+            rust: beta
+    continue-on-error: ${{ matrix.rust == 'beta' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ matrix.rust }} toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      # Advisory only: the suite must still run if the cache cannot be restored.
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        continue-on-error: true
+        with:
+          shared-key: "rust-cache-${{ matrix.os }}-${{ matrix.rust }}"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+
+      - name: Test
+        run: cargo +${{ matrix.rust }} test --all-targets --all-features --locked
+
+  lint-and-docs:
+    name: Lint & Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        continue-on-error: true
+        with:
+          shared-key: "rust-cache-ubuntu-latest-stable"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Clippy
+        run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Build private-item documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo +stable doc --all-features --no-deps --document-private-items --locked
+
+  msrv:
+    name: MSRV 1.88
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88.0 toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.88.0"
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        continue-on-error: true
+        with:
+          shared-key: "rust-cache-msrv"
+          save-if: false
+
+      # Must match `rust-version` in Cargo.toml and the README quick start.
+      - name: Check on the minimum supported Rust version
+        run: cargo +1.88.0 check --all-targets --all-features --locked
+
+  dependency-policy:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Covers advisories, licenses, banned crates, and sources per deny.toml.
+      # `arguments` are cargo-deny's global flags and precede the subcommand.
+      - uses: EmbarkStudios/cargo-deny-action@c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb # v2.1.1
+        with:
+          command: check
+          arguments: --all-features --locked
+
+  package-check:
+    name: Package Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        continue-on-error: true
+        with:
+          shared-key: "rust-cache-ubuntu-latest-stable"
+          save-if: false
+
+      - name: Validate release metadata and ancestry
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          bash .github/scripts/validate-release.sh "$GITHUB_REF_NAME"
+
+      # Catches accidentally included secrets or omitted runtime files before
+      # an irreversible publish.
+      - name: Inspect package payload
+        run: |
+          cargo +stable package --locked --list
+          cargo +stable package --locked
+
+  ci-success:
+    name: CI Success
+    if: always()
+    needs:
+      - format
+      - test
+      - lint-and-docs
+      - msrv
+      - dependency-policy
+      - package-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check whether every required job succeeded
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more required jobs failed"
+            exit 1
+          elif [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more required jobs were cancelled"
+            exit 1
+          else
+            echo "All required jobs passed or were skipped"
+          fi
+
+  publish:
+    name: Publish
+    needs: [ci-success]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        continue-on-error: true
+        with:
+          shared-key: "rust-cache-ubuntu-latest-stable"
+          save-if: false
+
+      # Re-validated here so the publish step cannot run against a tag that
+      # only passed an earlier, separately checked-out job.
+      - name: Validate release metadata and inspect payload
+        id: release
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          bash .github/scripts/validate-release.sh "$GITHUB_REF_NAME"
+          cargo +stable package --locked --list
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          if cargo info --registry crates-io "rmcp-irc@${RELEASE_VERSION}" >/dev/null 2>&1; then
+            echo "rmcp-irc@${RELEASE_VERSION} is already published"
+          else
+            cargo +stable publish --locked --dry-run
+            cargo +stable publish --locked
+          fi
+
+      - name: Verify the published version
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: bash .github/scripts/wait-for-crate.sh rmcp-irc "$RELEASE_VERSION" 300
