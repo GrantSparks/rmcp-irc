@@ -72,6 +72,8 @@ pub const TOOL_NAMES: &[&str] = &[
     "irc.typing.set",
     "irc.execute",
     "irc.events.read",
+    "irc.watch.create",
+    "irc.watch.close",
     "irc.dcc.chat.open",
     "irc.dcc.chat.send",
     "irc.dcc.send",

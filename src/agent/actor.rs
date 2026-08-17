@@ -54,6 +54,7 @@ use crate::{
         target::ChannelName,
         wire::{LineBudget, OutboundMessage, WireMessage},
     },
+    mcp::{resources::ResourceUris, watch::WatchRegistry},
     time::Timestamp,
 };
 
@@ -63,10 +64,11 @@ use super::{
     journal::{
         ConnectionEvent, CorrelationRole, DccChatMessage, DccFailure, EventClass, EventCorrelation,
         EventCursor, EventDirection, EventFilter, EventOrigin, EventPage, EventPayload,
-        EventVerbosity, IrcEvent, JournalStats, MalformedLine, NewEvent, addresses_nickname,
+        EventVerbosity, IrcEvent, JournalStats, MalformedLine, NewEvent, RecentQuery,
+        addresses_nickname,
     },
     reconnect::ReconnectBackoff,
-    state::{AgentState, ConnectionState, MotdSource, MotdState, MotdStatus},
+    state::{AgentState, ChannelState, ConnectionState, MotdSource, MotdState, MotdStatus},
 };
 
 type IrcFramed = Framed<BoxedIrcStream, IrcCodec>;
@@ -190,6 +192,11 @@ enum AgentCommand {
         filter: EventFilter,
         completion: oneshot::Sender<Result<EventPage>>,
     },
+    ReadRecent {
+        limit: usize,
+        query: RecentQuery,
+        completion: oneshot::Sender<Vec<IrcEvent>>,
+    },
     Snapshot {
         completion: oneshot::Sender<AgentSnapshot>,
     },
@@ -242,6 +249,7 @@ impl AgentHandle {
         config: Arc<Config>,
         registration: RegistrationRequest,
         resource_updates: broadcast::Sender<String>,
+        watches: Arc<WatchRegistry>,
         capacity_permit: OwnedSemaphorePermit,
     ) -> (
         Self,
@@ -295,6 +303,7 @@ impl AgentHandle {
             seen_message_order: VecDeque::new(),
             motd_query: None,
             resource_updates,
+            watches,
             started_at: Instant::now(),
             active_budget: LineBudget::TRADITIONAL,
             _capacity_permit: capacity_permit,
@@ -335,6 +344,25 @@ impl AgentHandle {
         result
             .await
             .map_err(|_| GatewayError::ActorStopped(self.id.clone()))?
+    }
+
+    /// Read the newest matching retained events, oldest-first.
+    ///
+    /// Distinct from [`Self::read_events`], which answers "what is after this
+    /// cursor". A conversational resource has no caller cursor and wants the
+    /// end of the stream, so scanning from the newest record is what keeps a
+    /// rare class such as a mention visible in a busy journal.
+    pub async fn read_recent(&self, limit: usize, query: RecentQuery) -> Result<Vec<IrcEvent>> {
+        let (completion, result) = oneshot::channel();
+        self.send(AgentCommand::ReadRecent {
+            limit,
+            query,
+            completion,
+        })
+        .await?;
+        result
+            .await
+            .map_err(|_| GatewayError::ActorStopped(self.id.clone()))
     }
 
     /// Read a consistent actor-owned resource snapshot.
@@ -529,6 +557,7 @@ pub struct AgentActor {
     seen_message_order: VecDeque<String>,
     motd_query: Option<MotdState>,
     resource_updates: broadcast::Sender<String>,
+    watches: Arc<WatchRegistry>,
     started_at: Instant,
     active_budget: LineBudget,
     _capacity_permit: OwnedSemaphorePermit,
@@ -983,6 +1012,13 @@ impl AgentActor {
                 filter,
                 completion,
             } => self.read_events(cursor, limit, wait, filter, completion),
+            AgentCommand::ReadRecent {
+                limit,
+                query,
+                completion,
+            } => {
+                let _ = completion.send(self.journal.read_latest(limit, &query));
+            }
             AgentCommand::Snapshot { completion } => {
                 let _ = completion.send(self.snapshot());
             }
@@ -1308,6 +1344,9 @@ impl AgentActor {
                     AgentCommand::ReadEvents { cursor, limit, wait, filter, completion } => {
                         self.read_events(cursor, limit, wait, filter, completion);
                     }
+                    AgentCommand::ReadRecent { limit, query, completion } => {
+                        let _ = completion.send(self.journal.read_latest(limit, &query));
+                    }
                     AgentCommand::Snapshot { completion } => {
                         let _ = completion.send(self.snapshot());
                     }
@@ -1346,17 +1385,19 @@ impl AgentActor {
     }
 
     fn snapshot(&self) -> AgentSnapshot {
-        let recent = self.journal.read(
-            None,
+        // The newest window, not the oldest: once the journal retains more than
+        // this many records a cursor-less `read` would hand back the start of
+        // the buffer, which is the least useful end of it.
+        let recent = self.journal.read_latest(
             self.config.limits.max_event_page_size.min(100),
-            &EventFilter::default(),
+            &RecentQuery::default(),
         );
         AgentSnapshot {
             state: self.state.borrow().clone(),
             protocol: self.protocol.clone(),
             line_budget: self.active_budget.into(),
             journal: self.journal.stats(),
-            recent_events: recent.events,
+            recent_events: recent,
             dcc_sessions: self.dcc.list(),
         }
     }
@@ -1585,7 +1626,8 @@ impl AgentActor {
         };
         match self.journal.push(event) {
             Ok(cursor) => {
-                let mut state = self.state.borrow().clone();
+                let previous = self.state.borrow().clone();
+                let mut state = previous.clone();
                 state.reduce(
                     &projection,
                     cursor.clone(),
@@ -1594,8 +1636,23 @@ impl AgentActor {
                 );
                 state.reduce_wire(&message, &self.isupport);
                 self.remember_membership(&projection, &state);
-                self.state.send_replace(state);
-                self.notify_resources(&["events", "state"]);
+                let channels_changed = previous.channels != state.channels;
+                let identity_changed = previous.identity != state.identity;
+                self.state.send_replace(state.clone());
+                self.notify_journal_append();
+                // Only claim the aggregate resources changed when they did.
+                // Every inbound line used to invalidate `state`, which made a
+                // subscription to it a fair approximation of "the connection is
+                // receiving traffic" rather than a signal about state at all.
+                if channels_changed || identity_changed {
+                    self.notify_resources(&["state"]);
+                }
+                if identity_changed {
+                    self.notify_resources(&["status"]);
+                }
+                if channels_changed {
+                    self.notify_changed_channels(&previous.channels, &state.channels);
+                }
                 Some(cursor)
             }
             Err(error) => {
@@ -1696,7 +1753,7 @@ impl AgentActor {
             mentions_me: false,
         };
         if self.journal.push(event).is_ok() {
-            self.notify_resources(&["events"]);
+            self.notify_journal_append();
             self.flush_event_reads(false);
         }
     }
@@ -1724,7 +1781,7 @@ impl AgentActor {
             mentions_me: false,
         };
         if self.journal.push(event).is_ok() {
-            self.notify_resources(&["events"]);
+            self.notify_journal_append();
         }
     }
 
@@ -1754,7 +1811,8 @@ impl AgentActor {
             mentions_me: false,
         };
         let _ = self.journal.push(event);
-        self.notify_resources(&["status", "state", "events"]);
+        self.notify_journal_append();
+        self.notify_resources(&["status", "state"]);
     }
 
     fn finish_registration(&mut self, nickname: &Nickname, motd: &MotdState) {
@@ -3009,7 +3067,7 @@ impl AgentActor {
             mentions_me: false,
         };
         if self.journal.push(event).is_ok() {
-            self.notify_resources(&["events"]);
+            self.notify_journal_append();
             self.flush_event_reads(false);
         }
     }
@@ -3069,6 +3127,79 @@ impl AgentActor {
         let base = format!("irc://agents/{}", self.id);
         for suffix in suffixes {
             let _ = self.resource_updates.send(format!("{base}/{suffix}"));
+        }
+    }
+
+    /// Invalidate the event resources, and every watch that selects the record
+    /// just appended.
+    ///
+    /// Testing the watch filters here rather than at the subscription is what
+    /// keeps a watch quiet: a client watching one channel is woken by traffic
+    /// in that channel, not by every line the connection happens to see.
+    fn notify_journal_append(&self) {
+        self.notify_resources(&["events"]);
+        let Some(event) = self.journal.latest_event() else {
+            return;
+        };
+        if event.mentions_me {
+            self.notify_resources(&["inbox"]);
+        }
+        if event.verbosity == EventVerbosity::Wire || event.semantic.is_none() {
+            self.notify_resources(&["wire"]);
+        }
+        if let Some(target) = event.target.as_deref() {
+            let _ = self.resource_updates.send(ResourceUris::transcript(
+                &self.id,
+                &self.isupport.case_mapping().fold(target),
+            ));
+        }
+        for uri in self
+            .watches
+            .matching_uris(&self.id, event, self.isupport.case_mapping())
+        {
+            let _ = self.resource_updates.send(uri);
+        }
+    }
+
+    /// Invalidate only the channel resources whose contents actually changed.
+    ///
+    /// The expanded channel resources were previously invisible to
+    /// subscribers: state changes notified the aggregate `state` resource and
+    /// nothing else, so a client subscribed to one channel never heard about
+    /// it. Diffing here also means a busy channel does not invalidate the
+    /// quiet one beside it.
+    fn notify_changed_channels(
+        &self,
+        before: &BTreeMap<String, ChannelState>,
+        after: &BTreeMap<String, ChannelState>,
+    ) {
+        for (key, channel) in after {
+            let previous = before.get(key);
+            if previous == Some(channel) {
+                continue;
+            }
+            let _ = self
+                .resource_updates
+                .send(ResourceUris::channel(&self.id, &channel.name));
+            if previous.map(|previous| &previous.members) != Some(&channel.members) {
+                let _ = self
+                    .resource_updates
+                    .send(ResourceUris::channel_members(&self.id, &channel.name));
+            }
+            if previous.map(|previous| &previous.topic) != Some(&channel.topic) {
+                let _ = self
+                    .resource_updates
+                    .send(ResourceUris::channel_topic(&self.id, &channel.name));
+            }
+        }
+        // A channel we left disappears from the map; subscribers to it still
+        // need to hear that it is gone.
+        for (key, channel) in before {
+            if !after.contains_key(key) {
+                let _ = self
+                    .resource_updates
+                    .send(ResourceUris::channel(&self.id, &channel.name));
+            }
         }
     }
 }

@@ -1,7 +1,7 @@
 //! End-to-end gateway tests against a deterministic in-process Ergo fixture.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
@@ -21,6 +21,7 @@ use crate::{
         registration::{NickConflictPolicy, Nickname},
         wire::{OutboundMessage, WireMessage},
     },
+    mcp::watch::WatchFilter,
 };
 use bytes::Bytes;
 use tokio::{
@@ -1213,4 +1214,115 @@ async fn event_cursor_pages_carry_the_journal_forward_without_a_tool_call() {
         .disconnect(&connected.agent_id, None)
         .await
         .expect("disconnect");
+}
+
+#[tokio::test]
+async fn a_watch_delivers_only_what_it_selected_and_advances_past_it() {
+    let fake = FakeErgo::spawn().await;
+    let gateway = Gateway::new(fake.config());
+    let connected = gateway
+        .connect(connect_request("Ariadne"))
+        .await
+        .expect("connect");
+
+    let watch = gateway
+        .create_watch(
+            &connected.agent_id,
+            WatchFilter {
+                targets: BTreeSet::from(["#agents".to_string()]),
+                ..WatchFilter::default()
+            },
+            None,
+        )
+        .await
+        .expect("create watch");
+
+    // The fixture echoes a PRIVMSG back as an inbound line, so this produces
+    // traffic on the watched channel and on one the watch must ignore.
+    for channel in ["#agents", "#elsewhere"] {
+        gateway
+            .execute(
+                &connected.agent_id,
+                OutboundMessage::new("PRIVMSG", vec![channel.into()])
+                    .with_trailing("thread through the maze"),
+                CompletionMode::Auto,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("send");
+    }
+
+    let first = gateway
+        .read_watch(&watch.watch_id)
+        .await
+        .expect("read watch");
+    assert_eq!(first.status, crate::agent::journal::CursorStatus::Current);
+    assert!(
+        !first.events.is_empty(),
+        "a watch on an active channel must deliver something"
+    );
+    assert!(
+        first
+            .events
+            .iter()
+            .all(|event| event.target.as_deref() == Some("#agents")),
+        "a watch must not deliver targets it did not select: {:?}",
+        first.events
+    );
+    assert!(
+        first
+            .events
+            .iter()
+            .any(|event| event.text.as_deref() == Some("thread through the maze")),
+        "the watch dropped the message it was created for"
+    );
+
+    // The position lives with the watch, so a second read with no argument
+    // continues rather than repeating.
+    let second = gateway
+        .read_watch(&watch.watch_id)
+        .await
+        .expect("second read");
+    assert!(
+        second
+            .events
+            .iter()
+            .all(|event| event.cursor.sequence > first.next_cursor.sequence),
+        "a watch re-delivered events its previous read had consumed"
+    );
+
+    gateway.close_watch(&watch.watch_id).expect("close watch");
+    assert!(
+        gateway.read_watch(&watch.watch_id).await.is_err(),
+        "a closed watch must not remain readable"
+    );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+#[tokio::test]
+async fn disconnecting_an_agent_releases_its_watches() {
+    let fake = FakeErgo::spawn().await;
+    let gateway = Gateway::new(fake.config());
+    let connected = gateway
+        .connect(connect_request("Icarus"))
+        .await
+        .expect("connect");
+    let watch = gateway
+        .create_watch(&connected.agent_id, WatchFilter::default(), None)
+        .await
+        .expect("create watch");
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+
+    assert!(
+        gateway.watches().describe(&watch.watch_id).is_none(),
+        "a watch outlived the stream it was watching"
+    );
 }

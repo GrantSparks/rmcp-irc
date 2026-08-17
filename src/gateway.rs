@@ -15,7 +15,7 @@ use crate::{
             AgentHandle, AgentSnapshot, CompletionMode, DccAcceptRequest, DisconnectReceipt,
             ExecuteRequest, RegistrationRequest,
         },
-        journal::{EventCursor, EventFilter, EventPage},
+        journal::{CursorStatus, EventCursor, EventFilter, EventPage, EventVerbosity, RecentQuery},
     },
     config::Config,
     dcc::{
@@ -25,9 +25,15 @@ use crate::{
     error::{GatewayError, Result},
     irc::{
         correlation::CommandResult,
+        isupport::CaseMapping,
         registration::{NickConflictPolicy, Nickname},
         target::ChannelName,
         wire::OutboundMessage,
+    },
+    mcp::{
+        conversation::CompactEvent,
+        resources::{ConversationResource, WireResource},
+        watch::{WatchDescriptor, WatchFilter, WatchId, WatchRegistry, WatchResource},
     },
 };
 
@@ -46,6 +52,15 @@ pub struct ConnectRequest {
     pub real_name: Option<String>,
     /// Additional initial channels.
     pub channels: BTreeSet<ChannelName>,
+}
+
+/// Which conversational window a resource read wants.
+#[derive(Clone, Copy, Debug)]
+pub enum ConversationWindow<'a> {
+    /// Everything addressed to the agent, across every channel and peer.
+    Inbox,
+    /// One channel or peer.
+    Target(&'a str),
 }
 
 /// Published agent and its initial registration details.
@@ -68,6 +83,7 @@ pub struct Gateway {
     agents: RwLock<BTreeMap<AgentId, AgentHandle>>,
     capacity: Arc<Semaphore>,
     resource_updates: broadcast::Sender<String>,
+    watches: Arc<WatchRegistry>,
 }
 
 impl Gateway {
@@ -81,7 +97,13 @@ impl Gateway {
             agents: RwLock::new(BTreeMap::new()),
             capacity,
             resource_updates,
+            watches: Arc::new(WatchRegistry::new()),
         }
+    }
+
+    /// Shared registry of watch handles.
+    pub fn watches(&self) -> &Arc<WatchRegistry> {
+        &self.watches
     }
 
     /// Shared immutable process configuration.
@@ -139,6 +161,7 @@ impl Gateway {
             self.config.clone(),
             registration,
             self.resource_updates.clone(),
+            self.watches.clone(),
             permit,
         );
         tokio::spawn(actor.run());
@@ -193,6 +216,156 @@ impl Gateway {
             .await
     }
 
+    /// Serve one conversational or diagnostic resource that is a window over
+    /// the journal rather than a field of the actor snapshot.
+    ///
+    /// These read from the newest end of the stream. A mention or a quiet
+    /// channel is exactly the case where the oldest hundred retained records
+    /// contain nothing, so a snapshot-shaped preview would show an empty
+    /// transcript for a conversation that is actively happening.
+    pub async fn read_conversation(
+        &self,
+        agent_id: &AgentId,
+        window: ConversationWindow<'_>,
+    ) -> Result<ConversationResource> {
+        let handle = self.resolve(agent_id).await?;
+        let snapshot = handle.snapshot().await?;
+        let limit = self.config.limits.max_event_page_size;
+        let (target, query) = match window {
+            ConversationWindow::Inbox => (None, RecentQuery::mentions()),
+            // Targets are compared with the server's own mapping, so a
+            // transcript URI spelled `#Control` finds `#control`.
+            ConversationWindow::Target(target) => (
+                Some(target.to_owned()),
+                RecentQuery::for_target(target, case_mapping_of(&snapshot)),
+            ),
+        };
+        let events = handle.read_recent(limit, query).await?;
+        let through_cursor = events.last().map(|event| event.cursor.clone());
+        Ok(ConversationResource {
+            target,
+            events: events.iter().filter_map(CompactEvent::project).collect(),
+            through_cursor,
+            journal: snapshot.journal,
+        })
+    }
+
+    /// Serve the lossless wire-diagnostics window.
+    pub async fn read_wire(&self, agent_id: &AgentId) -> Result<WireResource> {
+        let handle = self.resolve(agent_id).await?;
+        let snapshot = handle.snapshot().await?;
+        let events = handle
+            .read_recent(
+                self.config.limits.max_event_page_size,
+                RecentQuery::default(),
+            )
+            .await?;
+        Ok(WireResource {
+            events: events
+                .into_iter()
+                .filter(|event| event.wire.is_some() || event.verbosity == EventVerbosity::Wire)
+                .collect(),
+            journal: snapshot.journal,
+            line_budget: snapshot.line_budget,
+        })
+    }
+
+    /// Register a watch over one agent's stream.
+    ///
+    /// Resolving the agent first means an unusable handle fails here rather
+    /// than on the caller's first read of a watch that could never produce
+    /// anything.
+    pub async fn create_watch(
+        &self,
+        agent_id: &AgentId,
+        filter: WatchFilter,
+        cursor: Option<EventCursor>,
+    ) -> Result<WatchDescriptor> {
+        self.resolve(agent_id).await?;
+        let descriptor = self.watches.create(agent_id.clone(), filter, cursor);
+        let _ = self.resource_updates.send("irc://agents".into());
+        Ok(descriptor)
+    }
+
+    /// Release a watch handle.
+    pub fn close_watch(&self, watch_id: &WatchId) -> Result<()> {
+        if !self.watches.close(watch_id) {
+            return Err(GatewayError::WatchNotFound(watch_id.clone()));
+        }
+        let _ = self.resource_updates.send("irc://agents".into());
+        Ok(())
+    }
+
+    /// Read everything a watch has not yet delivered, advancing its position.
+    ///
+    /// The journal read itself is unfiltered so the stored position advances
+    /// over records the watch does not want; otherwise a quiet watch on a busy
+    /// stream would rescan the same events forever. Selection is applied
+    /// afterwards, which is also what lets the compact projection drop protocol
+    /// records without those records blocking the cursor.
+    pub async fn read_watch(&self, watch_id: &WatchId) -> Result<WatchResource> {
+        let (agent_id, filter, cursor) = self
+            .watches
+            .position(watch_id)
+            .ok_or_else(|| GatewayError::WatchNotFound(watch_id.clone()))?;
+        let handle = self.resolve(&agent_id).await?;
+        let snapshot = handle.snapshot().await?;
+        let case_mapping = case_mapping_of(&snapshot);
+        let limit = self.config.limits.max_event_page_size;
+
+        // Keep reading while the page is entirely uninteresting, so a
+        // notification never resolves to an empty read while matching records
+        // sit just past the first page. Bounded by the retained window, since
+        // every pass consumes at least one record.
+        let mut cursor = cursor;
+        // The opening read decides the status: a gap or a stream reset relative
+        // to the position the watch actually held is what the caller needs to
+        // hear about, and later passes are all continuations of this same read.
+        let mut status = None;
+        let mut events = Vec::new();
+        let has_more = loop {
+            let page = handle
+                .read_events(
+                    cursor.clone(),
+                    limit,
+                    Duration::ZERO,
+                    EventFilter::default(),
+                )
+                .await?;
+            status.get_or_insert(page.status);
+            let advanced = page.next_cursor.clone();
+            events.extend(
+                page.events
+                    .iter()
+                    .filter(|event| filter.matches(event, case_mapping))
+                    .filter_map(CompactEvent::project),
+            );
+            let more = advanced.sequence < page.latest.sequence;
+            // A pass that could not move is exhausted even if the journal
+            // reports later records, so this always terminates.
+            let stalled = cursor.as_ref() == Some(&advanced);
+            cursor = Some(advanced);
+            if !events.is_empty() || stalled || !more {
+                break more;
+            }
+        };
+
+        let status = status.unwrap_or(CursorStatus::Current);
+        let next_cursor = cursor.expect("a watch read always advances to a cursor");
+        self.watches.advance(watch_id, next_cursor.clone());
+        let watch = self
+            .watches
+            .describe(watch_id)
+            .ok_or_else(|| GatewayError::WatchNotFound(watch_id.clone()))?;
+        Ok(WatchResource {
+            watch,
+            status,
+            events,
+            next_cursor,
+            has_more,
+        })
+    }
+
     /// Invalidate an agent handle and request clean shutdown.
     pub async fn disconnect(
         &self,
@@ -206,6 +379,9 @@ impl Gateway {
             .remove(agent_id)
             .ok_or_else(|| GatewayError::AgentNotFound(agent_id.clone()))?;
         let result = actor.disconnect(reason).await;
+        // Watches outlive nothing: their stream is gone, so leaving them
+        // registered would only produce handles that can never be read.
+        self.watches.close_agent(agent_id);
         let _ = self.resource_updates.send("irc://agents".into());
         result
     }
@@ -217,6 +393,9 @@ impl Gateway {
             std::mem::take(&mut *agents)
         };
         let count = actors.len();
+        for agent_id in actors.keys() {
+            self.watches.close_agent(agent_id);
+        }
         let _ = self.resource_updates.send("irc://agents".into());
         let mut shutdowns = futures_util::stream::FuturesUnordered::new();
         for (agent_id, actor) in actors {
@@ -339,6 +518,18 @@ impl Gateway {
             .cloned()
             .ok_or_else(|| GatewayError::AgentNotFound(agent_id.clone()))
     }
+}
+
+/// The server's advertised nickname/channel comparison rule, or the RFC
+/// default when it has not advertised one.
+fn case_mapping_of(snapshot: &AgentSnapshot) -> CaseMapping {
+    snapshot
+        .protocol
+        .isupport
+        .get("CASEMAPPING")
+        .and_then(|token| token.value.as_deref())
+        .map(CaseMapping::parse)
+        .unwrap_or_default()
 }
 
 fn validate_identity_field(value: Option<&str>, name: &str, allow_spaces: bool) -> Result<()> {

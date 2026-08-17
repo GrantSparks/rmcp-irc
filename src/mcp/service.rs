@@ -15,11 +15,11 @@ use rmcp::{
         wrapper::Parameters,
     },
     model::{
-        CallToolResult, CompleteRequestParams, CompleteResult, CompletionInfo, ContentBlock,
-        Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-        PromptMessage, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
-        Reference, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
-        ServerInfo, SubscriptionFilter,
+        Annotations, CallToolResult, CompleteRequestParams, CompleteResult, CompletionInfo,
+        ContentBlock, Implementation, ListResourceTemplatesResult, ListResourcesResult,
+        PaginatedRequestParams, PromptMessage, ReadResourceRequestParams, ReadResourceResponse,
+        ReadResourceResult, Reference, Resource, ResourceContents, ResourceTemplate, Role,
+        ServerCapabilities, ServerInfo, SubscriptionFilter,
     },
     prompt, prompt_handler, prompt_router,
     service::{RequestContext, RoleServer, SubscriptionContext},
@@ -37,30 +37,51 @@ use crate::{
     },
     dcc::session::DccSession,
     error::GatewayError,
-    gateway::{ConnectRequest, Gateway},
+    gateway::{ConnectRequest, ConversationWindow, Gateway},
     irc::{
         capabilities::CapabilityStatus,
         correlation::{CommandOutcome, CommandResult},
         wire::{OutboundMessage, Tag},
     },
     mcp::{
-        resources::{AgentResourceUri, ResourceKind, ResourceUris, encode_channel_segment},
+        resources::{
+            AgentResourceUri, ResourceDescriptor, ResourceKind, ResourcePayload, ResourceUris,
+            descriptors_for_agent, encode_channel_segment,
+        },
         tools::*,
+        watch::{
+            WatchCloseInput, WatchCloseOutput, WatchCreateInput, WatchCreateOutput,
+            WatchDescriptor, WatchId,
+        },
     },
 };
 
-/// The one resource template this server exposes. Declared once so the
-/// template listing and its argument completion cannot drift apart.
+/// Resource templates this server exposes. Declared once so the template
+/// listing and its argument completion cannot drift apart.
 const CHANNEL_STATE_TEMPLATE: &str = "irc://agents/{agent_id}/channels/{encoded_channel}";
+
+/// Member list of one channel, addressable without its topic and modes.
+const CHANNEL_MEMBERS_TEMPLATE: &str = "irc://agents/{agent_id}/channels/{encoded_channel}/members";
+
+/// Topic of one channel, addressable on its own.
+const CHANNEL_TOPIC_TEMPLATE: &str = "irc://agents/{agent_id}/channels/{encoded_channel}/topic";
+
+/// Compact conversation with one channel or peer.
+const TRANSCRIPT_TEMPLATE: &str = "irc://agents/{agent_id}/transcripts/{encoded_channel}";
 
 /// Cursor-page expansion of the per-agent events resource. Subscribing to
 /// `irc://agents/{agent_id}/events` and reading this on each notification is a
 /// complete delivery loop that needs no tool call.
 const EVENT_CURSOR_TEMPLATE: &str = "irc://agents/{agent_id}/events/after/{sequence}";
 
-/// Resources returned by one `resources/list` page. Six resources exist per
-/// connected agent, so this keeps a full listing well inside client response
-/// limits even at the configured agent ceiling.
+/// Watch handles are addressed under their own authority rather than under an
+/// agent, because a watch outlives any single read and is the thing a client
+/// subscribes to.
+const WATCH_URI_PREFIX: &str = "irc://watches/";
+
+/// Resources returned by one `resources/list` page. A connected agent
+/// contributes eight fixed resources plus four per joined channel, so this
+/// keeps a full listing well inside client response limits.
 const RESOURCE_PAGE_SIZE: usize = 60;
 
 #[cfg(test)]
@@ -291,6 +312,70 @@ impl IrcMcpService {
 
     /// Read a consistent status snapshot.
     #[tool(
+        name = "irc.watch.create",
+        description = "Create a subscribable watch over one guest's events, returning a resource \
+                       link that delivers matching activity without polling.",
+        output_schema = schema_for_output::<WatchCreateOutput>(),
+        annotations(
+            title = "Create event watch",
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn irc_watch_create(
+        &self,
+        Parameters(input): Parameters<WatchCreateInput>,
+    ) -> CallToolResult {
+        let filter = input.filter();
+        match self
+            .gateway
+            .create_watch(&input.agent_id, filter, input.cursor)
+            .await
+        {
+            Ok(watch) => {
+                let summary = format!("Watching {} at {}.", watch.agent_id, watch.uri);
+                let link = ContentBlock::ResourceLink(watch_resource_entry(&watch));
+                let output = WatchCreateOutput {
+                    watch,
+                    instructions: "Subscribe to this watch's URI, then read it on each notification. Each \
+                         read returns everything matching since the previous one and advances the \
+                         watch, so no cursor argument is needed. A `status` other than `current` \
+                         means records were lost. Release the handle with irc.watch.close.",
+                };
+                tool_success_with_content(summary, &output, vec![link])
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    #[tool(
+        name = "irc.watch.close",
+        description = "Release one watch handle and stop its resource notifications.",
+        output_schema = schema_for_output::<WatchCloseOutput>(),
+        annotations(
+            title = "Close event watch",
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn irc_watch_close(
+        &self,
+        Parameters(input): Parameters<WatchCloseInput>,
+    ) -> CallToolResult {
+        match self.gateway.close_watch(&input.watch_id) {
+            Ok(()) => tool_success(
+                format!("Closed watch {}.", input.watch_id),
+                &WatchCloseOutput {
+                    watch_id: input.watch_id,
+                },
+            ),
+            Err(error) => tool_error(error),
+        }
+    }
+
+    #[tool(
         name = "irc.status",
         description = "Read connection, identity, protocol, event, and reconnect status for one guest.",
         output_schema = schema_for_output::<StatusOutput>(),
@@ -476,12 +561,7 @@ impl IrcMcpService {
                 let failure = outcome.filter(|outcome| is_failure_outcome(*outcome));
                 let summary = history_result_summary(failure);
                 let resources = ResourceUris::for_agent(&agent_id);
-                let mut content = vec![resource_link(
-                    resources.events,
-                    "irc-agent-events",
-                    "IRC event stream",
-                    "Live and retained events for the agent that produced this history",
-                )];
+                let mut content = vec![resource_link(resources.events)];
                 if let Some(channel) = channel {
                     content.push(channel_resource_link(
                         ResourceUris::channel(&agent_id, channel.as_str()),
@@ -1556,12 +1636,7 @@ impl IrcMcpService {
                     page.next_cursor.sequence
                 ),
                 &page,
-                vec![resource_link(
-                    resources.events,
-                    "irc-agent-events",
-                    "IRC event stream",
-                    "Live and retained events for this IRC agent",
-                )],
+                vec![resource_link(resources.events)],
             ),
             Err(error) => tool_error(error),
         }
@@ -1951,10 +2026,11 @@ impl ServerHandler for IrcMcpService {
 
     /// List agent resources one bounded page at a time.
     ///
-    /// Six resources exist per connected agent, so at the configured agent
-    /// ceiling an unpaginated reply would be large enough to break clients that
-    /// bound response size. The cursor is the index of the first item on the
-    /// next page, which is stable because `agent_ids` is ordered.
+    /// Eight fixed resources plus per-channel resources exist for each agent,
+    /// so at the configured agent ceiling an unpaginated reply would be large
+    /// enough to break clients that bound response size. The cursor is the
+    /// index of the first item on the next page, which is stable because
+    /// `agent_ids` is ordered.
     async fn list_resources(
         &self,
         request: Option<PaginatedRequestParams>,
@@ -1969,13 +2045,20 @@ impl ServerHandler for IrcMcpService {
 
         let mut resources = Vec::new();
         for agent_id in self.gateway.agent_ids().await {
-            let uris = ResourceUris::for_agent(&agent_id);
-            resources.extend(uris.named().into_iter().map(|(name, uri)| {
-                Resource::new(uri, format!("{}-{name}", agent_id.as_str()))
-                    .with_title(format!("IRC {name} for {agent_id}"))
-                    .with_description(format!("In-memory {name} snapshot for {agent_id}"))
-                    .with_mime_type("application/json")
-            }));
+            // A snapshot is what makes the per-channel resources discoverable
+            // and supplies the last-modified hint; an agent that vanished
+            // mid-listing simply contributes nothing.
+            let Ok(snapshot) = self.gateway.snapshot(&agent_id).await else {
+                continue;
+            };
+            resources.extend(
+                descriptors_for_agent(&agent_id, &snapshot.state, Some(snapshot.state.snapshot_at))
+                    .into_iter()
+                    .map(ResourceDescriptor::into_resource),
+            );
+        }
+        for watch in self.gateway.watches().list() {
+            resources.push(watch_resource_entry(&watch));
         }
 
         if offset > resources.len() {
@@ -2007,6 +2090,24 @@ impl ServerHandler for IrcMcpService {
                 .with_title("IRC channel state")
                 .with_description("Best-effort state for one channel joined by one explicit agent")
                 .with_mime_type("application/json"),
+            ResourceTemplate::new(CHANNEL_MEMBERS_TEMPLATE, "irc-channel-members")
+                .with_title("IRC channel members")
+                .with_description("Who is currently in one channel, without its topic or modes")
+                .with_mime_type("application/json"),
+            ResourceTemplate::new(CHANNEL_TOPIC_TEMPLATE, "irc-channel-topic")
+                .with_title("IRC channel topic")
+                .with_description(
+                    "The current topic of one channel. Channel topics carry that channel's \
+                     standing instructions, so this is worth reading on its own.",
+                )
+                .with_mime_type("application/json"),
+            ResourceTemplate::new(TRANSCRIPT_TEMPLATE, "irc-transcript")
+                .with_title("IRC conversation transcript")
+                .with_description(
+                    "Compact conversation with one channel or peer: who said what, and when, \
+                     without the lossless protocol detail.",
+                )
+                .with_mime_type("application/json"),
             ResourceTemplate::new(EVENT_CURSOR_TEMPLATE, "irc-events-after")
                 .with_title("IRC events after a cursor")
                 .with_description(
@@ -2023,6 +2124,19 @@ impl ServerHandler for IrcMcpService {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
+        // A watch lives under its own authority and is read entirely from the
+        // registry, so it is resolved before any agent lookup.
+        if let Some(handle) = request.uri.strip_prefix(WATCH_URI_PREFIX) {
+            let watch_id = WatchId::from_str(handle)
+                .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
+            let payload = self
+                .gateway
+                .read_watch(&watch_id)
+                .await
+                .map_err(gateway_read_error)?;
+            return json_resource(request.uri, &payload);
+        }
+
         let uri = AgentResourceUri::from_str(&request.uri)
             .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
 
@@ -2046,34 +2160,62 @@ impl ServerHandler for IrcMcpService {
         // notification already said there is something to collect. The stream
         // id comes from the snapshot, so the page reports a genuine gap or
         // reset instead of silently restarting the caller.
-        let text = if let ResourceKind::EventsAfter(sequence) = uri.kind {
-            let page = self
-                .gateway
-                .read_events(
-                    &uri.agent_id,
-                    Some(EventCursor {
-                        stream_id: snapshot.journal.stream_id.clone(),
-                        sequence,
-                    }),
-                    self.gateway.config().limits.max_event_page_size,
-                    Duration::ZERO,
-                    EventFilter::default(),
-                )
-                .await
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-            serde_json::to_string_pretty(&page)
-        } else {
-            let payload = snapshot
-                .resource(&uri)
-                .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
-            serde_json::to_string_pretty(&payload)
+        // Journal-backed windows are live reads rather than snapshot fields, so
+        // each is served straight from the gateway. This is the read half of
+        // the subscribe-then-read loop, and it deliberately does not long poll:
+        // the notification already said there is something to collect.
+        match &uri.kind {
+            ResourceKind::EventsAfter(sequence) => {
+                let page = self
+                    .gateway
+                    .read_events(
+                        &uri.agent_id,
+                        Some(EventCursor {
+                            // The stream id comes from the snapshot, so the page
+                            // reports a genuine gap or reset instead of silently
+                            // restarting the caller.
+                            stream_id: snapshot.journal.stream_id.clone(),
+                            sequence: *sequence,
+                        }),
+                        self.gateway.config().limits.max_event_page_size,
+                        Duration::ZERO,
+                        EventFilter::default(),
+                    )
+                    .await
+                    .map_err(gateway_read_error)?;
+                json_resource(request.uri, &page)
+            }
+            ResourceKind::Inbox => {
+                let payload = self
+                    .gateway
+                    .read_conversation(&uri.agent_id, ConversationWindow::Inbox)
+                    .await
+                    .map_err(gateway_read_error)?;
+                json_resource(request.uri, &ResourcePayload::Inbox(payload))
+            }
+            ResourceKind::Transcript(target) => {
+                let payload = self
+                    .gateway
+                    .read_conversation(&uri.agent_id, ConversationWindow::Target(target))
+                    .await
+                    .map_err(gateway_read_error)?;
+                json_resource(request.uri, &ResourcePayload::Transcript(payload))
+            }
+            ResourceKind::Wire => {
+                let payload = self
+                    .gateway
+                    .read_wire(&uri.agent_id)
+                    .await
+                    .map_err(gateway_read_error)?;
+                json_resource(request.uri, &ResourcePayload::Wire(Box::new(payload)))
+            }
+            _ => {
+                let payload = snapshot
+                    .resource(&uri)
+                    .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
+                json_resource(request.uri, &payload)
+            }
         }
-        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-
-        Ok(ReadResourceResult::new(vec![
-            ResourceContents::text(text, request.uri).with_mime_type("application/json"),
-        ])
-        .into())
     }
 
     /// Complete the channel-state template arguments from live gateway state.
@@ -2162,12 +2304,84 @@ impl ServerHandler for IrcMcpService {
                     Ok(uri) => {
                         let _ = context.sink().notify_resource_updated(uri).await;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    // Dropping notifications silently leaves a subscriber
+                    // believing its last read is still current, which is the
+                    // one failure a resource subscription must not have. Every
+                    // resource that exists is republished instead, so each
+                    // subscriber re-reads exactly what it holds and recovers
+                    // its own position from the cursor or status in the
+                    // payload.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!(missed, "resource notifications lagged; resynchronizing");
+                        self.notify_resynchronization(&context).await;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
         }
     }
+}
+
+impl IrcMcpService {
+    /// Republish every live resource after notifications were dropped.
+    ///
+    /// The list-changed notification comes first: a client that lost updates
+    /// may also have missed an agent appearing or going away, so the catalog
+    /// itself is resynchronized before the individual URIs within it.
+    async fn notify_resynchronization(&self, context: &SubscriptionContext) {
+        let _ = context.sink().notify_resource_list_changed().await;
+        for agent_id in self.gateway.agent_ids().await {
+            let Ok(snapshot) = self.gateway.snapshot(&agent_id).await else {
+                continue;
+            };
+            for descriptor in descriptors_for_agent(&agent_id, &snapshot.state, None) {
+                let _ = context.sink().notify_resource_updated(descriptor.uri).await;
+            }
+        }
+        for watch in self.gateway.watches().list() {
+            let _ = context.sink().notify_resource_updated(watch.uri).await;
+        }
+    }
+}
+
+/// Serialize one payload as the JSON contents of a resource read.
+fn json_resource<T: Serialize>(uri: String, payload: &T) -> Result<ReadResourceResponse, McpError> {
+    let text = serde_json::to_string_pretty(payload)
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    Ok(ReadResourceResult::new(vec![
+        ResourceContents::text(text, uri).with_mime_type("application/json"),
+    ])
+    .into())
+}
+
+/// Classify a gateway failure encountered while reading a resource.
+///
+/// Only a genuinely absent handle is "not found". Anything else went wrong on
+/// our side, and a caller retrying a different URI would be chasing the wrong
+/// problem.
+fn gateway_read_error(error: GatewayError) -> McpError {
+    match error {
+        GatewayError::AgentNotFound(_) | GatewayError::WatchNotFound(_) => {
+            McpError::resource_not_found(error.to_string(), None)
+        }
+        other => McpError::internal_error(other.to_string(), None),
+    }
+}
+
+/// Catalog entry for one watch handle.
+fn watch_resource_entry(watch: &WatchDescriptor) -> Resource {
+    Resource::new(watch.uri.clone(), format!("watch-{}", watch.watch_id))
+        .with_title(format!("Watch on {}", watch.agent_id))
+        .with_description(
+            "Everything this watch selected since it was last read, with the position it \
+             advanced to. Subscribe here and read on each notification.",
+        )
+        .with_mime_type("application/json")
+        .with_annotations(
+            Annotations::default()
+                .with_audience(vec![Role::Assistant, Role::User])
+                .with_priority(1.0),
+        )
 }
 
 fn connect_request(input: ConnectInput) -> Result<ConnectRequest, GatewayError> {
@@ -2771,6 +2985,9 @@ fn tool_success(summary: impl Into<String>, value: &impl Serialize) -> CallToolR
     structured_result(summary, value, false)
 }
 
+/// Succeed with additional native content blocks after the text summary, so a
+/// client can recognize a returned resource as something to attach or
+/// subscribe to rather than as a URI printed inside JSON.
 fn tool_success_with_content(
     summary: impl Into<String>,
     value: &impl Serialize,
@@ -2827,51 +3044,27 @@ fn structured_result_with_content(
     }
 }
 
-fn resource_link(
-    uri: impl Into<String>,
-    name: impl Into<String>,
-    title: impl Into<String>,
-    description: impl Into<String>,
-) -> ContentBlock {
-    ContentBlock::ResourceLink(
-        Resource::new(uri, name)
-            .with_title(title)
-            .with_description(description)
-            .with_mime_type("application/json"),
-    )
+fn resource_link(uri: impl Into<String>) -> ContentBlock {
+    let uri = uri.into();
+    let parsed =
+        AgentResourceUri::from_str(&uri).expect("gateway-generated agent resource URI must parse");
+    ContentBlock::ResourceLink(crate::mcp::resources::describe(&parsed, None).into_resource())
 }
 
 fn agent_resource_links(resources: &ResourceUris) -> Vec<ContentBlock> {
     resources
         .named()
         .into_iter()
-        .map(|(name, uri)| {
-            resource_link(
-                uri,
-                format!("irc-agent-{name}"),
-                format!("IRC agent {name}"),
-                format!("Live {name} resource for this IRC agent"),
-            )
-        })
+        .map(|(_, uri)| resource_link(uri))
         .collect()
 }
 
-fn channel_resource_link(uri: impl Into<String>, channel: &str) -> ContentBlock {
-    resource_link(
-        uri,
-        "irc-channel-state",
-        format!("IRC channel {channel}"),
-        format!("Live topic, membership, and mode state for {channel}"),
-    )
+fn channel_resource_link(uri: impl Into<String>, _channel: &str) -> ContentBlock {
+    resource_link(uri)
 }
 
 fn dcc_resource_link(agent_id: &crate::agent::AgentId) -> ContentBlock {
-    resource_link(
-        ResourceUris::for_agent(agent_id).dcc,
-        "irc-dcc-sessions",
-        "IRC DCC sessions",
-        "Live direct-chat and file-transfer sessions for this IRC agent",
-    )
+    resource_link(ResourceUris::for_agent(agent_id).dcc)
 }
 
 fn tool_error(error: GatewayError) -> CallToolResult {
@@ -3008,7 +3201,7 @@ mod tests {
         let agent_id = crate::agent::AgentId::new();
         let resources = ResourceUris::for_agent(&agent_id);
         let links = agent_resource_links(&resources);
-        assert_eq!(links.len(), 6);
+        assert_eq!(links.len(), resources.named().len());
         assert!(
             links
                 .iter()
@@ -3020,7 +3213,7 @@ mod tests {
             &serde_json::json!({"agent_id": agent_id}),
             links,
         );
-        assert_eq!(result.content.len(), 7);
+        assert_eq!(result.content.len(), resources.named().len() + 1);
         assert_eq!(
             result.content[0].as_text().expect("summary text").text,
             "connected"
@@ -3028,7 +3221,10 @@ mod tests {
         let linked_uris: BTreeSet<_> = result.content[1..]
             .iter()
             .map(|block| match block {
-                ContentBlock::ResourceLink(resource) => resource.uri.as_str(),
+                ContentBlock::ResourceLink(resource) => {
+                    assert!(resource.annotations.is_some());
+                    resource.uri.as_str()
+                }
                 other => panic!("expected resource link, got {other:?}"),
             })
             .collect();
@@ -3139,17 +3335,24 @@ mod tests {
         let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
         let mut checked = 0_usize;
         for tool in service.tool_router.list_all() {
-            let Some(description) = property_description(&tool.input_schema, "agent_id") else {
-                continue;
-            };
-            assert!(
-                description.contains("irc.connect"),
-                "{}: agent_id description does not name its source: {description:?}",
-                tool.name
-            );
-            checked += 1;
+            // Each handle names the tool that mints it, so a caller reading one
+            // schema never has to search for where the value comes from.
+            for (property, source) in [
+                ("agent_id", "irc.connect"),
+                ("watch_id", "irc.watch.create"),
+            ] {
+                let Some(description) = property_description(&tool.input_schema, property) else {
+                    continue;
+                };
+                assert!(
+                    description.contains(source),
+                    "{}: {property} description does not name its source: {description:?}",
+                    tool.name
+                );
+                checked += 1;
+            }
         }
-        // Every tool except irc.connect itself takes a handle.
+        // Every tool takes a handle except irc.connect, which mints one.
         assert_eq!(checked, TOOL_NAMES.len() - 1);
     }
 

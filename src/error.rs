@@ -62,6 +62,10 @@ pub enum GatewayError {
     #[error("unknown or expired agent handle: {0}")]
     AgentNotFound(AgentId),
 
+    /// A referenced watch handle does not exist.
+    #[error("unknown or expired watch handle: {0}")]
+    WatchNotFound(crate::mcp::watch::WatchId),
+
     /// An IRC message could not be represented safely.
     #[error("invalid IRC operation: {0}")]
     InvalidMessage(String),
@@ -119,7 +123,7 @@ impl GatewayError {
     pub const fn kind(&self) -> ErrorKind {
         match self {
             Self::Configuration(_) => ErrorKind::Configuration,
-            Self::AgentNotFound(_) => ErrorKind::NotFound,
+            Self::AgentNotFound(_) | Self::WatchNotFound(_) => ErrorKind::NotFound,
             Self::InvalidMessage(_) => ErrorKind::Validation,
             Self::ResourceLimit(_) => ErrorKind::ResourceLimit,
             Self::NotConnected(_) => ErrorKind::NotConnected,

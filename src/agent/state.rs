@@ -78,7 +78,7 @@ pub struct MotdState {
 }
 
 /// Best-effort identity and presence information.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct IdentityState {
     /// Current case-preserved nickname.
     pub nickname: Option<String>,
@@ -97,7 +97,7 @@ pub struct IdentityState {
 }
 
 /// Best-effort information about one channel member.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct MemberState {
     /// IRC account when known.
     pub account: Option<String>,
@@ -112,7 +112,7 @@ pub struct MemberState {
 }
 
 /// Advisory snapshot for one joined channel.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct ChannelState {
     /// Case-preserved channel name.
     pub name: String,

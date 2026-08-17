@@ -22,7 +22,9 @@ use crate::{
 };
 
 /// Stable event class understood by filters and clients.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, JsonSchema, Ord, PartialEq, Eq, PartialOrd, Serialize,
+)]
 pub enum EventClass {
     /// Channel message.
     #[serde(rename = "message.channel")]
@@ -340,6 +342,53 @@ pub struct EventFilter {
     pub mentions_me: Option<bool>,
 }
 
+/// A newest-first window request over the journal.
+///
+/// Kept separate from [`EventFilter`], which is a tool input schema: a
+/// conversational resource addresses a channel or peer by name and needs the
+/// server's case mapping applied, which is gateway knowledge rather than
+/// something a caller should have to spell exactly.
+#[derive(Clone, Debug, Default)]
+pub struct RecentQuery {
+    /// Selection shared with cursor reads.
+    pub filter: EventFilter,
+    /// Case-folded target and the mapping used to fold it.
+    pub folded_target: Option<(String, CaseMapping)>,
+}
+
+impl RecentQuery {
+    /// Restrict the window to one channel or peer, compared case-insensitively.
+    pub fn for_target(target: &str, case_mapping: CaseMapping) -> Self {
+        Self {
+            filter: EventFilter::default(),
+            folded_target: Some((case_mapping.fold(target), case_mapping)),
+        }
+    }
+
+    /// Restrict the window to events addressed to the owning agent.
+    pub fn mentions() -> Self {
+        Self {
+            filter: EventFilter {
+                mentions_me: Some(true),
+                ..EventFilter::default()
+            },
+            folded_target: None,
+        }
+    }
+
+    fn matches(&self, event: &IrcEvent) -> bool {
+        self.folded_target
+            .as_ref()
+            .is_none_or(|(wanted, case_mapping)| {
+                event
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| case_mapping.fold(target) == *wanted)
+            })
+            && self.filter.matches(event)
+    }
+}
+
 impl EventFilter {
     fn matches(&self, event: &IrcEvent) -> bool {
         self.command_id
@@ -622,6 +671,33 @@ impl EventJournal {
         }
     }
 
+    /// The most recently appended event, if any is still retained.
+    pub fn latest_event(&self) -> Option<&IrcEvent> {
+        self.events.back().map(|(event, _)| event)
+    }
+
+    /// Return the newest matching retained events, oldest-first.
+    ///
+    /// [`Self::read`] answers "what comes after this cursor", which starts at
+    /// the oldest retained record when the caller has no cursor. A preview
+    /// window wants the opposite end: once more than `limit` records are
+    /// retained, the interesting ones are the most recent. Taking from the back
+    /// and reversing keeps the returned slice in the same ascending order as
+    /// every other event list, so callers never have to special-case it.
+    pub fn read_latest(&self, limit: usize, query: &RecentQuery) -> Vec<IrcEvent> {
+        let mut newest: Vec<IrcEvent> = self
+            .events
+            .iter()
+            .rev()
+            .map(|(event, _)| event)
+            .filter(|event| query.matches(event))
+            .take(limit)
+            .cloned()
+            .collect();
+        newest.reverse();
+        newest
+    }
+
     /// Return bounded journal measurements.
     pub fn stats(&self) -> JournalStats {
         JournalStats {
@@ -764,6 +840,63 @@ mod tests {
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.events[0].cursor, addressed);
         assert!(page.events[0].mentions_me);
+    }
+
+    #[test]
+    fn the_recent_window_reads_the_newest_events_rather_than_the_oldest() {
+        let agent = AgentId::new();
+        let mut journal = EventJournal::new(64, 1_000_000);
+        for _ in 0..20 {
+            journal
+                .push(event(&agent, EventClass::MessageChannel))
+                .expect("push");
+        }
+        let latest = journal.stats().latest.sequence;
+
+        let recent = journal.read_latest(5, &RecentQuery::default());
+        assert_eq!(recent.len(), 5);
+        // Ascending order is preserved, and the window ends at the newest
+        // record rather than starting at the oldest retained one.
+        assert_eq!(recent.last().expect("newest").cursor.sequence, latest);
+        assert_eq!(
+            recent.first().expect("oldest shown").cursor.sequence,
+            latest - 4
+        );
+
+        let cursorless_page = journal.read(None, 5, &EventFilter::default());
+        assert_eq!(
+            cursorless_page
+                .events
+                .first()
+                .expect("first")
+                .cursor
+                .sequence,
+            1,
+            "a cursor-less read still starts at the beginning, which is why the \
+             preview needs its own newest-first read"
+        );
+    }
+
+    #[test]
+    fn a_recent_window_can_select_one_target_case_insensitively() {
+        let agent = AgentId::new();
+        let mut journal = EventJournal::new(64, 1_000_000);
+        for target in ["#Control", "#other", "#control"] {
+            let mut record = event(&agent, EventClass::MessageChannel);
+            record.target = Some(target.to_owned());
+            journal.push(record).expect("push");
+        }
+
+        let window = journal.read_latest(
+            10,
+            &RecentQuery::for_target("#CONTROL", CaseMapping::default()),
+        );
+        assert_eq!(window.len(), 2);
+        assert!(
+            window
+                .iter()
+                .all(|event| event.target.as_deref() != Some("#other"))
+        );
     }
 
     #[test]
