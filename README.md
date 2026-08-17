@@ -246,9 +246,14 @@ machine in stdio mode and the shared server in HTTP mode. File contents are
 streamed and never placed in MCP results or the event journal.
 
 Incoming DCC offers must be direct messages to the actor, private/local peer
-addresses are opt-in, advertised filenames cannot contain paths, accepted
-files stay below the configured download root, and every receive has a byte
-ceiling. See the [DCC guide](docs/DCC.md).
+addresses are opt-in, advertised filenames cannot contain paths, and every
+receive has a byte ceiling. Configuration declares named receive roots, which are
+the gateway's complete filesystem authority; `irc.dcc.accept` names one of them
+plus a relative destination, and resolution holds each directory open rather than
+re-walking a path, so no link or swapped directory can move a write outside the
+chosen root. Where the root is genuinely the caller's choice, the tool asks for it
+through an MCP elicitation and completes on the retry. See the
+[DCC guide](docs/DCC.md).
 
 ## Documentation
 

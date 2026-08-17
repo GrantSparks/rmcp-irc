@@ -10,13 +10,16 @@ use std::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    fs::{self, File, OpenOptions},
+    fs::File,
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, SeekFrom},
     sync::mpsc,
 };
 use uuid::Uuid;
 
-use super::session::DccSessionId;
+use super::{
+    confine::{Occupant, ReceiveDestination},
+    session::DccSessionId,
+};
 
 /// Caller-selected behavior when a destination already exists.
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
@@ -45,8 +48,13 @@ pub struct TransferProgress {
 /// Completed receive result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceivedFile {
-    /// Actual committed destination, including any generated rename.
+    /// Actual committed destination on the gateway host, including any
+    /// generated rename.
     pub path: PathBuf,
+    /// Configured receive root the file was written beneath.
+    pub root: String,
+    /// Committed destination relative to that root.
+    pub relative_path: PathBuf,
     /// Final file length.
     pub bytes: u64,
 }
@@ -184,10 +192,17 @@ fn expand_acknowledgement(raw: u32, previous: u64) -> u64 {
 }
 
 /// Receive a DCC stream and commit it according to explicit conflict behavior.
+///
+/// `destination` is a directory this process already holds open plus a name
+/// inside it, so every operation below — the conflict probe, the temporary file,
+/// the commit, the cleanup — addresses an entry within that descriptor. Nothing
+/// here re-resolves a path, which is what keeps a link or a swapped directory
+/// from redirecting the write after the destination was confined. See
+/// [`crate::dcc::confine`].
 pub async fn receive_file<S>(
     stream: S,
     session_id: DccSessionId,
-    destination: &Path,
+    mut destination: ReceiveDestination,
     options: ReceiveOptions,
 ) -> Result<ReceivedFile, TransferError>
 where
@@ -215,27 +230,21 @@ where
         });
     }
 
-    let final_path = if options.transfer.resume_offset == 0 {
-        select_destination(destination, options.conflict).await?
-    } else {
-        destination.to_path_buf()
-    };
     let (mut file, temporary) = if options.transfer.resume_offset == 0 {
-        let temporary = temporary_path(&final_path);
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .await
-            .map_err(|source| TransferError::Io {
-                operation: "create temporary DCC destination",
-                source,
-            })?;
+        select_destination(&mut destination, options.conflict).await?;
+        let temporary = temporary_name(destination.file_name());
+        let file =
+            destination
+                .create_new(&temporary)
+                .await
+                .map_err(|source| TransferError::Io {
+                    operation: "create temporary DCC destination",
+                    source,
+                })?;
         (file, Some(temporary))
     } else {
-        let file = OpenOptions::new()
-            .append(true)
-            .open(&final_path)
+        let file = destination
+            .open_append(destination.file_name())
             .await
             .map_err(|source| TransferError::Io {
                 operation: "open partial DCC destination",
@@ -264,7 +273,7 @@ where
         Err(error) => {
             drop(file);
             if let Some(temporary) = temporary {
-                let _ = fs::remove_file(temporary).await;
+                let _ = destination.remove(&temporary).await;
             }
             return Err(error);
         }
@@ -280,10 +289,12 @@ where
     })?;
     drop(file);
     if let Some(temporary) = temporary {
-        commit_temporary(&temporary, &final_path, options.conflict).await?;
+        commit_temporary(&destination, &temporary, options.conflict).await?;
     }
     Ok(ReceivedFile {
-        path: final_path,
+        path: destination.path(),
+        root: destination.root().to_owned(),
+        relative_path: destination.relative_path(),
         bytes: transferred,
     })
 }
@@ -405,48 +416,53 @@ async fn peer_io<T>(
         .map_err(|source| TransferError::Io { operation, source })
 }
 
+/// Settle which name inside the confined directory this transfer commits to.
+///
+/// The probe never follows a link, so a link planted at the destination name is
+/// an occupied name to resolve rather than a route out of the receive root: with
+/// `fail` the transfer stops, with `replace` the commit rename replaces the link
+/// itself, and with `rename` the transfer moves aside.
 async fn select_destination(
-    requested: &Path,
+    destination: &mut ReceiveDestination,
     conflict: DestinationConflict,
-) -> Result<PathBuf, TransferError> {
-    if requested.file_name().is_none() {
-        return Err(TransferError::InvalidDestination(requested.to_path_buf()));
-    }
-    match fs::metadata(requested).await {
-        Ok(metadata) if metadata.is_dir() => {
-            Err(TransferError::InvalidDestination(requested.to_path_buf()))
-        }
-        Ok(_) => match conflict {
-            DestinationConflict::Fail => {
-                Err(TransferError::DestinationExists(requested.to_path_buf()))
-            }
-            DestinationConflict::Replace => Ok(requested.to_path_buf()),
-            DestinationConflict::Rename => available_sibling(requested).await,
-        },
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(requested.to_path_buf()),
-        Err(source) => Err(TransferError::Io {
+) -> Result<(), TransferError> {
+    let occupant = destination
+        .occupant(destination.file_name())
+        .await
+        .map_err(|source| TransferError::Io {
             operation: "inspect DCC destination",
             source,
-        }),
+        })?;
+    match occupant {
+        None => Ok(()),
+        Some(Occupant::Directory) => Err(TransferError::InvalidDestination(destination.path())),
+        Some(Occupant::Entry) => match conflict {
+            DestinationConflict::Fail => Err(TransferError::DestinationExists(destination.path())),
+            DestinationConflict::Replace => Ok(()),
+            DestinationConflict::Rename => {
+                let available = available_sibling(destination).await?;
+                destination.set_file_name(available);
+                Ok(())
+            }
+        },
     }
 }
 
-async fn available_sibling(requested: &Path) -> Result<PathBuf, TransferError> {
-    let parent = requested.parent().unwrap_or_else(|| Path::new("."));
-    let stem = requested
+async fn available_sibling(destination: &ReceiveDestination) -> Result<String, TransferError> {
+    let taken = Path::new(destination.file_name());
+    let stem = taken
         .file_stem()
         .and_then(|value| value.to_str())
-        .ok_or_else(|| TransferError::InvalidDestination(requested.to_path_buf()))?;
-    let extension = requested.extension().and_then(|value| value.to_str());
+        .ok_or_else(|| TransferError::InvalidDestination(destination.path()))?;
+    let extension = taken.extension().and_then(|value| value.to_str());
     for number in 2..=10_000 {
-        let name = extension.map_or_else(
+        let candidate = extension.map_or_else(
             || format!("{stem} ({number})"),
             |extension| format!("{stem} ({number}).{extension}"),
         );
-        let candidate = parent.join(name);
-        match fs::metadata(&candidate).await {
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(candidate),
+        match destination.occupant(&candidate).await {
+            Ok(None) => return Ok(candidate),
+            Ok(Some(_)) => {}
             Err(source) => {
                 return Err(TransferError::Io {
                     operation: "inspect renamed DCC destination",
@@ -455,25 +471,22 @@ async fn available_sibling(requested: &Path) -> Result<PathBuf, TransferError> {
             }
         }
     }
-    Err(TransferError::RenameExhausted(requested.to_path_buf()))
+    Err(TransferError::RenameExhausted(destination.path()))
 }
 
-fn temporary_path(final_path: &Path) -> PathBuf {
-    let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
-    let filename = final_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("download");
-    parent.join(format!(".{filename}.{}.part", Uuid::new_v4()))
+fn temporary_name(file_name: &str) -> String {
+    format!(".{file_name}.{}.part", Uuid::new_v4())
 }
 
 async fn commit_temporary(
-    temporary: &Path,
-    destination: &Path,
+    destination: &ReceiveDestination,
+    temporary: &str,
     conflict: DestinationConflict,
 ) -> Result<(), TransferError> {
+    let committed = destination.file_name();
     if conflict != DestinationConflict::Replace {
-        return fs::rename(temporary, destination)
+        return destination
+            .rename_within(temporary, committed)
             .await
             .map_err(|source| TransferError::Io {
                 operation: "commit DCC destination",
@@ -481,15 +494,8 @@ async fn commit_temporary(
             });
     }
 
-    let backup = destination.with_file_name(format!(
-        ".{}.{}.backup",
-        destination
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("download"),
-        Uuid::new_v4()
-    ));
-    let had_existing = match fs::rename(destination, &backup).await {
+    let backup = format!(".{committed}.{}.backup", Uuid::new_v4());
+    let had_existing = match destination.rename_within(committed, &backup).await {
         Ok(()) => true,
         Err(error) if error.kind() == ErrorKind::NotFound => false,
         Err(source) => {
@@ -499,17 +505,17 @@ async fn commit_temporary(
             });
         }
     };
-    if let Err(source) = fs::rename(temporary, destination).await {
+    if let Err(source) = destination.rename_within(temporary, committed).await {
         if had_existing {
-            let _ = fs::rename(&backup, destination).await;
+            let _ = destination.rename_within(&backup, committed).await;
         }
         return Err(TransferError::Io {
             operation: "commit replacement DCC destination",
             source,
         });
     }
-    if had_existing && let Err(error) = fs::remove_file(&backup).await {
-        tracing::warn!(path = %backup.display(), %error, "could not remove replaced DCC backup");
+    if had_existing && let Err(error) = destination.remove(&backup).await {
+        tracing::warn!(backup, %error, "could not remove replaced DCC backup");
     }
     Ok(())
 }
@@ -596,6 +602,20 @@ pub enum TransferError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DccReceiveRoot;
+
+    /// Resolve one destination inside a temporary receive root.
+    async fn destination(root: &Path, relative: &str) -> ReceiveDestination {
+        ReceiveDestination::resolve(
+            &DccReceiveRoot {
+                name: "downloads".into(),
+                path: root.to_path_buf(),
+            },
+            Path::new(relative),
+        )
+        .await
+        .expect("resolve destination")
+    }
 
     #[test]
     fn cumulative_acknowledgements_expand_across_the_u32_boundary() {
@@ -608,14 +628,17 @@ mod tests {
         let source_dir = tempfile::tempdir().expect("source tempdir");
         let destination_dir = tempfile::tempdir().expect("destination tempdir");
         let source = source_dir.path().join("source.bin");
-        let destination = destination_dir.path().join("destination.bin");
+        let received = destination(destination_dir.path(), "nested/destination.bin").await;
+        let committed = received.path();
         let data = vec![0x5a; 70_000];
-        fs::write(&source, &data).await.expect("write source");
+        tokio::fs::write(&source, &data)
+            .await
+            .expect("write source");
         let (left, right) = tokio::io::duplex(8 * 1024);
 
         let send_id = DccSessionId::new();
         let receive_id = DccSessionId::new();
-        let (sent, received) = tokio::join!(
+        let (sent, outcome) = tokio::join!(
             send_file(
                 left,
                 send_id,
@@ -630,7 +653,7 @@ mod tests {
             receive_file(
                 right,
                 receive_id,
-                &destination,
+                received,
                 ReceiveOptions {
                     conflict: DestinationConflict::Fail,
                     expected_size: Some(data.len() as u64),
@@ -645,8 +668,17 @@ mod tests {
             )
         );
         assert_eq!(sent.expect("send"), data.len() as u64);
-        assert_eq!(received.expect("receive").path, destination);
-        assert_eq!(fs::read(destination).await.expect("read destination"), data);
+        let outcome = outcome.expect("receive");
+        assert_eq!(outcome.path, committed);
+        assert_eq!(outcome.root, "downloads");
+        assert_eq!(
+            outcome.relative_path,
+            PathBuf::from("nested/destination.bin")
+        );
+        assert_eq!(
+            tokio::fs::read(committed).await.expect("read destination"),
+            data
+        );
     }
 
     #[tokio::test]
@@ -678,13 +710,15 @@ mod tests {
     #[tokio::test]
     async fn failed_conflict_never_touches_existing_file() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let destination = directory.path().join("existing");
-        fs::write(&destination, b"original").await.expect("seed");
+        let existing = directory.path().join("existing");
+        tokio::fs::write(&existing, b"original")
+            .await
+            .expect("seed");
         let (_left, right) = tokio::io::duplex(64);
         let error = receive_file(
             right,
             DccSessionId::new(),
-            &destination,
+            destination(directory.path(), "existing").await,
             ReceiveOptions {
                 conflict: DestinationConflict::Fail,
                 expected_size: Some(0),
@@ -700,13 +734,78 @@ mod tests {
         .await
         .expect_err("must reject");
         assert!(matches!(error, TransferError::DestinationExists(_)));
-        assert_eq!(fs::read(destination).await.expect("read"), b"original");
+        assert_eq!(tokio::fs::read(existing).await.expect("read"), b"original");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_at_the_destination_is_replaced_rather_than_written_through() {
+        // Following the link would place a peer's bytes anywhere the link
+        // addressed, which is the whole hole this confinement closes. Replacing
+        // it keeps the write inside the receive root and leaves the target of
+        // the link untouched.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().join("downloads");
+        let outside = directory.path().join("outside.txt");
+        tokio::fs::create_dir_all(&root).await.expect("root");
+        tokio::fs::write(&outside, b"untouched")
+            .await
+            .expect("outside file");
+        std::os::unix::fs::symlink(&outside, root.join("report.txt")).expect("link");
+
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let send = tokio::spawn(async move {
+            sender.write_all(b"peer").await.expect("write");
+            let mut acknowledgement = [0_u8; 4];
+            sender
+                .read_exact(&mut acknowledgement)
+                .await
+                .expect("acknowledgement");
+            drop(sender);
+        });
+        let outcome = receive_file(
+            receiver,
+            DccSessionId::new(),
+            destination(&root, "report.txt").await,
+            ReceiveOptions {
+                conflict: DestinationConflict::Replace,
+                expected_size: Some(4),
+                max_bytes: 16,
+                transfer: TransferOptions {
+                    resume_offset: 0,
+                    buffer_bytes: 16,
+                    idle_timeout: Duration::from_secs(1),
+                    progress: None,
+                },
+            },
+        )
+        .await
+        .expect("receive");
+        send.await.expect("sender");
+
+        assert_eq!(outcome.relative_path, PathBuf::from("report.txt"));
+        assert_eq!(
+            tokio::fs::read(&outside).await.expect("read outside"),
+            b"untouched"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join("report.txt"))
+                .await
+                .expect("read destination"),
+            b"peer"
+        );
+        assert!(
+            !tokio::fs::symlink_metadata(root.join("report.txt"))
+                .await
+                .expect("metadata")
+                .is_symlink()
+        );
     }
 
     #[tokio::test]
     async fn unknown_size_receive_stops_at_the_configured_limit() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let destination = directory.path().join("bounded.bin");
+        let bounded = directory.path().join("bounded.bin");
         let (mut sender, receiver) = tokio::io::duplex(64);
         let send = tokio::spawn(async move {
             sender.write_all(b"12345").await.expect("write");
@@ -719,7 +818,7 @@ mod tests {
         let error = receive_file(
             receiver,
             DccSessionId::new(),
-            &destination,
+            destination(directory.path(), "bounded.bin").await,
             ReceiveOptions {
                 conflict: DestinationConflict::Fail,
                 expected_size: None,
@@ -736,6 +835,6 @@ mod tests {
         .expect_err("limit must be enforced");
         send.await.expect("sender");
         assert!(matches!(error, TransferError::SizeLimit { limit: 4 }));
-        assert!(!destination.exists());
+        assert!(!bounded.exists());
     }
 }

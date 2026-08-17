@@ -149,6 +149,13 @@ and semantic events. After negotiation, the agent's DCC manager owns the direct
 sockets. Chat lines and transfer progress enter the journal; file contents
 flow directly between disk and the socket through a bounded buffer.
 
+Filesystem authority for incoming files is configuration and only
+configuration: named receive roots are the boundary, and a tool call chooses a
+root name plus a relative destination. Accepting one resolves that choice into a
+directory the process holds open, which is what the transfer receives — so no
+resolved path is ever passed between layers as an argument, and the write cannot
+be redirected after the confinement decision was made.
+
 See [DCC.md](DCC.md) for network locality, session states, reverse connections,
 resume behavior, and destination handling.
 

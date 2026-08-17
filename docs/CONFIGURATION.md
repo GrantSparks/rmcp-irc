@@ -147,7 +147,8 @@ server cannot force unbounded allocation.
 | `advertised_address` | address string | absent | Reachable address placed in DCC offers; absence uses implementation discovery. |
 | `port_start` | integer | `50000` | First DCC listener port. Must be non-zero. |
 | `port_end` | integer | `50100` | Last DCC listener port, inclusive and not below `port_start`. |
-| `download_directory` | path | `downloads` | Writable root for every accepted incoming file. Relative paths resolve from the gateway process working directory. |
+| `download_directory` | path | `downloads` | Seeds the default receive root when `receive_roots` is empty. Relative paths resolve from the gateway process working directory. |
+| `receive_roots` | array of tables | empty | Named directories incoming files may be received into. Empty means `download_directory` seeds one root named `downloads`. |
 | `max_sessions` | positive integer | `16` | Non-terminal DCC sessions per agent. Up to the same number of recent terminal sessions are retained. |
 | `max_offers_per_peer` | positive integer | `4` | Simultaneous incoming offers retained from one nickname. |
 | `transfer_buffer_bytes` | positive integer | `65536` | Bounded streaming buffer; never a whole-file allocation. |
@@ -156,21 +157,53 @@ server cannot force unbounded allocation.
 | `connect_timeout_ms` | positive integer | `15000` | Deadline while actively connecting to a peer endpoint; it does not shorten a listener-backed offer's lifetime. |
 | `idle_timeout_ms` | positive integer | `300000` | Idle CHAT/transfer deadline. |
 | `automatic_accept_chat` | boolean | `false` | Accept valid incoming CHAT offers without an MCP call. |
-| `automatic_accept_send` | boolean | `false` | Accept valid incoming SEND offers into `download_directory` without an MCP call. |
+| `automatic_accept_send` | boolean | `false` | Accept valid incoming SEND offers into the first receive root without an MCP call. |
 | `allow_private_addresses` | boolean | `false` | Permit direct connections to loopback, private, link-local, and carrier-grade NAT addresses. Enable only for a trusted local/container network. |
 | `chat_queue` | positive integer | `64` | Outbound lines buffered for one active DCC CHAT socket. |
 | `chat_line_bytes` | positive integer | `8192` | Maximum DCC CHAT line including its LF terminator. |
 
+### `[[dcc.receive_roots]]`: named receive roots
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `name` | string | Identifier an `irc.dcc.accept` call names to select this root. 1–64 characters of letters, digits, `_`, `-`, or `.`; unique regardless of case. |
+| `path` | path | Directory every file received into this root is confined beneath. Relative paths resolve from the gateway process working directory. |
+
+```toml
+[[dcc.receive_roots]]
+name = "downloads"
+path = "downloads"
+
+[[dcc.receive_roots]]
+name = "media"
+path = "/srv/media/incoming"
+```
+
+These roots are the gateway's complete filesystem authority for incoming files.
+An `irc.dcc.accept` call names a root and a path relative to it; it cannot name a
+directory, and an absolute `destination_path` is refused. Declaring any root
+*replaces* the default seeded from `download_directory` rather than adding to it,
+so the declared list is always the whole set. Omitting the tables entirely keeps
+one root named `downloads` pointing at `download_directory`, which is why a
+configuration written before named roots existed keeps working unchanged.
+
+Declaration order matters twice: the first root is what automatic acceptance
+uses, and it is the value proposed as the default when the gateway asks a caller
+to choose. With exactly one root configured, a call that names none selects it
+implicitly; with several, a call that names none is answered with an MCP
+`input_required` elicitation offering exactly these names, or — if the calling
+request declared no elicitation support — with a structured error listing them.
+
 DCC addresses and paths are local to the gateway host. In stdio mode that is
 normally the MCP client's machine; in HTTP mode it is the central server.
-Incoming filenames must be one ordinary path component. Explicit and automatic
-receive destinations are confined beneath `download_directory`, and the
-destination parent must already exist.
+Incoming filenames must be one ordinary path component. Every receive
+destination, explicit or automatic, is confined beneath the chosen root; missing
+directories named by a relative destination are created inside it.
 
 Automatic acceptance does not permit accidental overwrite. CHAT and SEND are
-enabled independently. SEND offers use `download_directory` and fail on an
-existing destination or an unavailable directory; an explicit
-`irc.dcc.accept` call is required to select `replace` or `rename`. See
+enabled independently. SEND offers use the first receive root and fail on an
+existing destination or an unavailable directory; an explicit `irc.dcc.accept`
+call is required to select `replace` or `rename`, or any root but the first. See
 [DCC.md](DCC.md).
 
 ## Validation and startup failures
@@ -183,7 +216,14 @@ The process rejects configuration before serving MCP when:
 - reconnect delay/multiplier/jitter relationships are invalid;
 - `max_line_bytes` is below 512;
 - the DCC port interval is invalid;
+- a `dcc.receive_roots` name is empty, longer than 64 characters, contains
+  anything but letters, digits, `_`, `-`, or `.`, or repeats another name
+  regardless of case;
+- a `dcc.receive_roots` path is empty;
 - a template contains an unsupported placeholder.
+
+A misdeclared receive root cannot be corrected from a tool call, so it is a
+startup failure rather than a per-call error.
 
 Credential variables are resolved later, when an agent connects. A missing
 variable or upstream connection failure is therefore an `irc.connect` tool

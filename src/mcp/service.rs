@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -11,17 +12,17 @@ use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{
         router::{prompt::PromptRouter, tool::ToolRouter},
-        tool::{ToolCallContext, schema_for_output},
+        tool::{InputResponses, RequestState, ToolCallContext, schema_for_output},
         wrapper::Parameters,
     },
     model::{
         Annotations, CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
         CompleteRequestParams, CompleteResult, CompletionInfo, ContentBlock, CreateTaskResult,
-        GetTaskParams, GetTaskResult, Implementation, ListResourceTemplatesResult,
-        ListResourcesResult, PaginatedRequestParams, PromptMessage, ProtocolVersion,
-        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Reference, Resource,
-        ResourceContents, ResourceTemplate, Role, ServerCapabilities, ServerInfo,
-        SubscriptionFilter, TASKS_EXTENSION_ID, UpdateTaskParams,
+        GetTaskParams, GetTaskResult, Implementation, InputRequiredResult,
+        ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, PromptMessage,
+        ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+        Reference, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
+        ServerInfo, SubscriptionFilter, TASKS_EXTENSION_ID, UpdateTaskParams,
     },
     prompt, prompt_handler, prompt_router,
     service::{RequestContext, RoleServer, SubscriptionContext},
@@ -39,7 +40,7 @@ use crate::{
         actor::{CompletionMode, ConnectMilestone},
         journal::{EventClass, EventCursor, EventFilter, EventOrigin},
     },
-    dcc::session::{DccSession, DccSessionId},
+    dcc::session::{DccDirection, DccSession, DccSessionId, DccState},
     error::GatewayError,
     gateway::{ConnectRequest, ConversationWindow, Gateway},
     irc::{
@@ -49,6 +50,8 @@ use crate::{
     },
     mcp::{
         authorization::{CallerPolicy, OwnerId},
+        dcc_accept,
+        mrtr::OriginatingOperation,
         progress::ProgressReporter,
         request_profile::RequestProfile,
         resources::{
@@ -1855,11 +1858,13 @@ impl IrcMcpService {
     /// Accept one incoming direct offer.
     #[tool(
         name = "irc.dcc.accept",
-        description = "Accept one incoming DCC CHAT or SEND offer with explicit file conflict \
-                       behavior. A client that declares the tasks extension in its request \
-                       capabilities receives a task handle that follows the transfer to \
-                       completion, with status and cancellation, instead of a result returned \
-                       once the acceptance is written.",
+        description = "Accept one incoming DCC CHAT or SEND offer into a configured receive root \
+                       with explicit file conflict behavior. A SEND names `root` and a relative \
+                       `destination_path`; omitting either where the server cannot choose returns \
+                       an input_required elicitation to answer and retry with. A client that \
+                       declares the tasks extension in its request capabilities receives a task \
+                       handle that follows a SEND transfer to completion, with status and \
+                       cancellation, instead of a result returned once the acceptance is written.",
         output_schema = schema_for_output::<DccSessionOutput>(),
         annotations(
             title = "Accept direct offer",
@@ -1871,20 +1876,40 @@ impl IrcMcpService {
     async fn irc_dcc_accept(
         &self,
         Parameters(input): Parameters<DccAcceptInput>,
-    ) -> CallToolResult {
-        match self
+        context: RequestContext<RoleServer>,
+        RequestState(request_state): RequestState,
+        InputResponses(responses): InputResponses,
+    ) -> Result<CallToolResponse, McpError> {
+        let owner = self.callers.identify(&context)?;
+        let profile = RequestProfile::from_context(&context);
+        let plan = match self
+            .plan_dcc_accept(
+                &owner,
+                &profile,
+                &input,
+                request_state.as_deref(),
+                responses.as_ref(),
+            )
+            .await?
+        {
+            DccAcceptResolution::Ready(plan) => plan,
+            DccAcceptResolution::NeedsInput(request) => return Ok(request.into()),
+            DccAcceptResolution::Settled(result) => return Ok(result.into()),
+        };
+        Ok(match self
             .gateway
             .dcc_accept(
                 &input.agent_id,
-                input.dcc_session_id,
-                input.destination_path,
-                input.conflict,
+                input.dcc_session_id.clone(),
+                plan.destination,
+                plan.conflict,
             )
             .await
         {
             Ok(session) => dcc_session_result("DCC offer accepted.", &input.agent_id, session),
             Err(error) => tool_error(error),
         }
+        .into())
     }
 
     /// Reject one incoming offer.
@@ -2730,6 +2755,121 @@ impl IrcMcpService {
         }
     }
 
+    /// Decide what an `irc.dcc.accept` call still needs, or produce the
+    /// validated plan it will run.
+    ///
+    /// Separated from the tool body on purpose. A task-augmented acceptance must
+    /// settle its input round trips *before* a task exists — the tasks extension
+    /// says MRTR exchanges are resolved synchronously first, and a task handle
+    /// returned for work that still needs an answer would strand the caller — so
+    /// the task path calls this and only spawns once it holds an
+    /// [`AcceptPlan`](dcc_accept::AcceptPlan).
+    ///
+    /// Every refusal here is in-band: a bad request state, a state minted for
+    /// another offer, and a caller that declined all produce an ordinary tool
+    /// result with `isError`, because the model that issued the call is the one
+    /// that has to react, and none of them leaves the offer consumed. The
+    /// offer's own TTL remains the only thing that retires it.
+    pub(crate) async fn plan_dcc_accept(
+        &self,
+        owner: &OwnerId,
+        profile: &RequestProfile,
+        input: &DccAcceptInput,
+        request_state: Option<&str>,
+        responses: Option<&rmcp::model::InputResponses>,
+    ) -> Result<DccAcceptResolution, McpError> {
+        let offer = match self
+            .gateway
+            .dcc_session(&input.agent_id, &input.dcc_session_id)
+            .await
+        {
+            Ok(offer) => offer,
+            Err(error) => return Ok(DccAcceptResolution::Settled(tool_error(error))),
+        };
+        // A session that is not a pending incoming offer cannot be accepted at
+        // all. Asking where its file should go would be asking about work that
+        // is refused a moment later, so this hands the call straight through and
+        // lets the session lifecycle give the one authoritative answer.
+        if offer.direction != DccDirection::Inbound || offer.state != DccState::Offered {
+            return Ok(DccAcceptResolution::Ready(dcc_accept::AcceptPlan {
+                destination: None,
+                conflict: input.conflict,
+            }));
+        }
+        // Bound to the arguments as they arrived, so a retry that changed any of
+        // them is a different operation and cannot redeem this exchange's state.
+        let operation = OriginatingOperation::for_tool("irc.dcc.accept", &input.salient());
+        let pending = match request_state {
+            Some(sealed) => {
+                match self
+                    .gateway
+                    .request_states()
+                    .open::<dcc_accept::PendingAccept>(sealed, owner, &operation)
+                {
+                    Ok(pending) if pending.matches(&offer) => Some(pending),
+                    Ok(_) => {
+                        return Ok(DccAcceptResolution::Settled(destination_refusal(
+                            "this destination choice was made for a different DCC offer",
+                        )));
+                    }
+                    Err(error) => {
+                        return Ok(DccAcceptResolution::Settled(destination_refusal(
+                            error.message,
+                        )));
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let answer = dcc_accept::read_answer(responses)?;
+        if answer == dcc_accept::Answer::Declined {
+            return Ok(DccAcceptResolution::Settled(declined_destination(&offer)));
+        }
+        let chosen = match &answer {
+            dcc_accept::Answer::Chosen(choice) => Some(choice),
+            _ => None,
+        };
+        let offered_roots = pending.as_ref().map(|pending| pending.roots.as_slice());
+
+        match dcc_accept::decide(
+            &self.gateway.config().dcc,
+            &offer,
+            input,
+            chosen,
+            offered_roots,
+        ) {
+            dcc_accept::Decision::Ready(plan) => Ok(DccAcceptResolution::Ready(plan)),
+            dcc_accept::Decision::Refuse(message) => {
+                Ok(DccAcceptResolution::Settled(destination_refusal(message)))
+            }
+            dcc_accept::Decision::Choose {
+                roots,
+                default_path,
+            } => {
+                if !profile.supports_form_elicitation() {
+                    // Nothing to ask with. The refusal carries the whole choice
+                    // so the caller's next attempt can be the explicit one.
+                    return Ok(DccAcceptResolution::Settled(unchosen_destination(
+                        roots,
+                        default_path,
+                    )));
+                }
+                let requests =
+                    dcc_accept::destination_requests(&offer, &roots, default_path.as_ref())?;
+                let sealed = self.gateway.request_states().seal(
+                    owner,
+                    &operation,
+                    &dcc_accept::PendingAccept::for_offer(&offer, roots),
+                )?;
+                Ok(DccAcceptResolution::NeedsInput(InputRequiredResult::new(
+                    Some(requests),
+                    Some(sealed),
+                )))
+            }
+        }
+    }
+
     /// Run one DCC tool and then follow its session to a terminal state.
     ///
     /// The tool call itself only writes the offer, so returning there would
@@ -2860,6 +3000,79 @@ impl IrcMcpService {
             "republished every owned resource after a subscription lag"
         );
     }
+}
+
+/// What one `irc.dcc.accept` call resolved to before anything was accepted.
+#[derive(Debug)]
+pub(crate) enum DccAcceptResolution {
+    /// Accept the offer with these validated arguments.
+    Ready(dcc_accept::AcceptPlan),
+    /// Ask the caller to choose, then let it retry the same call.
+    NeedsInput(InputRequiredResult),
+    /// Nothing further will happen; report this. The offer stays pending.
+    Settled(CallToolResult),
+}
+
+/// Refuse an acceptance whose destination cannot be settled.
+fn destination_refusal(message: impl Into<String>) -> CallToolResult {
+    let message = message.into();
+    structured_result(
+        message.clone(),
+        &ToolErrorOutput {
+            kind: GatewayError::Dcc(String::new()).kind().as_str().into(),
+            message,
+            retriable: false,
+        },
+        true,
+    )
+}
+
+/// Report that the caller was asked where the file should go and refused.
+///
+/// A refusal is not a failure of the transfer and not a success either: nothing
+/// was written, and the offer is still there to accept until its own TTL retires
+/// it. Saying so as an error result is what stops a model from reading silence as
+/// completion.
+fn declined_destination(offer: &DccSession) -> CallToolResult {
+    let message = format!(
+        "The destination choice for {} from {} was declined; the offer is still pending.",
+        offer.filename.as_deref().unwrap_or("this transfer"),
+        offer.peer
+    );
+    structured_result(
+        message.clone(),
+        &ToolErrorOutput {
+            kind: "declined".into(),
+            message,
+            // Calling again and answering is the recovery.
+            retriable: true,
+        },
+        true,
+    )
+}
+
+/// Refuse an acceptance whose root the caller must name explicitly.
+///
+/// Reached when several roots are configured, the call named none, and the
+/// request declared no way to answer a form. Listing the roots and the default
+/// destination makes the retry a single obvious call rather than a guess.
+fn unchosen_destination(roots: Vec<String>, default_path: Option<PathBuf>) -> CallToolResult {
+    let message = format!(
+        "This gateway has more than one DCC receive root; name one in `root`. Configured roots \
+         are {}.",
+        roots.join(", ")
+    );
+    structured_result(
+        message.clone(),
+        &DccReceiveRootsOutput {
+            kind: GatewayError::Dcc(String::new()).kind().as_str().into(),
+            message,
+            retriable: false,
+            receive_roots: roots,
+            default_destination_path: default_path,
+        },
+        true,
+    )
 }
 
 /// Whether this call is answered with a task handle instead of a result.
@@ -4186,6 +4399,39 @@ mod tests {
         // irc.events.read takes both: an agent and, optionally, the watch whose
         // selection it should read through.
         assert_eq!(checked, TOOL_NAMES.len());
+    }
+
+    #[test]
+    fn accepting_a_transfer_advertises_the_root_that_carries_its_authority() {
+        // A model can only choose a destination it can see in the schema, and
+        // the two properties have to say what they are for: one names a
+        // configured root, the other is relative to it and can never be
+        // absolute.
+        let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
+        let accept = service
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "irc.dcc.accept")
+            .expect("irc.dcc.accept is published");
+
+        let root = property_description(&accept.input_schema, "root").expect("root is an input");
+        assert!(root.contains("receive_roots"), "{root:?}");
+        let destination = property_description(&accept.input_schema, "destination_path")
+            .expect("destination_path is an input");
+        assert!(destination.contains("relative"), "{destination:?}");
+        assert!(
+            destination.contains("Absolute paths are refused"),
+            "{destination:?}"
+        );
+        assert!(
+            accept
+                .description
+                .as_deref()
+                .expect("description")
+                .contains("input_required"),
+            "the description must tell a caller the choice can be asked for"
+        );
     }
 
     #[test]

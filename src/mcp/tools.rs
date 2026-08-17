@@ -1368,18 +1368,53 @@ pub struct DccSendInput {
 }
 
 /// Accept one incoming direct offer.
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DccAcceptInput {
     /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// Offered session.
     pub dcc_session_id: DccSessionId,
-    /// Required for SEND and omitted for CHAT.
+    /// Name of a configured `dcc.receive_roots` entry for SEND, omitted for
+    /// CHAT. Omitting it when exactly one root is configured selects that root;
+    /// omitting it when several are configured asks the caller to choose.
+    pub root: Option<String>,
+    /// Destination relative to the chosen root for SEND, omitted for CHAT.
+    /// Defaults to the offered filename. Absolute paths are refused: the root
+    /// name is what carries filesystem authority.
     pub destination_path: Option<PathBuf>,
     /// Existing-file behavior for SEND.
     #[serde(default)]
     pub conflict: DestinationConflict,
+}
+
+impl DccAcceptInput {
+    /// The arguments a request state is bound to.
+    ///
+    /// Everything that decides what the acceptance will do, and nothing that
+    /// legitimately varies between rounds — a retry re-sends the original
+    /// arguments unchanged, so a caller that altered one of these is starting a
+    /// different operation and must not redeem the state from the first.
+    pub fn salient(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// Structured refusal when a destination choice is missing and cannot be asked
+/// for, because the calling request declared no way to answer.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct DccReceiveRootsOutput {
+    /// Stable machine-readable category.
+    pub kind: String,
+    /// Safe human-readable explanation.
+    pub message: String,
+    /// Whether retrying after external state changes is normally safe.
+    pub retriable: bool,
+    /// Configured root names, in declaration order, one of which the retry must
+    /// name in `root`.
+    pub receive_roots: Vec<String>,
+    /// Destination the retry gets if it names a root and nothing else.
+    pub default_destination_path: Option<PathBuf>,
 }
 
 /// Identify one existing DCC session.

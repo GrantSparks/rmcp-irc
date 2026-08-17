@@ -42,6 +42,8 @@ bind_address = "0.0.0.0"
 # advertised_address = "10.0.0.5"
 port_start = 50000
 port_end = 50100
+# Seeds the single default receive root named "downloads" when no
+# [[dcc.receive_roots]] table is declared below.
 download_directory = "downloads"
 max_sessions = 16
 max_offers_per_peer = 4
@@ -57,3 +59,23 @@ automatic_accept_send = false
 allow_private_addresses = false
 chat_queue = 64
 chat_line_bytes = 8192
+
+# Named directories incoming DCC files may be received into. These are the
+# complete filesystem authority of the gateway: `irc.dcc.accept` names a root and
+# a path relative to it, and can never reach outside one. Declaring any root
+# replaces the default seeded from `download_directory`; leave the tables out to
+# keep exactly one root named "downloads".
+#
+# With more than one root declared, an `irc.dcc.accept` call that names none is
+# answered with an `input_required` elicitation offering exactly these names.
+# Automatic acceptance uses the first root, because nobody is there to choose.
+#
+# Names are 1-64 characters of letters, digits, '_', '-', or '.', and must be
+# unique regardless of case.
+# [[dcc.receive_roots]]
+# name = "downloads"
+# path = "downloads"
+#
+# [[dcc.receive_roots]]
+# name = "media"
+# path = "/srv/media/incoming"

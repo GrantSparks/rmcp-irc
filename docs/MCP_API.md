@@ -683,6 +683,47 @@ client that wants live transfer progress therefore declares the tasks extension
 and polls, or subscribes to the DCC-session resource — narrating the few
 milliseconds before the offer is written would tell it nothing it could act on.
 
+### `irc.dcc.accept`
+
+Filesystem authority for incoming files is server configuration, and the
+destination is an explicit tool argument. This server implements no MCP Roots
+surface: `roots/list` and the roots capability are deprecated by
+[SEP-2577](https://modelcontextprotocol.io/seps/2577-deprecate-roots-sampling-and-logging),
+which directs new implementations to server configuration, tool parameters, or
+resource URIs instead — all of which a stateless call can restate from scratch,
+which a client-declared capability cannot.
+
+Inputs beyond `agent_id` and `dcc_session_id`:
+
+| Input | Type | Meaning |
+| --- | --- | --- |
+| `root` | string, optional | Name of a configured `dcc.receive_roots` entry. Required for SEND unless exactly one root is configured. Refused on a CHAT offer. |
+| `destination_path` | relative path, optional | Destination beneath that root. Defaults to the offered filename. An absolute path is refused. Refused on a CHAT offer. |
+| `conflict` | `fail` \| `replace` \| `rename` | Existing-destination behavior, default `fail`. |
+
+Where the choice cannot be made server-side — several roots configured and none
+named — the tool returns an MRTR `input_required` result carrying one
+`elicitation/create` request under the key `dcc_destination` in form mode, whose
+`root` property is a single-select enum of exactly the configured root names, plus
+an integrity-protected `requestState`. The client answers and retries the same
+call with `inputResponses` and the echoed `requestState`; see
+[DCC.md](DCC.md) for the full wire example, the validation applied to an answer,
+what a declined answer returns, and the structured `receive_roots` error a
+request that declared no elicitation support gets instead.
+
+Successful output is a `DccSessionOutput` whose session carries `receive_root`
+and `receive_path` — the chosen root name and the root-relative destination —
+alongside the host `local_path`, and links
+`irc://agents/{agent_id}/dcc/{dcc_session_id}` as a native resource. A
+task-augmented call keeps that link in its terminal result.
+
+Confinement guarantees, enforced by how the destination is resolved rather than
+by inspecting a path: a symbolic link at any component is refused; a link at the
+destination name is a conflict rather than a route out of the root; `..`, an
+absolute path, and a path prefix are refused before any directory is created; and
+replacing a directory after resolution cannot redirect the write, because the
+transfer holds the directory open and never resolves the path again.
+
 ## Resources
 
 Resources are stable in-memory URIs, not durable storage. Agent and watch

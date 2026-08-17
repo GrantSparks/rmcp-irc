@@ -1,6 +1,7 @@
 //! Typed configuration loading and validation.
 
 use std::{
+    collections::BTreeSet,
     env, fs,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -138,6 +139,7 @@ impl Config {
                 "dcc.download_directory must not be empty".into(),
             ));
         }
+        validate_receive_roots(&self.dcc.receive_roots)?;
         if self.dcc.max_sessions == 0
             || self.dcc.max_offers_per_peer == 0
             || self.dcc.transfer_buffer_bytes == 0
@@ -189,6 +191,47 @@ impl Config {
                 .transpose()?,
         })
     }
+}
+
+/// Reject a receive-root list that could not be selected from unambiguously.
+///
+/// A root name reaches this process from a tool argument and leaves it in an
+/// elicitation form, so it is constrained to an identifier charset: anything
+/// that needed quoting, or that differs from another name only in case, would
+/// make the caller's choice ambiguous at exactly the moment the choice is the
+/// only thing standing between a peer's file and the filesystem. Startup is the
+/// right place to refuse, because a misdeclared root cannot be corrected from a
+/// tool call.
+fn validate_receive_roots(roots: &[DccReceiveRoot]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for root in roots {
+        if root.name.is_empty()
+            || root.name.len() > 64
+            || !root
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(GatewayError::Configuration(format!(
+                "dcc.receive_roots name must be 1-64 characters of letters, digits, '_', '-', or \
+                 '.': {:?}",
+                root.name
+            )));
+        }
+        if root.path.as_os_str().is_empty() {
+            return Err(GatewayError::Configuration(format!(
+                "dcc.receive_roots path must not be empty for root {:?}",
+                root.name
+            )));
+        }
+        if !seen.insert(root.name.to_ascii_lowercase()) {
+            return Err(GatewayError::Configuration(format!(
+                "dcc.receive_roots names must be unique regardless of case: {:?}",
+                root.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_template(value: &str, field: &str, placeholders: &[&str]) -> Result<()> {
@@ -444,6 +487,25 @@ impl Default for GatewayLimits {
     }
 }
 
+/// Name of the root `download_directory` seeds when no root is declared.
+pub const DEFAULT_RECEIVE_ROOT: &str = "downloads";
+
+/// One named directory incoming DCC files may be received into.
+///
+/// The name is the whole authority a tool call carries: a caller chooses *which*
+/// configured root a file lands in and where beneath it, never the root's path.
+/// That keeps the set of writable directories an operator decision while leaving
+/// the destination an explicit, replayable argument.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DccReceiveRoot {
+    /// Identifier `irc.dcc.accept` names to select this root.
+    pub name: String,
+    /// Directory every file received into this root is confined beneath.
+    /// Relative paths resolve from the gateway process working directory.
+    pub path: PathBuf,
+}
+
 /// DCC networking and filesystem behavior.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -456,8 +518,15 @@ pub struct DccConfig {
     pub port_start: u16,
     /// Last port available to DCC listeners.
     pub port_end: u16,
-    /// Default destination directory for accepted transfers.
+    /// Directory that seeds the default receive root when `receive_roots` is
+    /// empty. It is not a fallback for an explicit root: declaring roots
+    /// replaces it entirely.
     pub download_directory: PathBuf,
+    /// Named roots incoming files may be received into, in the order an
+    /// operator declared them. Empty means `download_directory` seeds one root
+    /// named [`DEFAULT_RECEIVE_ROOT`]; read the effective list through
+    /// [`DccConfig::receive_roots`].
+    pub receive_roots: Vec<DccReceiveRoot>,
     /// Maximum active DCC sessions per IRC agent.
     pub max_sessions: usize,
     /// Maximum simultaneous incoming offers retained from one nickname.
@@ -484,6 +553,63 @@ pub struct DccConfig {
     pub chat_line_bytes: usize,
 }
 
+impl DccConfig {
+    /// The named roots incoming files may be received into.
+    ///
+    /// An empty `receive_roots` list means the configuration never declared
+    /// any — which every configuration written before named roots existed did —
+    /// so `download_directory` seeds a single root named
+    /// [`DEFAULT_RECEIVE_ROOT`] and those deployments keep exactly the one root
+    /// they had. Declaring roots explicitly *replaces* that default rather than
+    /// adding to it, which is what makes the declared list the complete
+    /// filesystem authority instead of a hint layered over a hidden one.
+    ///
+    /// Never empty: a receive always has somewhere to resolve against, and code
+    /// downstream of here does not have to carry an "unless there are no roots"
+    /// branch that could only fail late.
+    pub fn receive_roots(&self) -> std::borrow::Cow<'_, [DccReceiveRoot]> {
+        if self.receive_roots.is_empty() {
+            std::borrow::Cow::Owned(vec![DccReceiveRoot {
+                name: DEFAULT_RECEIVE_ROOT.to_owned(),
+                path: self.download_directory.clone(),
+            }])
+        } else {
+            std::borrow::Cow::Borrowed(&self.receive_roots)
+        }
+    }
+
+    /// Look one configured root up by the name a caller supplied.
+    pub fn receive_root(&self, name: &str) -> Option<DccReceiveRoot> {
+        self.receive_roots()
+            .iter()
+            .find(|root| root.name == name)
+            .cloned()
+    }
+
+    /// The root used when nobody chose one and nobody has to.
+    ///
+    /// That is the first declared root, which is also the only root whenever
+    /// there is exactly one. Automatic acceptance uses it because there is no
+    /// caller present to ask.
+    pub fn default_receive_root(&self) -> DccReceiveRoot {
+        self.receive_roots()
+            .first()
+            .cloned()
+            .expect("receive_roots is never empty")
+    }
+
+    /// Configured root names in declaration order.
+    ///
+    /// This is the choice a caller has to make, so it is also what an
+    /// elicitation offers and what a refusal lists.
+    pub fn receive_root_names(&self) -> Vec<String> {
+        self.receive_roots()
+            .iter()
+            .map(|root| root.name.clone())
+            .collect()
+    }
+}
+
 impl Default for DccConfig {
     fn default() -> Self {
         Self {
@@ -491,7 +617,8 @@ impl Default for DccConfig {
             advertised_address: None,
             port_start: 50_000,
             port_end: 50_100,
-            download_directory: PathBuf::from("downloads"),
+            download_directory: PathBuf::from(DEFAULT_RECEIVE_ROOT),
+            receive_roots: Vec::new(),
             max_sessions: 16,
             max_offers_per_peer: 4,
             transfer_buffer_bytes: 64 * 1024,
@@ -515,6 +642,79 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         Config::default().validate().expect("default config");
+    }
+
+    /// Build a configuration whose only non-default part is its receive roots.
+    fn with_roots(roots: Vec<(&str, &str)>) -> Config {
+        let mut config = Config::default();
+        config.dcc.receive_roots = roots
+            .into_iter()
+            .map(|(name, path)| DccReceiveRoot {
+                name: name.to_owned(),
+                path: PathBuf::from(path),
+            })
+            .collect();
+        config
+    }
+
+    #[test]
+    fn the_download_directory_seeds_the_default_receive_root() {
+        // A configuration written before named roots existed must keep exactly
+        // the one root it had, wherever that root pointed.
+        let mut config = Config::default();
+        config.dcc.download_directory = PathBuf::from("/srv/incoming");
+        config.validate().expect("valid");
+
+        let roots = config.dcc.receive_roots();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].name, DEFAULT_RECEIVE_ROOT);
+        assert_eq!(roots[0].path, PathBuf::from("/srv/incoming"));
+        assert_eq!(
+            config.dcc.default_receive_root().path,
+            PathBuf::from("/srv/incoming")
+        );
+        assert_eq!(config.dcc.receive_root_names(), vec!["downloads"]);
+    }
+
+    #[test]
+    fn declared_receive_roots_replace_the_seeded_default() {
+        let config = with_roots(vec![("media", "/srv/media"), ("docs", "/srv/docs")]);
+        config.validate().expect("valid");
+
+        assert_eq!(config.dcc.receive_root_names(), vec!["media", "docs"]);
+        assert_eq!(config.dcc.receive_root(DEFAULT_RECEIVE_ROOT), None);
+        // The first declared root is the one an unattended acceptance uses.
+        assert_eq!(config.dcc.default_receive_root().name, "media");
+        assert_eq!(
+            config.dcc.receive_root("docs").expect("docs").path,
+            PathBuf::from("/srv/docs")
+        );
+    }
+
+    #[test]
+    fn a_receive_root_list_that_cannot_be_chosen_from_is_refused_at_startup() {
+        for (roots, expected) in [
+            (vec![("", "/srv/in")], "1-64 characters"),
+            (vec![("has space", "/srv/in")], "1-64 characters"),
+            (vec![("../escape", "/srv/in")], "1-64 characters"),
+            (vec![("media", "")], "must not be empty"),
+            (
+                vec![("media", "/srv/a"), ("media", "/srv/b")],
+                "must be unique",
+            ),
+            (
+                vec![("media", "/srv/a"), ("MEDIA", "/srv/b")],
+                "must be unique",
+            ),
+        ] {
+            let error = with_roots(roots.clone())
+                .validate()
+                .expect_err("must be refused");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error for {roots:?}: {error}"
+            );
+        }
     }
 
     #[test]

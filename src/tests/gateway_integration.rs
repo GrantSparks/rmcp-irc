@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeSet, HashSet},
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -10,23 +10,37 @@ use std::{
 
 use crate::{
     agent::{
+        AgentId,
         actor::CompletionMode,
         journal::{EventClass, EventDirection, EventFilter},
     },
-    dcc::negotiation::{CtcpMessage, DccOffer, parse_address},
+    config::{Config, DccReceiveRoot},
+    dcc::{
+        confine::ReceiveChoice,
+        negotiation::{CtcpMessage, DccOffer, encode_address, parse_address},
+        session::{DccKind, DccSession, DccSessionId, DccState},
+        transfer::DestinationConflict,
+    },
     gateway::{ConnectRequest, Gateway},
     irc::{
         correlation::CommandOutcome,
         registration::{NickConflictPolicy, Nickname},
         wire::{OutboundMessage, WireMessage},
     },
-    mcp::{authorization::OwnerId, watch::WatchFilter},
+    mcp::{
+        authorization::OwnerId,
+        dcc_accept::DESTINATION_INPUT,
+        request_profile::RequestProfile,
+        service::{DccAcceptResolution, IrcMcpService},
+        tools::DccAcceptInput,
+        watch::WatchFilter,
+    },
     tests::fake_ergo::FakeErgo,
 };
 use bytes::Bytes;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     task::JoinSet,
 };
 
@@ -1608,6 +1622,731 @@ async fn one_callers_handles_are_invisible_and_unusable_to_another() {
         unknown.message.contains("unknown or expired"),
         "an unowned handle must read exactly like a missing one: {unknown:?}"
     );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+/// A configuration whose DCC receive roots are named directories inside `base`.
+///
+/// Loopback peers are permitted because the peer in these tests is a real socket
+/// in this process, which is exactly the case the production refusal exists to
+/// keep out.
+fn config_with_receive_roots(fake: &FakeErgo, base: &std::path::Path, names: &[&str]) -> Config {
+    let mut config = fake.config();
+    config.dcc.allow_private_addresses = true;
+    config.dcc.receive_roots = names
+        .iter()
+        .map(|name| DccReceiveRoot {
+            name: (*name).to_owned(),
+            path: base.join(name),
+        })
+        .collect();
+    config.validate().expect("receive roots are valid");
+    config
+}
+
+/// Have the fixture push one inbound DCC SEND offer and wait for the actor to
+/// retain it.
+async fn offered_transfer(
+    gateway: &Gateway,
+    agent_id: &AgentId,
+    endpoint: SocketAddr,
+    size: u64,
+    filename: &str,
+) -> DccSession {
+    gateway
+        .execute(
+            agent_id,
+            OutboundMessage::new(
+                "TESTDCCSEND",
+                vec![
+                    encode_address(endpoint.ip()),
+                    endpoint.port().to_string(),
+                    size.to_string(),
+                    filename.to_owned(),
+                ],
+            ),
+            CompletionMode::FireAndForget,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("DCC SEND fixture trigger");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let offered = gateway
+                .dcc_list(agent_id, Some(DccState::Offered), Some(DccKind::Send), None)
+                .await
+                .expect("list DCC sessions");
+            if let Some(session) = offered
+                .into_iter()
+                .find(|session| session.filename.as_deref() == Some(filename))
+            {
+                return session;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the offer must be retained")
+}
+
+/// Wait for one DCC session to settle, then return it.
+async fn settled_transfer(
+    gateway: &Gateway,
+    agent_id: &AgentId,
+    session_id: &DccSessionId,
+) -> DccSession {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let session = gateway
+                .dcc_session(agent_id, session_id)
+                .await
+                .expect("session");
+            if session.state.is_terminal() {
+                return session;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the transfer must settle")
+}
+
+/// One request's declarations, as a well-formed 2026-07-28 caller sends them.
+fn declaring_elicitation(elicitation: bool) -> RequestProfile {
+    let mut capabilities = rmcp::model::ClientCapabilities::default();
+    if elicitation {
+        capabilities.elicitation = Some(rmcp::model::ElicitationCapability::new());
+    }
+    let mut meta = rmcp::model::RequestMetaObject::new();
+    meta.set_protocol_version(rmcp::model::ProtocolVersion::V_2026_07_28);
+    meta.set_client_capabilities(capabilities);
+    RequestProfile::from_meta(&meta)
+}
+
+fn accept_input(
+    agent_id: &AgentId,
+    session_id: &DccSessionId,
+    root: Option<&str>,
+    destination_path: Option<&str>,
+) -> DccAcceptInput {
+    DccAcceptInput {
+        agent_id: agent_id.clone(),
+        dcc_session_id: session_id.clone(),
+        root: root.map(str::to_owned),
+        destination_path: destination_path.map(std::path::PathBuf::from),
+        conflict: DestinationConflict::Fail,
+    }
+}
+
+/// One accepted form answer, shaped the way a client echoes an elicitation back.
+fn answered(root: Option<&str>, destination_path: Option<&str>) -> rmcp::model::InputResponses {
+    let mut content = serde_json::Map::new();
+    if let Some(root) = root {
+        content.insert("root".into(), serde_json::Value::String(root.into()));
+    }
+    if let Some(path) = destination_path {
+        content.insert(
+            "destination_path".into(),
+            serde_json::Value::String(path.into()),
+        );
+    }
+    rmcp::model::InputResponses::from([(
+        DESTINATION_INPUT.to_owned(),
+        serde_json::json!({ "action": "accept", "content": content }),
+    )])
+}
+
+#[tokio::test]
+async fn an_accepted_transfer_lands_under_the_receive_root_the_caller_named() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let fake = FakeErgo::spawn().await;
+    let gateway = Gateway::new(config_with_receive_roots(
+        &fake,
+        scratch.path(),
+        &["inbox", "archive"],
+    ));
+    let connected = gateway
+        .connect(connect_request("Iris"))
+        .await
+        .expect("connect");
+
+    let data = vec![0x37_u8; 40_000];
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("peer listener");
+    let endpoint = listener.local_addr().expect("peer address");
+    let payload = data.clone();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("peer accept");
+        stream.write_all(&payload).await.expect("peer write");
+        let mut acknowledgement = [0_u8; 4];
+        loop {
+            stream
+                .read_exact(&mut acknowledgement)
+                .await
+                .expect("acknowledgement");
+            if u64::from(u32::from_be_bytes(acknowledgement)) >= payload.len() as u64 {
+                return;
+            }
+        }
+    });
+
+    let offer = offered_transfer(
+        &gateway,
+        &connected.agent_id,
+        endpoint,
+        data.len() as u64,
+        "report.txt",
+    )
+    .await;
+    let accepted = gateway
+        .dcc_accept(
+            &connected.agent_id,
+            offer.id.clone(),
+            Some(ReceiveChoice {
+                root: "archive".into(),
+                path: std::path::PathBuf::from("august/report.txt"),
+            }),
+            DestinationConflict::Fail,
+        )
+        .await
+        .expect("accept");
+    // The chosen root and root-relative destination are reported from the moment
+    // of acceptance, not only once the file has landed.
+    assert_eq!(accepted.receive_root.as_deref(), Some("archive"));
+    assert_eq!(
+        accepted.receive_path.as_deref(),
+        Some(std::path::Path::new("august/report.txt"))
+    );
+
+    let settled = settled_transfer(&gateway, &connected.agent_id, &offer.id).await;
+    peer.await.expect("peer");
+    assert_eq!(settled.state, DccState::Completed, "{settled:?}");
+    assert_eq!(settled.receive_root.as_deref(), Some("archive"));
+    assert_eq!(
+        settled.receive_path.as_deref(),
+        Some(std::path::Path::new("august/report.txt"))
+    );
+
+    let landed = scratch.path().join("archive/august/report.txt");
+    assert_eq!(
+        tokio::fs::read(&landed).await.expect("received file"),
+        data,
+        "the file must land beneath the root the caller named"
+    );
+    assert!(
+        !scratch.path().join("inbox/august").exists(),
+        "naming one root must not touch another"
+    );
+    assert_eq!(
+        settled
+            .local_path
+            .as_deref()
+            .and_then(std::path::Path::file_name),
+        landed.file_name()
+    );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+#[tokio::test]
+async fn one_configured_receive_root_is_selected_without_asking_anybody() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let fake = FakeErgo::spawn().await;
+    let gateway = Arc::new(Gateway::new(config_with_receive_roots(
+        &fake,
+        scratch.path(),
+        &["inbox"],
+    )));
+    let service = IrcMcpService::new(gateway.clone());
+    let connected = gateway
+        .connect(connect_request("Selene"))
+        .await
+        .expect("connect");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("peer listener");
+    let offer = offered_transfer(
+        &gateway,
+        &connected.agent_id,
+        listener.local_addr().expect("peer address"),
+        16,
+        "report.txt",
+    )
+    .await;
+
+    // Neither a root nor a destination: one configured root answers the first
+    // question and the offered filename answers the second, so even a client
+    // that could not answer an elicitation needs no round trip.
+    let resolution = service
+        .plan_dcc_accept(
+            &OwnerId::local(),
+            &declaring_elicitation(false),
+            &accept_input(&connected.agent_id, &offer.id, None, None),
+            None,
+            None,
+        )
+        .await
+        .expect("plan");
+    let DccAcceptResolution::Ready(plan) = resolution else {
+        panic!("a single root needs no input: {resolution:?}");
+    };
+    assert_eq!(
+        plan.destination,
+        Some(ReceiveChoice {
+            root: "inbox".into(),
+            path: std::path::PathBuf::from("report.txt"),
+        })
+    );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+#[tokio::test]
+async fn several_receive_roots_ask_where_the_file_goes_and_then_accept_the_answer() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let fake = FakeErgo::spawn().await;
+    let gateway = Arc::new(Gateway::new(config_with_receive_roots(
+        &fake,
+        scratch.path(),
+        &["inbox", "archive"],
+    )));
+    let service = IrcMcpService::new(gateway.clone());
+    let connected = gateway
+        .connect(connect_request("Clio"))
+        .await
+        .expect("connect");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("peer listener");
+    let offer = offered_transfer(
+        &gateway,
+        &connected.agent_id,
+        listener.local_addr().expect("peer address"),
+        16,
+        "report.txt",
+    )
+    .await;
+    let input = accept_input(&connected.agent_id, &offer.id, None, None);
+
+    let resolution = service
+        .plan_dcc_accept(
+            &OwnerId::local(),
+            &declaring_elicitation(true),
+            &input,
+            None,
+            None,
+        )
+        .await
+        .expect("plan");
+    let DccAcceptResolution::NeedsInput(request) = resolution else {
+        panic!("an unresolvable root must be asked about: {resolution:?}");
+    };
+
+    // The exact wire shape matters: this is what a client has to render.
+    let wire = serde_json::to_value(&request).expect("serialize");
+    assert_eq!(wire["resultType"], "input_required");
+    let elicitation = &wire["inputRequests"][DESTINATION_INPUT];
+    assert_eq!(elicitation["method"], "elicitation/create");
+    assert_eq!(elicitation["params"]["mode"], "form");
+    let schema = &elicitation["params"]["requestedSchema"];
+    assert_eq!(
+        schema["properties"]["root"]["enum"],
+        serde_json::json!(["inbox", "archive"]),
+        "the form must offer exactly the configured roots, in configured order"
+    );
+    assert_eq!(schema["required"], serde_json::json!(["root"]));
+    assert_eq!(
+        schema["properties"]["destination_path"]["default"],
+        "report.txt"
+    );
+    let sealed = request.request_state.clone().expect("sealed request state");
+    assert!(
+        !sealed.contains("archive"),
+        "request state must be opaque to the client: {sealed}"
+    );
+
+    // The retry re-sends the original call plus the answer and the state.
+    let resolution = service
+        .plan_dcc_accept(
+            &OwnerId::local(),
+            &declaring_elicitation(true),
+            &input,
+            Some(&sealed),
+            Some(&answered(Some("archive"), Some("august/report.txt"))),
+        )
+        .await
+        .expect("plan the retry");
+    let DccAcceptResolution::Ready(plan) = resolution else {
+        panic!("an answered choice must resolve: {resolution:?}");
+    };
+    assert_eq!(
+        plan.destination,
+        Some(ReceiveChoice {
+            root: "archive".into(),
+            path: std::path::PathBuf::from("august/report.txt"),
+        })
+    );
+
+    // An answer that names only a root takes the offered filename.
+    let resolution = service
+        .plan_dcc_accept(
+            &OwnerId::local(),
+            &declaring_elicitation(true),
+            &input,
+            Some(&sealed),
+            Some(&answered(Some("inbox"), None)),
+        )
+        .await
+        .expect("plan the sparse retry");
+    let DccAcceptResolution::Ready(plan) = resolution else {
+        panic!("a root alone must resolve: {resolution:?}");
+    };
+    assert_eq!(
+        plan.destination,
+        Some(ReceiveChoice {
+            root: "inbox".into(),
+            path: std::path::PathBuf::from("report.txt"),
+        })
+    );
+
+    // A retry that echoes the state but answers nothing asks again rather than
+    // failing, which is what the specification requires of a partial response.
+    let resolution = service
+        .plan_dcc_accept(
+            &OwnerId::local(),
+            &declaring_elicitation(true),
+            &input,
+            Some(&sealed),
+            None,
+        )
+        .await
+        .expect("plan the empty retry");
+    assert!(matches!(resolution, DccAcceptResolution::NeedsInput(_)));
+
+    // A session that can no longer be accepted is never asked about: the
+    // lifecycle refusal is the only answer worth giving.
+    gateway
+        .dcc_reject(&connected.agent_id, offer.id.clone())
+        .await
+        .expect("reject");
+    let resolution = service
+        .plan_dcc_accept(
+            &OwnerId::local(),
+            &declaring_elicitation(true),
+            &input,
+            None,
+            None,
+        )
+        .await
+        .expect("plan a retired offer");
+    assert!(matches!(resolution, DccAcceptResolution::Ready(_)));
+    let refused = gateway
+        .dcc_accept(
+            &connected.agent_id,
+            offer.id.clone(),
+            None,
+            DestinationConflict::Fail,
+        )
+        .await
+        .expect_err("a rejected offer cannot be accepted");
+    assert!(
+        refused.to_string().contains("not an incoming offer"),
+        "{refused}"
+    );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+#[tokio::test]
+async fn a_caller_that_cannot_answer_a_form_is_told_which_roots_exist() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let fake = FakeErgo::spawn().await;
+    let gateway = Arc::new(Gateway::new(config_with_receive_roots(
+        &fake,
+        scratch.path(),
+        &["inbox", "archive"],
+    )));
+    let service = IrcMcpService::new(gateway.clone());
+    let connected = gateway
+        .connect(connect_request("Thalia"))
+        .await
+        .expect("connect");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("peer listener");
+    let offer = offered_transfer(
+        &gateway,
+        &connected.agent_id,
+        listener.local_addr().expect("peer address"),
+        16,
+        "report.txt",
+    )
+    .await;
+
+    let resolution = service
+        .plan_dcc_accept(
+            &OwnerId::local(),
+            &declaring_elicitation(false),
+            &accept_input(&connected.agent_id, &offer.id, None, None),
+            None,
+            None,
+        )
+        .await
+        .expect("plan");
+    let DccAcceptResolution::Settled(result) = resolution else {
+        panic!("a client with no way to answer must be refused: {resolution:?}");
+    };
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.expect("structured error");
+    assert_eq!(
+        structured["receive_roots"],
+        serde_json::json!(["inbox", "archive"]),
+        "the refusal has to carry the whole choice so the retry can be explicit"
+    );
+    assert_eq!(structured["default_destination_path"], "report.txt");
+
+    // An absolute destination is refused the same way whoever is asking, because
+    // the root name is the only thing that carries filesystem authority.
+    let absolute = if cfg!(windows) {
+        r"C:\elsewhere\report.txt"
+    } else {
+        "/elsewhere/report.txt"
+    };
+    let resolution = service
+        .plan_dcc_accept(
+            &OwnerId::local(),
+            &declaring_elicitation(true),
+            &accept_input(
+                &connected.agent_id,
+                &offer.id,
+                Some("inbox"),
+                Some(absolute),
+            ),
+            None,
+            None,
+        )
+        .await
+        .expect("plan");
+    let DccAcceptResolution::Settled(result) = resolution else {
+        panic!("an absolute destination must be refused: {resolution:?}");
+    };
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result.structured_content.expect("structured error")["message"]
+            .as_str()
+            .expect("message")
+            .contains("must be relative")
+    );
+
+    // Nothing above consumed the offer.
+    assert_eq!(
+        gateway
+            .dcc_session(&connected.agent_id, &offer.id)
+            .await
+            .expect("session")
+            .state,
+        DccState::Offered
+    );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+#[tokio::test]
+async fn a_request_state_cannot_be_redeemed_by_another_caller_or_against_another_offer() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let fake = FakeErgo::spawn().await;
+    let gateway = Arc::new(Gateway::new(config_with_receive_roots(
+        &fake,
+        scratch.path(),
+        &["inbox", "archive"],
+    )));
+    let service = IrcMcpService::new(gateway.clone());
+    let connected = gateway
+        .connect(connect_request("Nemesis"))
+        .await
+        .expect("connect");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("peer listener");
+    let endpoint = listener.local_addr().expect("peer address");
+    let first = offered_transfer(&gateway, &connected.agent_id, endpoint, 16, "first.txt").await;
+    let mine = OwnerId::from_bearer("alice");
+
+    let DccAcceptResolution::NeedsInput(request) = service
+        .plan_dcc_accept(
+            &mine,
+            &declaring_elicitation(true),
+            &accept_input(&connected.agent_id, &first.id, None, None),
+            None,
+            None,
+        )
+        .await
+        .expect("plan")
+    else {
+        panic!("expected a destination question");
+    };
+    let sealed = request.request_state.expect("sealed request state");
+    let answer = answered(Some("archive"), None);
+
+    // A second offer from the same peer, so only the sealed binding separates
+    // the two exchanges.
+    let second = offered_transfer(&gateway, &connected.agent_id, endpoint, 16, "second.txt").await;
+
+    for (label, owner, state, target) in [
+        (
+            "another caller",
+            OwnerId::from_bearer("mallory"),
+            sealed.clone(),
+            &first,
+        ),
+        (
+            "the shared local owner",
+            OwnerId::local(),
+            sealed.clone(),
+            &first,
+        ),
+        (
+            "a tampered state",
+            mine.clone(),
+            format!("{sealed}x"),
+            &first,
+        ),
+        ("a truncated state", mine.clone(), "rs1.".to_owned(), &first),
+        (
+            "a state minted for another offer",
+            mine.clone(),
+            sealed.clone(),
+            &second,
+        ),
+    ] {
+        let resolution = service
+            .plan_dcc_accept(
+                &owner,
+                &declaring_elicitation(true),
+                &accept_input(&connected.agent_id, &target.id, None, None),
+                Some(&state),
+                Some(&answer),
+            )
+            .await
+            .expect("a refused state is an in-band result, never a protocol error");
+        let DccAcceptResolution::Settled(result) = resolution else {
+            panic!("{label} must be refused deterministically: {resolution:?}");
+        };
+        assert_eq!(result.is_error, Some(true), "{label}");
+        // Every offer survives every refusal; only its own expiry retires it.
+        for offer in [&first, &second] {
+            assert_eq!(
+                gateway
+                    .dcc_session(&connected.agent_id, &offer.id)
+                    .await
+                    .expect("session")
+                    .state,
+                DccState::Offered,
+                "{label}"
+            );
+        }
+    }
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+#[tokio::test]
+async fn declining_the_destination_question_leaves_the_offer_pending() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let fake = FakeErgo::spawn().await;
+    let gateway = Arc::new(Gateway::new(config_with_receive_roots(
+        &fake,
+        scratch.path(),
+        &["inbox", "archive"],
+    )));
+    let service = IrcMcpService::new(gateway.clone());
+    let connected = gateway
+        .connect(connect_request("Eirene"))
+        .await
+        .expect("connect");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("peer listener");
+    let offer = offered_transfer(
+        &gateway,
+        &connected.agent_id,
+        listener.local_addr().expect("peer address"),
+        16,
+        "report.txt",
+    )
+    .await;
+    let input = accept_input(&connected.agent_id, &offer.id, None, None);
+    let DccAcceptResolution::NeedsInput(request) = service
+        .plan_dcc_accept(
+            &OwnerId::local(),
+            &declaring_elicitation(true),
+            &input,
+            None,
+            None,
+        )
+        .await
+        .expect("plan")
+    else {
+        panic!("expected a destination question");
+    };
+    let sealed = request.request_state.expect("sealed request state");
+
+    for action in ["decline", "cancel"] {
+        let resolution = service
+            .plan_dcc_accept(
+                &OwnerId::local(),
+                &declaring_elicitation(true),
+                &input,
+                Some(&sealed),
+                Some(&rmcp::model::InputResponses::from([(
+                    DESTINATION_INPUT.to_owned(),
+                    serde_json::json!({ "action": action }),
+                )])),
+            )
+            .await
+            .expect("plan");
+        let DccAcceptResolution::Settled(result) = resolution else {
+            panic!("a refusal is terminal, not another round: {resolution:?}");
+        };
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("structured error");
+        assert_eq!(structured["kind"], "declined");
+        assert!(
+            structured["message"]
+                .as_str()
+                .expect("message")
+                .contains("still pending")
+        );
+        assert_eq!(
+            gateway
+                .dcc_session(&connected.agent_id, &offer.id)
+                .await
+                .expect("session")
+                .state,
+            DccState::Offered,
+            "declining writes nothing and consumes nothing"
+        );
+    }
 
     gateway
         .disconnect(&connected.agent_id, None)

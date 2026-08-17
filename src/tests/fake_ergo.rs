@@ -402,6 +402,25 @@ async fn serve_client(
                 write_line(&mut writer, &format!("@batch={label} :fake BATCH -{label}")).await;
             }
             "DROPME" => break,
+            // Push an inbound CTCP DCC SEND offer from a peer, which is the
+            // only way a real gateway learns of one and therefore the only
+            // honest way to exercise acceptance end to end. Parameters are the
+            // encoded address, port, size, and filename the offer advertises.
+            "TESTDCCSEND" => {
+                let target = nickname.as_deref().unwrap_or("guest");
+                let address = message.params.first().map_or("0", String::as_str);
+                let port = message.params.get(1).map_or("0", String::as_str);
+                let size = message.params.get(2).map_or("0", String::as_str);
+                let filename = message.params.get(3).map_or("offered.bin", String::as_str);
+                write_line(
+                    &mut writer,
+                    &format!(
+                        ":peer!u@h PRIVMSG {target} :\u{1}DCC SEND {filename} {address} {port} \
+                         {size}\u{1}"
+                    ),
+                )
+                .await;
+            }
             "TESTCTCP" => {
                 let target = nickname.as_deref().unwrap_or("guest");
                 write_line(

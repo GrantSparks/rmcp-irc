@@ -1124,6 +1124,7 @@ dependencies = [
  "proptest",
  "rand 0.10.2",
  "rmcp",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "schemars",

@@ -69,6 +69,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
 
+# Directory-relative filesystem calls. An accepted DCC file must land beneath
+# the configured receive root even when a peer, or anything else on the host,
+# is racing the resolution — which needs `openat`/`renameat`/`statat` against a
+# directory this process holds open, and the standard library exposes no
+# directory-relative operations at all. See `src/dcc/confine.rs`; the non-Unix
+# fallback there needs no dependency.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
+
 [dev-dependencies]
 proptest = "1.7"
 tempfile = "3.23"

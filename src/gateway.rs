@@ -19,6 +19,7 @@ use crate::{
     },
     config::Config,
     dcc::{
+        confine::ReceiveChoice,
         session::{DccKind, DccSession, DccSessionId, DccState},
         transfer::DestinationConflict,
     },
@@ -164,10 +165,6 @@ impl Gateway {
     /// service instance shares: Streamable HTTP builds a fresh handler for each
     /// POST, so a key held by the handler would change between the round that
     /// sealed a state and the round that must open it.
-    #[allow(
-        dead_code,
-        reason = "the elicitation flows that seal and open request state land separately"
-    )]
     pub fn request_states(&self) -> &RequestStateSealer {
         &self.request_states
     }
@@ -577,18 +574,23 @@ impl Gateway {
     }
 
     /// Accept one incoming direct offer.
+    ///
+    /// `destination` names a configured receive root and a path relative to it,
+    /// and is required for SEND. Confinement is settled inside the owning
+    /// actor, where the configuration lives, so no caller of this can hand a
+    /// resolved path down.
     pub async fn dcc_accept(
         &self,
         agent_id: &AgentId,
         session_id: DccSessionId,
-        destination_path: Option<std::path::PathBuf>,
+        destination: Option<ReceiveChoice>,
         conflict: DestinationConflict,
     ) -> Result<DccSession> {
         self.resolve(agent_id)
             .await?
             .dcc_accept(DccAcceptRequest {
                 session_id,
-                destination_path,
+                destination,
                 conflict,
             })
             .await

@@ -20,10 +20,46 @@ Ergo-advertised IRC capabilities.
 - Incoming negotiation must be a direct message to the actor's current nick.
   Private and local peer addresses are rejected unless explicitly enabled for
   a trusted local/container network.
-- Incoming filenames are a single path component and receive destinations are
-  confined beneath the configured download root.
+- Incoming filenames are a single path component, and receive destinations are
+  confined beneath one of the configured named receive roots.
+- Filesystem authority is server-owned and the destination choice is
+  caller-owned: configuration names the roots, and a tool call names which root
+  and where beneath it. A call cannot name a directory, and no resolved path
+  crosses a process boundary as an argument.
 - Every transfer destination and conflict behavior is explicit unless safe
   automatic-accept defaults apply.
+
+## Receive roots
+
+`[[dcc.receive_roots]]` declares the named directories incoming files may be
+written into; see [CONFIGURATION.md](CONFIGURATION.md). They are the hard
+security boundary. `download_directory` seeds one root named `downloads` when no
+root is declared, so existing configurations keep exactly the root they had, and
+declaring roots replaces that default entirely.
+
+Confinement is enforced by resolution, not by comparing strings. The gateway
+opens the configured root as a directory handle, then walks a relative
+destination one component at a time, opening each directory relative to the
+handle for the directory above it and refusing to traverse a symbolic link. The
+transfer receives that held directory plus a leaf name, and every later
+operation — the existence probe, the temporary file, the commit rename, failure
+cleanup — addresses an entry inside it. Consequences worth stating plainly:
+
+- A symbolic link at any component of the destination is refused, not followed.
+- A symbolic link *at the destination name* is treated as an occupied name by
+  conflict handling. `fail` stops, `rename` moves aside, and `replace` replaces
+  the link itself; none of them writes through it.
+- Replacing a directory after it was resolved cannot redirect the write, because
+  nothing resolves the path a second time. The write lands beneath the chosen
+  root or it fails.
+- `..`, an absolute path, and a platform path prefix are refused by name before
+  any directory is created.
+
+On Unix this uses directory-relative `openat`/`mkdirat`/`statat`/`renameat`
+against held descriptors. Platforms without directory-relative operations fall
+back to open-then-verify — each created directory is re-resolved and confirmed to
+be the one beneath the root — which refuses the same links without the
+capability guarantee that no second resolution happens at all.
 
 ## Session model
 
@@ -42,6 +78,8 @@ Every offer creates an opaque process-local `dcc_session_id` owned by one
   "endpoint": null,
   "filename": "report.txt",
   "local_path": null,
+  "receive_root": null,
+  "receive_path": null,
   "transferred_bytes": 0,
   "total_bytes": 1204,
   "created_at": "2026-08-17T10:00:00Z",
@@ -50,8 +88,18 @@ Every offer creates an opaque process-local `dcc_session_id` owned by one
 }
 ```
 
-`kind` is `chat` or `send`; `direction` is `inbound` or `outbound`. Lifecycle
-states are:
+`kind` is `chat` or `send`; `direction` is `inbound` or `outbound`.
+
+`local_path` is a path on the gateway host: the source of an outgoing SEND, or
+the committed destination of an accepted incoming one. For an accepted incoming
+SEND, `receive_root` and `receive_path` restate that destination in the terms the
+caller chose it — a configured root name and a path relative to that root — which
+is the pair a caller can reason about without any authority over host paths. Both
+are set when the offer is accepted and restated on completion, because a `rename`
+conflict settles the committed name only then. They are absent for CHAT and for
+outgoing sessions.
+
+Lifecycle states are:
 
 ```text
 offered -> connecting -> active | transferring -> completed
@@ -148,29 +196,120 @@ not merely end-of-file on the source read.
 Input contains:
 
 - `agent_id` and offered `dcc_session_id`;
-- `destination_path` for SEND, omitted for CHAT;
+- `root` for SEND: the name of a configured `dcc.receive_roots` entry;
+- `destination_path` for SEND: a **relative** path beneath that root;
 - `conflict`: `fail`, `replace`, or `rename` for an existing SEND destination.
+
+Both `root` and `destination_path` are omitted for CHAT, which writes nothing;
+supplying either on a CHAT offer is refused rather than ignored.
+
+### Resolving the destination
+
+| `root` | `destination_path` | Result |
+| --- | --- | --- |
+| given | given | Validated against configuration and accepted. |
+| given | omitted | The offered filename, already reduced to one ordinary path component. |
+| omitted | either | With exactly one configured root, that root. With several, the caller is asked. |
+| any | absolute | Refused. The root name carries the filesystem authority; a path that supplied its own root is claiming authority configuration never granted. |
+| any | any, unknown root | Refused, listing the configured root names. |
+
+An offer that advertised no filename requires `destination_path`.
+
+### Asking the caller which root
+
+When several roots are configured and the call named none, the gateway cannot
+choose without inventing an authority decision. If the calling request declared
+form elicitation, the tool answers with an MCP `input_required` result rather
+than a session:
+
+```json
+{
+  "resultType": "input_required",
+  "inputRequests": {
+    "dcc_destination": {
+      "method": "elicitation/create",
+      "params": {
+        "mode": "form",
+        "message": "Choose where to receive report.txt (1204 bytes) offered by alice.",
+        "requestedSchema": {
+          "type": "object",
+          "properties": {
+            "root": { "type": "string", "enum": ["downloads", "media"], "default": "downloads" },
+            "destination_path": { "type": "string", "default": "report.txt" }
+          },
+          "required": ["root"]
+        }
+      }
+    }
+  },
+  "requestState": "rs1.…"
+}
+```
+
+The client gathers the answer and re-sends the **same** `irc.dcc.accept` call
+with its original arguments plus `inputResponses` keyed `dcc_destination` and the
+`requestState` echoed byte-for-byte:
+
+```json
+{
+  "name": "irc.dcc.accept",
+  "arguments": { "agent_id": "…", "dcc_session_id": "dcc-…", "conflict": "fail" },
+  "inputResponses": {
+    "dcc_destination": {
+      "action": "accept",
+      "content": { "root": "media", "destination_path": "august/report.txt" }
+    }
+  },
+  "requestState": "rs1.…"
+}
+```
+
+The answer is validated exactly like an explicit argument: same configuration
+lookup, same refusal of an absolute path, and additionally checked against the
+set of roots the question actually offered.
+
+`requestState` is opaque and integrity-protected. It is bound to the calling
+caller identity, to this tool call's arguments, and to a short expiry, and the
+offer it was minted for is re-checked by peer and advertised filename on
+redemption. A state from another caller, for another offer, for altered
+arguments, expired, or modified in any way is refused as a tool error that leaves
+the offer untouched; only the offer's own `offer_ttl_ms` retires it. There is no
+separate one-time-redemption bookkeeping, because a second acceptance of the same
+offer is already refused by the session lifecycle.
+
+`action: "decline"` or `"cancel"` is terminal for the call: the tool returns an
+error result with `kind: "declined"`, nothing is written, and the offer stays
+pending until it expires or is accepted or rejected.
+
+A request that declared no elicitation support gets a structured error instead of
+a question, carrying `receive_roots` and `default_destination_path` so its next
+attempt can name both explicitly.
+
+### Acceptance and conflict behavior
 
 `fail` leaves the existing file untouched and the session fails before writing
 the destination. `replace` does not replace the destination until the transfer
 completes; failure cleanup does not delete the pre-existing file.
-`rename` chooses a non-existing sibling path deterministically and reports the
-actual path. The gateway receives into a temporary file and atomically renames
-it on success where the filesystem permits, so a partial file is not presented
-as a completed transfer.
+`rename` chooses a non-existing sibling name deterministically and reports the
+actual destination in `local_path` and `receive_path`. The gateway receives into a
+temporary file inside the resolved directory and renames it there on success, so a
+partial file is not presented as a completed transfer and the commit cannot be
+re-routed.
 
 For CHAT, acceptance establishes the direct connection. For SEND, acceptance
-resolves a relative path beneath `download_directory`, rejects a path whose
-resolved parent escapes that root, and starts a bounded streamed transfer. An
-absolute path is accepted only when it is already below the same root. The
-result is the updated session snapshot; when the request declares the tasks
-extension the server answers with a task handle instead, following the same
-status, cancellation, terminal-result, and native-resource-link behavior as
-task-augmented `irc.dcc.send`.
+resolves the destination beneath the chosen root, creating any directories the
+relative path names inside it, and starts a bounded streamed transfer. The default
+result is the updated session snapshot, including `receive_root` and
+`receive_path`. When the request declares the tasks extension in its `_meta`
+client capabilities, the server instead returns a task handle and follows the
+same progress, cancellation, terminal-result, and native-resource-link behavior
+as task-augmented `irc.dcc.send` — a task-augmented call must supply `root` and
+`destination_path` explicitly where the server cannot choose, because a task
+handle is created only for work that is already fully decided.
 
-The destination's parent directory must already exist and be writable by the
-gateway process. The gateway never creates an implicit directory tree from a
-peer-supplied offer.
+The gateway never creates a directory tree from a peer-supplied offer: an offered
+filename is a single path component, and only a caller's explicit
+`destination_path` can name directories to create.
 
 ## `irc.dcc.reject`
 

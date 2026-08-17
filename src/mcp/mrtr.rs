@@ -30,14 +30,6 @@
 //! The signing key is generated once per process and never leaves it. A restart
 //! invalidates outstanding state, which is the correct outcome: the in-memory
 //! work the state referred to did not survive either.
-//!
-//! Nothing calls this yet. It is the foundation the elicitation flows are built
-//! on, landed with its own tests so those flows do not have to invent
-//! integrity protection alongside their own logic.
-#![allow(
-    dead_code,
-    reason = "sealed request state is landed and tested ahead of the elicitation flows that will use it"
-)]
 
 use std::time::Duration;
 

@@ -164,8 +164,18 @@ pub struct DccSession {
     pub endpoint: Option<SocketAddr>,
     /// Advertised filename.
     pub filename: Option<String>,
-    /// Local source or destination path.
+    /// Local source or destination path on the gateway host.
     pub local_path: Option<PathBuf>,
+    /// Configured `dcc.receive_roots` name an incoming file is confined to.
+    ///
+    /// Present only for an accepted incoming SEND. Together with
+    /// `receive_path` it says where the file landed in the terms the caller
+    /// chose it — a root name and a path relative to it — rather than in a
+    /// host path the caller has no authority over and may not be able to reach.
+    pub receive_root: Option<String>,
+    /// Destination relative to `receive_root`, updated if a conflict rename
+    /// moved the committed file aside.
+    pub receive_path: Option<PathBuf>,
     /// Bytes transferred so far.
     pub transferred_bytes: u64,
     /// Expected bytes when supplied by the peer.
@@ -197,6 +207,8 @@ impl DccSession {
             endpoint: None,
             filename: None,
             local_path: None,
+            receive_root: None,
+            receive_path: None,
             transferred_bytes: 0,
             total_bytes: None,
             created_at: now,

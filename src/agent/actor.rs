@@ -26,6 +26,7 @@ use crate::{
     config::{Config, IrcTransport},
     dcc::{
         chat::{DccChatEvent, DccChatHandle, spawn_chat},
+        confine::{ReceiveChoice, ReceiveDestination},
         manager::DccManager,
         negotiation::{CtcpMessage, DccOffer, encode_address, parse_address, validate_filename},
         runtime::{accept_offer, bind_listener, connect as connect_direct, offer_accept_timeout},
@@ -250,8 +251,9 @@ pub struct DisconnectReceipt {
 pub struct DccAcceptRequest {
     /// Offered session.
     pub session_id: DccSessionId,
-    /// Required destination for incoming SEND.
-    pub destination_path: Option<PathBuf>,
+    /// Required receive root and root-relative destination for incoming SEND;
+    /// absent for CHAT, which writes nothing.
+    pub destination: Option<ReceiveChoice>,
     /// Existing destination behavior.
     pub conflict: DestinationConflict,
 }
@@ -2411,9 +2413,11 @@ impl AgentActor {
         let destination = match session.kind {
             DccKind::Chat => None,
             DccKind::Send => Some(
-                self.resolve_dcc_destination(request.destination_path.as_deref().ok_or_else(
-                    || GatewayError::Dcc("destination_path is required for DCC SEND".into()),
-                )?)
+                self.resolve_dcc_destination(request.destination.as_ref().ok_or_else(|| {
+                    GatewayError::Dcc(
+                        "a receive root and destination are required for DCC SEND".into(),
+                    )
+                })?)
                 .await?,
             ),
         };
@@ -2450,10 +2454,13 @@ impl AgentActor {
             DirectSetup::Connect(endpoint)
         };
         if let Some(destination) = &destination {
-            self.dcc
+            let session = self
+                .dcc
                 .get_mut(&request.session_id)
-                .map_err(dcc_manager_error)?
-                .local_path = Some(destination.clone());
+                .map_err(dcc_manager_error)?;
+            session.local_path = Some(destination.path());
+            session.receive_root = Some(destination.root().to_owned());
+            session.receive_path = Some(destination.relative_path());
         }
         self.dcc
             .transition(&request.session_id, DccState::Connecting, Timestamp::now())
@@ -2531,8 +2538,24 @@ impl AgentActor {
         Ok(session)
     }
 
-    async fn resolve_dcc_destination(&self, requested: &std::path::Path) -> Result<PathBuf> {
-        confined_dcc_destination(&self.config.dcc.download_directory, requested).await
+    /// Turn a caller's root name and relative path into a directory this
+    /// process holds open plus the file to create inside it.
+    ///
+    /// The root name is looked up in configuration here, at the boundary, and
+    /// never carried further: everything downstream works from the resolved
+    /// capability, so no later code can be handed a path that only claims to be
+    /// beneath a root.
+    async fn resolve_dcc_destination(&self, choice: &ReceiveChoice) -> Result<ReceiveDestination> {
+        let root = self.config.dcc.receive_root(&choice.root).ok_or_else(|| {
+            GatewayError::Dcc(format!(
+                "unknown DCC receive root {:?}; configured roots are {}",
+                choice.root,
+                self.config.dcc.receive_root_names().join(", ")
+            ))
+        })?;
+        ReceiveDestination::resolve(&root, &choice.path)
+            .await
+            .map_err(|error| GatewayError::Dcc(error.to_string()))
     }
 
     fn incoming_offer_limit_reached(&self, peer: &str) -> bool {
@@ -2738,7 +2761,7 @@ impl AgentActor {
                 if self.config.dcc.automatic_accept_chat {
                     let request = DccAcceptRequest {
                         session_id: session.id.clone(),
-                        destination_path: None,
+                        destination: None,
                         conflict: DestinationConflict::Fail,
                     };
                     if let Err(error) = self.accept_dcc(framed, request).await {
@@ -2834,10 +2857,16 @@ impl AgentActor {
                 }
                 self.notify_dcc_change(EventClass::DccTransferOffered, &session);
                 if self.config.dcc.automatic_accept_send {
-                    let destination = session.filename.as_ref().map(PathBuf::from);
+                    // Nobody is present to choose, so this takes the default
+                    // root and the offered filename — which negotiation has
+                    // already reduced to a single ordinary component.
+                    let destination = session.filename.as_ref().map(|filename| ReceiveChoice {
+                        root: self.config.dcc.default_receive_root().name,
+                        path: PathBuf::from(filename),
+                    });
                     let request = DccAcceptRequest {
                         session_id: session.id.clone(),
-                        destination_path: destination,
+                        destination,
                         conflict: DestinationConflict::Fail,
                     };
                     if let Err(error) = self.accept_dcc(framed, request).await {
@@ -3041,7 +3070,7 @@ impl AgentActor {
         &mut self,
         session_id: DccSessionId,
         connection: F,
-        destination: PathBuf,
+        destination: ReceiveDestination,
         conflict: DestinationConflict,
         expected_bytes: Option<u64>,
     ) where
@@ -3080,7 +3109,7 @@ impl AgentActor {
             let transfer = receive_file(
                 stream,
                 event_id.clone(),
-                &destination,
+                destination,
                 ReceiveOptions {
                     conflict,
                     expected_size: expected_bytes,
@@ -3205,7 +3234,12 @@ impl AgentActor {
                 if let Some(received) = received
                     && let Ok(session) = self.dcc.get_mut(&session_id)
                 {
+                    // A conflict rename settles the committed name only here,
+                    // so the reported destination has to be restated rather
+                    // than left as the one acceptance planned.
                     session.local_path = Some(received.path);
+                    session.receive_root = Some(received.root);
+                    session.receive_path = Some(received.relative_path);
                 }
                 let _ = self
                     .dcc
@@ -3501,39 +3535,6 @@ async fn dcc_source_metadata(source_path: &std::path::Path) -> Result<std::fs::M
     Ok(metadata)
 }
 
-async fn confined_dcc_destination(
-    root: &std::path::Path,
-    requested: &std::path::Path,
-) -> Result<PathBuf> {
-    tokio::fs::create_dir_all(root)
-        .await
-        .map_err(|source| GatewayError::io("create DCC download directory", source))?;
-    let root = tokio::fs::canonicalize(root)
-        .await
-        .map_err(|source| GatewayError::io("resolve DCC download directory", source))?;
-    let candidate = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        root.join(requested)
-    };
-    let filename = candidate
-        .file_name()
-        .ok_or_else(|| GatewayError::Dcc("DCC destination must identify a file".into()))?;
-    let parent = candidate
-        .parent()
-        .ok_or_else(|| GatewayError::Dcc("DCC destination must have a parent directory".into()))?;
-    let parent = tokio::fs::canonicalize(parent)
-        .await
-        .map_err(|source| GatewayError::io("resolve DCC destination directory", source))?;
-    if !parent.starts_with(&root) {
-        return Err(GatewayError::Dcc(format!(
-            "DCC destination must remain below {}",
-            root.display()
-        )));
-    }
-    Ok(parent.join(filename))
-}
-
 fn validate_peer(peer: &str) -> Result<()> {
     Nickname::new(peer)
         .map(|_| ())
@@ -3620,29 +3621,6 @@ mod tests {
         assert!(is_history_batch_kind("draft/chathistory"));
         assert!(is_history_batch_kind("HISTORY"));
         assert!(!is_history_batch_kind("draft/no-history"));
-    }
-
-    #[tokio::test]
-    async fn incoming_files_remain_below_the_download_root() {
-        let parent = tempfile::tempdir().expect("parent");
-        let root = parent.path().join("downloads");
-        let nested = root.join("nested");
-        tokio::fs::create_dir_all(&nested).await.expect("nested");
-        let canonical_nested = tokio::fs::canonicalize(&nested)
-            .await
-            .expect("canonical nested directory");
-
-        assert_eq!(
-            confined_dcc_destination(&root, std::path::Path::new("nested/report.txt"))
-                .await
-                .expect("inside root"),
-            canonical_nested.join("report.txt")
-        );
-        assert!(
-            confined_dcc_destination(&root, std::path::Path::new("../escape.txt"))
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test]
