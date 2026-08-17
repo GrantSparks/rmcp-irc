@@ -21,7 +21,7 @@ use crate::{
         registration::{NickConflictPolicy, Nickname},
         wire::{OutboundMessage, WireMessage},
     },
-    mcp::watch::WatchFilter,
+    mcp::{authorization::OwnerId, watch::WatchFilter},
 };
 use bytes::Bytes;
 use tokio::{
@@ -1325,4 +1325,71 @@ async fn disconnecting_an_agent_releases_its_watches() {
         gateway.watches().describe(&watch.watch_id).is_none(),
         "a watch outlived the stream it was watching"
     );
+}
+
+#[tokio::test]
+async fn one_callers_handles_are_invisible_and_unusable_to_another() {
+    let fake = FakeErgo::spawn().await;
+    let gateway = Gateway::new(fake.config());
+    let mine = OwnerId::from_bearer("mine");
+    let theirs = OwnerId::from_bearer("theirs");
+
+    let connected = gateway
+        .connect_as(mine.clone(), connect_request("Minos"))
+        .await
+        .expect("connect");
+    let watch = gateway
+        .create_watch(&connected.agent_id, WatchFilter::default(), None)
+        .await
+        .expect("create watch");
+
+    assert_eq!(
+        gateway.agent_ids_for(&mine).await,
+        vec![connected.agent_id.clone()]
+    );
+    assert!(
+        gateway.agent_ids_for(&theirs).await.is_empty(),
+        "another caller must not see handles it did not create"
+    );
+    assert!(
+        gateway
+            .authorize_agent(&mine, &connected.agent_id)
+            .await
+            .is_ok()
+    );
+    assert!(
+        gateway
+            .authorize_agent(&theirs, &connected.agent_id)
+            .await
+            .is_err(),
+        "another caller must not be able to operate this agent"
+    );
+    // A watch is reachable only through the agent it watches.
+    assert!(
+        gateway
+            .authorize_watch(&mine, &watch.watch_id)
+            .await
+            .is_ok()
+    );
+    assert!(
+        gateway
+            .authorize_watch(&theirs, &watch.watch_id)
+            .await
+            .is_err()
+    );
+
+    // Refusal must not reveal that the handle exists at all.
+    let unknown = gateway
+        .authorize_agent(&theirs, &connected.agent_id)
+        .await
+        .expect_err("refused");
+    assert!(
+        unknown.message.contains("unknown or expired"),
+        "an unowned handle must read exactly like a missing one: {unknown:?}"
+    );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
 }

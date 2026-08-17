@@ -16,7 +16,7 @@ use crate::{
         journal::{EventCursor, IrcEvent, JournalStats},
         state::{AgentState, ChannelState, MemberState, MotdState},
     },
-    dcc::session::DccSession,
+    dcc::session::{DccSession, DccSessionId},
     irc::{capabilities::CompatibilityCatalog, isupport::CaseMapping},
     mcp::conversation::CompactEvent,
     time::Timestamp,
@@ -57,6 +57,15 @@ impl ResourceUris {
             wire: format!("{base}/wire"),
             dcc: format!("{base}/dcc"),
         }
+    }
+
+    /// Build the resource URI for one direct session.
+    pub fn dcc_session(agent_id: &AgentId, session_id: &DccSessionId) -> String {
+        format!(
+            "irc://agents/{}/dcc/{}",
+            agent_id.as_str(),
+            encode_channel_segment(&session_id.to_string())
+        )
     }
 
     /// Build the transcript resource URI for one channel or peer.
@@ -245,6 +254,13 @@ pub fn describe(uri: &AgentResourceUri, last_modified: Option<Timestamp>) -> Res
             FOR_MODEL,
             0.5,
         ),
+        ResourceKind::DccSession(session_id) => (
+            format!("dcc-{session_id}"),
+            format!("Direct session {session_id}"),
+            "One direct session: its state, endpoint, byte progress, and local path.".to_string(),
+            FOR_MODEL,
+            0.6,
+        ),
         ResourceKind::Channel(channel) => (
             format!("channel-{channel}"),
             format!("Channel {channel}"),
@@ -353,6 +369,9 @@ pub enum ResourceKind {
     Transcript(String),
     /// Retained direct sessions.
     Dcc,
+    /// One direct session, addressable so a long-running transfer can be
+    /// followed and its terminal result linked to.
+    DccSession(DccSessionId),
     /// One expanded channel snapshot.
     Channel(String),
     /// The member list of one channel on its own.
@@ -396,6 +415,10 @@ impl FromStr for AgentResourceUri {
             ["inbox"] => ResourceKind::Inbox,
             ["wire"] => ResourceKind::Wire,
             ["dcc"] => ResourceKind::Dcc,
+            ["dcc", session] if !session.is_empty() => ResourceKind::DccSession(
+                DccSessionId::from_str(&decode_segment(session)?)
+                    .map_err(ResourceUriError::DccSession)?,
+            ),
             ["transcripts", target] if !target.is_empty() => {
                 ResourceKind::Transcript(decode_segment(target)?)
             }
@@ -440,6 +463,9 @@ pub enum ResourceUriError {
     /// Cursor expansion did not carry a decimal sequence number.
     #[error("event cursor segment must be a decimal sequence number")]
     CursorSequence,
+    /// A DCC path did not carry a valid session handle.
+    #[error("invalid DCC session handle: {0}")]
+    DccSession(&'static str),
 }
 
 /// Status-resource payload.
@@ -559,6 +585,8 @@ pub enum ResourcePayload {
     Wire(Box<WireResource>),
     /// Retained direct sessions.
     Dcc(DccResource),
+    /// One direct session.
+    DccSession(Box<DccSession>),
     /// One channel snapshot.
     Channel(ChannelState),
     /// One channel's members.
@@ -608,6 +636,13 @@ impl AgentSnapshot {
             ResourceKind::Dcc => ResourcePayload::Dcc(DccResource {
                 sessions: self.dcc_sessions.clone(),
             }),
+            ResourceKind::DccSession(session_id) => ResourcePayload::DccSession(Box::new(
+                self.dcc_sessions
+                    .iter()
+                    .find(|session| session.id == *session_id)
+                    .cloned()
+                    .ok_or_else(|| ResourceLookupError::DccSession(session_id.to_string()))?,
+            )),
             ResourceKind::Channel(requested) => {
                 ResourcePayload::Channel(self.joined_channel(requested)?)
             }
@@ -654,6 +689,9 @@ pub enum ResourceLookupError {
     /// The actor is not currently joined to the expanded channel name.
     #[error("channel is not present in the actor snapshot: {0}")]
     Channel(String),
+    /// The actor is not retaining the requested direct session.
+    #[error("direct session is not present in the actor snapshot: {0}")]
+    DccSession(String),
     /// A journal window must be read through the gateway rather than a snapshot.
     #[error("journal-backed resources are served by the gateway, not by a snapshot")]
     JournalWindowIsAsync,
@@ -670,6 +708,9 @@ impl fmt::Display for AgentResourceUri {
             ResourceKind::Inbox => ResourceUris::for_agent(&self.agent_id).inbox,
             ResourceKind::Wire => ResourceUris::for_agent(&self.agent_id).wire,
             ResourceKind::Dcc => ResourceUris::for_agent(&self.agent_id).dcc,
+            ResourceKind::DccSession(session_id) => {
+                ResourceUris::dcc_session(&self.agent_id, session_id)
+            }
             ResourceKind::EventsAfter(sequence) => {
                 ResourceUris::events_after(&self.agent_id, *sequence)
             }

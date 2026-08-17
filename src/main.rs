@@ -14,7 +14,11 @@ mod tests;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
-use crate::{config::Config, gateway::Gateway, mcp::service::IrcMcpService};
+use crate::{
+    config::Config,
+    gateway::Gateway,
+    mcp::{authorization::CallerPolicy, service::IrcMcpService},
+};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rmcp::{
@@ -65,6 +69,12 @@ struct ServeArgs {
     /// Browser Origin accepted by the HTTP cross-origin guard; repeatable.
     #[arg(long = "allow-origin", value_name = "ORIGIN")]
     allow_origin: Vec<String>,
+    /// Bearer credential accepted on the HTTP endpoint; repeatable. Each
+    /// credential is a distinct caller identity, and handles created by one
+    /// are invisible to the others. Without any, callers are separated by MCP
+    /// session instead.
+    #[arg(long = "http-bearer-token", value_name = "TOKEN")]
+    http_bearer_token: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -120,7 +130,15 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         }
         Transport::Http => {
             let (allowed_hosts, allowed_origins) = http_security(&args)?;
-            serve_http(gateway.clone(), args.listen, allowed_hosts, allowed_origins).await
+            let callers = CallerPolicy::http(&args.http_bearer_token);
+            serve_http(
+                gateway.clone(),
+                args.listen,
+                allowed_hosts,
+                allowed_origins,
+                callers,
+            )
+            .await
         }
     };
     let stopped = gateway
@@ -139,6 +157,13 @@ fn http_security(args: &ServeArgs) -> anyhow::Result<(Vec<String>, Vec<String>)>
     }
     if args.allow_host.iter().any(|host| host.trim().is_empty()) {
         anyhow::bail!("--allow-host must not be empty");
+    }
+    if args
+        .http_bearer_token
+        .iter()
+        .any(|token| token.trim().is_empty())
+    {
+        anyhow::bail!("--http-bearer-token must not be empty");
     }
     for origin in &args.allow_origin {
         let valid = origin == "null"
@@ -179,12 +204,19 @@ async fn serve_http(
     listen: SocketAddr,
     allowed_hosts: Vec<String>,
     allowed_origins: Vec<String>,
+    callers: CallerPolicy,
 ) -> anyhow::Result<()> {
     let cancellation = CancellationToken::new();
     let factory_gateway = gateway.clone();
+    let factory_callers = callers.clone();
     let service: StreamableHttpService<IrcMcpService, LocalSessionManager> =
         StreamableHttpService::new(
-            move || Ok(IrcMcpService::new(factory_gateway.clone())),
+            move || {
+                Ok(IrcMcpService::with_caller_policy(
+                    factory_gateway.clone(),
+                    factory_callers.clone(),
+                ))
+            },
             Default::default(),
             StreamableHttpServerConfig::default()
                 .with_legacy_session_mode(false)
@@ -192,7 +224,11 @@ async fn serve_http(
                 .with_allowed_origins(allowed_origins)
                 .with_cancellation_token(cancellation.child_token()),
         );
-    let router = axum::Router::new().nest_service("/mcp", service);
+    // Every response carries per-caller IRC state, so no shared cache may
+    // retain or reuse it for anyone else.
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(mark_responses_private));
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("bind Streamable HTTP listener at {listen}"))?;
@@ -209,6 +245,23 @@ async fn serve_http(
         .await
         .context("Streamable HTTP MCP service")?;
     Ok(())
+}
+
+/// Mark every HTTP response as private and uncacheable.
+///
+/// A resource read answers with whatever the calling identity owns, so a
+/// response cached by an intermediary and replayed to another caller would
+/// hand them somebody else's conversation.
+async fn mark_responses_private(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-store"),
+    );
+    response
 }
 
 #[cfg(unix)]
@@ -245,6 +298,7 @@ mod cli_tests {
             allow_unauthenticated_network: false,
             allow_host: Vec::new(),
             allow_origin: Vec::new(),
+            http_bearer_token: Vec::new(),
         }
     }
 

@@ -31,6 +31,7 @@ use crate::{
         wire::OutboundMessage,
     },
     mcp::{
+        authorization::{OwnerId, not_authorized},
         conversation::CompactEvent,
         resources::{ConversationResource, WireResource},
         watch::{WatchDescriptor, WatchFilter, WatchId, WatchRegistry, WatchResource},
@@ -76,11 +77,18 @@ pub struct ConnectedAgent {
     pub motd: crate::agent::state::MotdState,
 }
 
+/// One published agent and the caller identity that created it.
+#[derive(Clone, Debug)]
+struct OwnedAgent {
+    owner: OwnerId,
+    handle: AgentHandle,
+}
+
 /// Shared in-memory gateway for all MCP transports.
 #[derive(Debug)]
 pub struct Gateway {
     config: Arc<Config>,
-    agents: RwLock<BTreeMap<AgentId, AgentHandle>>,
+    agents: RwLock<BTreeMap<AgentId, OwnedAgent>>,
     capacity: Arc<Semaphore>,
     resource_updates: broadcast::Sender<String>,
     watches: Arc<WatchRegistry>,
@@ -122,8 +130,18 @@ impl Gateway {
         self.agents.read().await.len()
     }
 
-    /// Register a guest, publishing its handle only after success.
+    /// Register a guest owned by the local caller.
     pub async fn connect(&self, request: ConnectRequest) -> Result<ConnectedAgent> {
+        self.connect_as(OwnerId::local(), request).await
+    }
+
+    /// Register a guest, publishing its handle only after success and
+    /// recording the caller that may use it.
+    pub async fn connect_as(
+        &self,
+        owner: OwnerId,
+        request: ConnectRequest,
+    ) -> Result<ConnectedAgent> {
         validate_identity_field(request.username.as_deref(), "username", false)?;
         validate_identity_field(request.real_name.as_deref(), "real name", true)?;
         let permit = self
@@ -168,7 +186,10 @@ impl Gateway {
         let receipt = ready
             .await
             .map_err(|_| GatewayError::ActorStopped(agent_id.clone()))??;
-        self.agents.write().await.insert(agent_id.clone(), handle);
+        self.agents
+            .write()
+            .await
+            .insert(agent_id.clone(), OwnedAgent { owner, handle });
         let _ = self.resource_updates.send("irc://agents".into());
         Ok(ConnectedAgent {
             agent_id,
@@ -377,7 +398,8 @@ impl Gateway {
             .write()
             .await
             .remove(agent_id)
-            .ok_or_else(|| GatewayError::AgentNotFound(agent_id.clone()))?;
+            .ok_or_else(|| GatewayError::AgentNotFound(agent_id.clone()))?
+            .handle;
         let result = actor.disconnect(reason).await;
         // Watches outlive nothing: their stream is gone, so leaving them
         // registered would only produce handles that can never be read.
@@ -396,6 +418,10 @@ impl Gateway {
         for agent_id in actors.keys() {
             self.watches.close_agent(agent_id);
         }
+        let actors: BTreeMap<AgentId, AgentHandle> = actors
+            .into_iter()
+            .map(|(agent_id, agent)| (agent_id, agent.handle))
+            .collect();
         let _ = self.resource_updates.send("irc://agents".into());
         let mut shutdowns = futures_util::stream::FuturesUnordered::new();
         for (agent_id, actor) in actors {
@@ -487,6 +513,20 @@ impl Gateway {
         self.resolve(agent_id).await?.dcc_cancel(session_id).await
     }
 
+    /// Read one retained direct session.
+    pub async fn dcc_session(
+        &self,
+        agent_id: &AgentId,
+        session_id: &DccSessionId,
+    ) -> Result<DccSession> {
+        self.snapshot(agent_id)
+            .await?
+            .dcc_sessions
+            .into_iter()
+            .find(|session| session.id == *session_id)
+            .ok_or_else(|| GatewayError::Dcc(format!("unknown direct session: {session_id}")))
+    }
+
     /// Filter retained direct sessions in deterministic handle order.
     pub async fn dcc_list(
         &self,
@@ -505,9 +545,55 @@ impl Gateway {
             .collect())
     }
 
-    /// Return published handles in deterministic order.
-    pub async fn agent_ids(&self) -> Vec<AgentId> {
-        self.agents.read().await.keys().cloned().collect()
+    /// Return the handles one caller owns, in deterministic order.
+    pub async fn agent_ids_for(&self, owner: &OwnerId) -> Vec<AgentId> {
+        self.agents
+            .read()
+            .await
+            .iter()
+            .filter(|(_, agent)| agent.owner == *owner)
+            .map(|(agent_id, _)| agent_id.clone())
+            .collect()
+    }
+
+    /// Bind an agent handle to the caller that created it.
+    ///
+    /// Separate from `connect_as` because the tool surface learns the caller
+    /// identity at dispatch, after the gateway has already published the
+    /// handle. A handle whose actor vanished in between is simply not bound.
+    pub async fn assign_owner(&self, agent_id: &AgentId, owner: OwnerId) {
+        if let Some(agent) = self.agents.write().await.get_mut(agent_id) {
+            agent.owner = owner;
+        }
+    }
+
+    /// Confirm one caller may use an agent handle.
+    ///
+    /// A handle owned by somebody else fails exactly as a handle that does not
+    /// exist, so this can never be used to discover other callers' agents.
+    pub async fn authorize_agent(
+        &self,
+        owner: &OwnerId,
+        agent_id: &AgentId,
+    ) -> std::result::Result<(), rmcp::ErrorData> {
+        match self.agents.read().await.get(agent_id) {
+            Some(agent) if agent.owner == *owner => Ok(()),
+            _ => Err(not_authorized(agent_id.as_str())),
+        }
+    }
+
+    /// Confirm one caller may use a watch handle, through the agent it watches.
+    pub async fn authorize_watch(
+        &self,
+        owner: &OwnerId,
+        watch_id: &WatchId,
+    ) -> std::result::Result<(), rmcp::ErrorData> {
+        let Some(descriptor) = self.watches.describe(watch_id) else {
+            return Err(not_authorized(&watch_id.to_string()));
+        };
+        self.authorize_agent(owner, &descriptor.agent_id)
+            .await
+            .map_err(|_| not_authorized(&watch_id.to_string()))
     }
 
     async fn resolve(&self, agent_id: &AgentId) -> Result<AgentHandle> {
@@ -515,7 +601,7 @@ impl Gateway {
             .read()
             .await
             .get(agent_id)
-            .cloned()
+            .map(|agent| agent.handle.clone())
             .ok_or_else(|| GatewayError::AgentNotFound(agent_id.clone()))
     }
 }

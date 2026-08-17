@@ -43,6 +43,21 @@ breaking changes to the CLI, configuration, or MCP surface.
   audience, a priority, and a last-modified hint from one shared descriptor
   catalog, so what a tool link says about a URI and what `resources/list` says
   about the same URI cannot drift apart.
+- DCC transfers as MCP tasks. `irc.dcc.send` and `irc.dcc.accept` accept the
+  tasks extension on the call and then run as a task for the whole transfer,
+  reporting byte progress, honouring `tasks/cancel` by cancelling the session,
+  and settling with the terminal session and a link to it. Without the
+  extension they behave exactly as before. Each direct session is now
+  addressable at `irc://agents/{agent_id}/dcc/{session_id}`.
+- Caller ownership for handles. Agent and watch handles are now bound to the
+  caller that created them: the resource catalog lists only what that caller
+  owns, and naming somebody else's handle fails exactly as naming a handle
+  that does not exist, so the tool surface cannot be used to discover them.
+  HTTP callers are identified by `Authorization: Bearer` when
+  `--http-bearer-token` is configured and by MCP session otherwise; stdio has
+  one local caller that owns everything, so its behaviour is unchanged.
+- HTTP responses are marked `Cache-Control: private, no-store`, since every
+  response carries whatever the calling identity owns.
 
 ### Fixed
 

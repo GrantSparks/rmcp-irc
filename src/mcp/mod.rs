@@ -1,5 +1,6 @@
 //! Stable MCP service, tool schemas, and resource URI templates.
 
+pub mod authorization;
 pub mod conversation;
 pub mod resources;
 pub mod service;
