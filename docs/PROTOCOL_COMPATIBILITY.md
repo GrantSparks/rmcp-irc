@@ -222,6 +222,13 @@ and TIME queries, JOIN/PART echoes, messages, QUIT, and server/operator commands
 needed for structured execution. Unknown commands remain valid `irc.execute`
 inputs when syntactically encodable.
 
+Collector selection also inspects the structured message where one command has
+multiple reply shapes. A TOPIC with trailing text and a signed MODE change wait
+for their own state echo, while their read-only forms retain numeric collectors.
+MONITOR list, status, and mutation operations select their respective numeric,
+labeled-response, or visibly unconfirmed fallback instead of sharing one
+terminator that some forms can never produce.
+
 ## Correlation and collectors
 
 When `labeled-response` is negotiated, every outbound command gets a unique
@@ -238,6 +245,13 @@ Collectors are registered before the write. Labeled ACK and single replies
 complete directly; multi-message results remain open through their complete
 batch. FAIL completes as a tool execution error, WARN/NOTE attach structured
 information, and known numeric errors retain raw replies.
+
+An outer labeled-response batch is one logical response regardless of the
+command's static collector kind. Its opening line, descendants, nested batches,
+and closing line retain the parent command ID; completion and any rejection are
+reported only after the outer close. This prevents a single-reply or echo
+collector from detaching on the opening BATCH and leaving the actual payload
+uncorrelated.
 
 Cancellation detaches waiting without reversing an already-written command. A
 socket failure before write is `not_written`; after write but before definitive

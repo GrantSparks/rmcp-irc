@@ -227,4 +227,27 @@ mod tests {
         assert!(manager.update_progress(&id, 4, at(5)).is_err());
         assert!(manager.update_progress(&id, 11, at(5)).is_err());
     }
+
+    #[test]
+    fn local_cancellation_is_not_overwritten_by_a_late_peer_close() {
+        let mut manager = DccManager::new(1);
+        let session = offer("one", at(1));
+        let id = session.id.clone();
+        manager.insert(session).expect("insert");
+        manager
+            .transition(&id, DccState::Connecting, at(2))
+            .expect("connect");
+        manager
+            .transition(&id, DccState::Transferring, at(3))
+            .expect("transfer");
+        manager
+            .transition(&id, DccState::Cancelled, at(4))
+            .expect("cancel");
+
+        assert!(manager.transition(&id, DccState::Completed, at(5)).is_err());
+        assert_eq!(
+            manager.get(&id).expect("retained session").state,
+            DccState::Cancelled
+        );
+    }
 }

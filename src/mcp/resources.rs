@@ -48,10 +48,18 @@ impl ResourceUris {
         }
     }
 
+    /// Build the cursor-page expansion for one consumed sequence number.
+    pub fn events_after(agent_id: &AgentId, sequence: u64) -> String {
+        format!("irc://agents/{}/events/after/{sequence}", agent_id.as_str())
+    }
+
     /// Build the channel resource-template expansion for a case-preserved name.
     pub fn channel(agent_id: &AgentId, channel: &str) -> String {
-        let channel = utf8_percent_encode(channel, NON_ALPHANUMERIC);
-        format!("irc://agents/{}/channels/{channel}", agent_id.as_str())
+        format!(
+            "irc://agents/{}/channels/{}",
+            agent_id.as_str(),
+            encode_channel_segment(channel)
+        )
     }
 
     /// Ordered resources advertised for an agent.
@@ -67,6 +75,13 @@ impl ResourceUris {
     }
 }
 
+/// Percent-encode one case-preserved channel name for use as a single URI
+/// path segment. Shared so template expansion and argument completion can
+/// never disagree about the encoding.
+pub fn encode_channel_segment(channel: &str) -> String {
+    utf8_percent_encode(channel, NON_ALPHANUMERIC).to_string()
+}
+
 /// Per-agent resource kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResourceKind {
@@ -80,6 +95,13 @@ pub enum ResourceKind {
     State,
     /// Journal bounds and recent records.
     Events,
+    /// One cursor-addressed journal page beginning after a sequence.
+    ///
+    /// This is what makes `subscriptions/listen` plus `resources/read` a
+    /// complete delivery loop: the notification names the stable events
+    /// resource, and the reader then fetches everything it has not consumed
+    /// through this expansion, without a tool call.
+    EventsAfter(u64),
     /// Retained direct sessions.
     Dcc,
     /// One expanded channel snapshot.
@@ -102,17 +124,24 @@ impl FromStr for AgentResourceUri {
         let path = value
             .strip_prefix("irc://agents/")
             .ok_or(ResourceUriError::Scheme)?;
-        let mut segments = path.split('/');
-        let agent = segments.next().ok_or(ResourceUriError::Path)?;
+        // Match on the whole remainder so a trailing segment is rejected rather
+        // than silently ignored.
+        let segments: Vec<&str> = path.split('/').collect();
+        let (agent, rest) = segments.split_first().ok_or(ResourceUriError::Path)?;
         let agent_id = AgentId::from_str(agent).map_err(ResourceUriError::Agent)?;
-        let kind = match (segments.next(), segments.next(), segments.next()) {
-            (Some("status"), None, None) => ResourceKind::Status,
-            (Some("motd"), None, None) => ResourceKind::Motd,
-            (Some("protocol"), None, None) => ResourceKind::Protocol,
-            (Some("state"), None, None) => ResourceKind::State,
-            (Some("events"), None, None) => ResourceKind::Events,
-            (Some("dcc"), None, None) => ResourceKind::Dcc,
-            (Some("channels"), Some(channel), None) if !channel.is_empty() => {
+        let kind = match rest {
+            ["status"] => ResourceKind::Status,
+            ["motd"] => ResourceKind::Motd,
+            ["protocol"] => ResourceKind::Protocol,
+            ["state"] => ResourceKind::State,
+            ["events"] => ResourceKind::Events,
+            ["events", "after", sequence] => ResourceKind::EventsAfter(
+                sequence
+                    .parse()
+                    .map_err(|_| ResourceUriError::CursorSequence)?,
+            ),
+            ["dcc"] => ResourceKind::Dcc,
+            ["channels", channel] if !channel.is_empty() => {
                 let channel = percent_decode_str(channel)
                     .decode_utf8()
                     .map_err(|_| ResourceUriError::Encoding)?
@@ -140,6 +169,9 @@ pub enum ResourceUriError {
     /// Channel segment is not valid percent-encoded UTF-8.
     #[error("channel resource segment is not valid UTF-8")]
     Encoding,
+    /// Cursor expansion did not carry a decimal sequence number.
+    #[error("event cursor segment must be a decimal sequence number")]
+    CursorSequence,
 }
 
 /// Status-resource payload.
@@ -232,8 +264,11 @@ impl AgentSnapshot {
             ResourceKind::Events => ResourcePayload::Events(EventsResource {
                 journal: self.journal.clone(),
                 recent: self.recent_events.clone(),
-                instructions: "Call irc.events.read with the last next_cursor you consumed; resource notifications are only wake-up hints.",
+                instructions: "Subscribe to this URI, then on each notification read irc://agents/{agent_id}/events/after/{sequence} with the last sequence you consumed. The `recent` window here is an unpositioned preview and may slide; only the cursor expansion is safe to consume.",
             }),
+            // Served by the gateway, which owns the journal; a snapshot cannot
+            // answer a cursor read on its own.
+            ResourceKind::EventsAfter(_) => return Err(ResourceLookupError::CursorPageIsAsync),
             ResourceKind::Dcc => ResourcePayload::Dcc(DccResource {
                 sessions: self.dcc_sessions.clone(),
             }),
@@ -263,6 +298,9 @@ pub enum ResourceLookupError {
     /// The actor is not currently joined to the expanded channel name.
     #[error("channel is not present in the actor snapshot: {0}")]
     Channel(String),
+    /// A cursor page must be read through the gateway rather than a snapshot.
+    #[error("event cursor pages are served by the gateway, not by a snapshot")]
+    CursorPageIsAsync,
 }
 
 impl fmt::Display for AgentResourceUri {
@@ -274,6 +312,9 @@ impl fmt::Display for AgentResourceUri {
             ResourceKind::State => ResourceUris::for_agent(&self.agent_id).state,
             ResourceKind::Events => ResourceUris::for_agent(&self.agent_id).events,
             ResourceKind::Dcc => ResourceUris::for_agent(&self.agent_id).dcc,
+            ResourceKind::EventsAfter(sequence) => {
+                ResourceUris::events_after(&self.agent_id, *sequence)
+            }
             ResourceKind::Channel(channel) => ResourceUris::channel(&self.agent_id, channel),
         };
         formatter.write_str(&uri)
@@ -296,10 +337,41 @@ mod tests {
     #[test]
     fn rejects_trailing_resource_segments() {
         let agent = AgentId::new();
-        let uri = format!("irc://agents/{agent}/status/extra");
+        for path in ["status/extra", "events/after/4/extra", "events/after"] {
+            let uri = format!("irc://agents/{agent}/{path}");
+            assert_eq!(
+                AgentResourceUri::from_str(&uri),
+                Err(ResourceUriError::Path),
+                "{path} should not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn event_cursor_pages_round_trip_as_uris() {
+        let agent = AgentId::new();
+        let uri = ResourceUris::events_after(&agent, 42);
+        assert!(uri.ends_with("/events/after/42"));
+        let parsed = AgentResourceUri::from_str(&uri).expect("parse cursor URI");
+        assert_eq!(parsed.kind, ResourceKind::EventsAfter(42));
+        assert_eq!(parsed.to_string(), uri);
+    }
+
+    #[test]
+    fn a_cursor_page_needs_a_decimal_sequence() {
+        let agent = AgentId::new();
+        let uri = format!("irc://agents/{agent}/events/after/latest");
         assert_eq!(
             AgentResourceUri::from_str(&uri),
-            Err(ResourceUriError::Path)
+            Err(ResourceUriError::CursorSequence)
         );
+    }
+
+    #[test]
+    fn the_stable_events_resource_still_parses_alongside_its_cursor_pages() {
+        let agent = AgentId::new();
+        let uri = ResourceUris::for_agent(&agent).events;
+        let parsed = AgentResourceUri::from_str(&uri).expect("parse events URI");
+        assert_eq!(parsed.kind, ResourceKind::Events);
     }
 }

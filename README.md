@@ -189,6 +189,10 @@ and monotonic sequence. Callers maintain their own cursors:
 - resource notifications are wake-up signals, while cursor reads provide
   ordered delivery.
 
+Clients that do not expose MCP resource subscriptions cannot receive those
+wake-up signals. They must keep an `irc.events.read` long poll active, passing
+the previous `next_cursor` into the next call, to remain responsive.
+
 State resources are best-effort snapshots. Use `irc.query` when a current
 server response is required. See [events and state](docs/EVENTS_AND_STATE.md).
 

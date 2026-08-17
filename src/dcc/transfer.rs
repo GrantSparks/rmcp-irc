@@ -91,11 +91,11 @@ where
     let mut file = File::open(source)
         .await
         .map_err(|source| TransferError::Io {
-            operation: "open DCC source",
+            operation: "open DCC source_path on the gateway host",
             source,
         })?;
     let metadata = file.metadata().await.map_err(|source| TransferError::Io {
-        operation: "read DCC source metadata",
+        operation: "read DCC source_path metadata on the gateway host",
         source,
     })?;
     if !metadata.is_file() {
@@ -111,7 +111,7 @@ where
     file.seek(SeekFrom::Start(options.resume_offset))
         .await
         .map_err(|source| TransferError::Io {
-            operation: "seek DCC source",
+            operation: "seek DCC source_path on the gateway host",
             source,
         })?;
 
@@ -126,7 +126,7 @@ where
             .read(&mut buffer[..wanted])
             .await
             .map_err(|source| TransferError::Io {
-                operation: "read DCC source",
+                operation: "read DCC source_path on the gateway host",
                 source,
             })?;
         if read == 0 {
@@ -539,7 +539,7 @@ pub enum TransferError {
         operation: &'static str,
     },
     /// Source is not a regular file.
-    #[error("DCC source is not a regular file: {0}")]
+    #[error("DCC source_path on the gateway host is not a regular file: {0}")]
     SourceNotFile(PathBuf),
     /// Destination path cannot identify a file.
     #[error("invalid DCC destination: {0}")]
@@ -647,6 +647,32 @@ mod tests {
         assert_eq!(sent.expect("send"), data.len() as u64);
         assert_eq!(received.expect("receive").path, destination);
         assert_eq!(fs::read(destination).await.expect("read destination"), data);
+    }
+
+    #[tokio::test]
+    async fn source_lookup_errors_name_the_gateway_host() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let source = directory.path().join("missing.bin");
+        let (stream, _peer) = tokio::io::duplex(64);
+        let error = send_file(
+            stream,
+            DccSessionId::new(),
+            &source,
+            TransferOptions {
+                resume_offset: 0,
+                buffer_bytes: 16,
+                idle_timeout: Duration::from_secs(1),
+                progress: None,
+            },
+        )
+        .await
+        .expect_err("missing source must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("source_path on the gateway host")
+        );
     }
 
     #[tokio::test]

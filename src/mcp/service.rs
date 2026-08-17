@@ -6,10 +6,10 @@ use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::schema_for_output, wrapper::Parameters},
     model::{
-        CallToolResult, ContentBlock, Implementation, ListResourceTemplatesResult,
-        ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams,
-        ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
-        ServerCapabilities, ServerInfo, SubscriptionFilter,
+        CallToolResult, CompleteRequestParams, CompleteResult, CompletionInfo, ContentBlock,
+        Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Reference, Resource,
+        ResourceContents, ResourceTemplate, ServerCapabilities, ServerInfo, SubscriptionFilter,
     },
     service::{RequestContext, RoleServer, SubscriptionContext},
     tool, tool_handler, tool_router,
@@ -20,7 +20,7 @@ use crate::{
     MCP_INSTRUCTIONS,
     agent::{
         actor::CompletionMode,
-        journal::{EventClass, EventFilter, EventOrigin},
+        journal::{EventClass, EventCursor, EventFilter, EventOrigin},
     },
     dcc::session::DccSession,
     error::GatewayError,
@@ -31,10 +31,24 @@ use crate::{
         wire::{OutboundMessage, Tag},
     },
     mcp::{
-        resources::{AgentResourceUri, ResourceUris},
+        resources::{AgentResourceUri, ResourceKind, ResourceUris, encode_channel_segment},
         tools::*,
     },
 };
+
+/// The one resource template this server exposes. Declared once so the
+/// template listing and its argument completion cannot drift apart.
+const CHANNEL_STATE_TEMPLATE: &str = "irc://agents/{agent_id}/channels/{encoded_channel}";
+
+/// Cursor-page expansion of the per-agent events resource. Subscribing to
+/// `irc://agents/{agent_id}/events` and reading this on each notification is a
+/// complete delivery loop that needs no tool call.
+const EVENT_CURSOR_TEMPLATE: &str = "irc://agents/{agent_id}/events/after/{sequence}";
+
+/// Resources returned by one `resources/list` page. Six resources exist per
+/// connected agent, so this keeps a full listing well inside client response
+/// limits even at the configured agent ceiling.
+const RESOURCE_PAGE_SIZE: usize = 60;
 
 /// MCP request handler backed by a shared gateway.
 #[derive(Clone, Debug)]
@@ -59,9 +73,16 @@ impl IrcMcpService {
     #[tool(
         name = "irc.connect",
         description = "Connect one mythologically named guest to the configured Ergo server.",
-        output_schema = schema_for_output::<ConnectOutput>()
+        output_schema = schema_for_output::<ConnectOutput>(),
+        annotations(
+            title = "Connect IRC guest",
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn irc_connect(&self, Parameters(input): Parameters<ConnectInput>) -> CallToolResult {
+        let result_detail = input.result_detail;
         let request = match connect_request(input) {
             Ok(request) => request,
             Err(error) => return tool_error(error),
@@ -74,7 +95,8 @@ impl IrcMcpService {
                     nickname: connected.nickname.clone(),
                     nickname_adjusted: connected.nickname_adjusted,
                     registered: true,
-                    motd: connected.motd,
+                    motd: motd_for_tool_result(connected.motd, result_detail),
+                    result_detail,
                 };
                 let summary = if output.motd.text.is_empty() {
                     format!(
@@ -97,7 +119,13 @@ impl IrcMcpService {
     #[tool(
         name = "irc.disconnect",
         description = "Disconnect one explicit IRC guest and invalidate its process-local handle.",
-        output_schema = schema_for_output::<DisconnectOutput>()
+        output_schema = schema_for_output::<DisconnectOutput>(),
+        annotations(
+            title = "Disconnect IRC guest",
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn irc_disconnect(
         &self,
@@ -121,7 +149,12 @@ impl IrcMcpService {
     #[tool(
         name = "irc.status",
         description = "Read connection, identity, protocol, event, and reconnect status for one guest.",
-        output_schema = schema_for_output::<StatusOutput>()
+        output_schema = schema_for_output::<StatusOutput>(),
+        annotations(
+            title = "Read guest status",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn irc_status(&self, Parameters(input): Parameters<AgentInput>) -> CallToolResult {
         match self.gateway.snapshot(&input.agent_id).await {
@@ -137,7 +170,10 @@ impl IrcMcpService {
                     events: snapshot.journal,
                     resources: ResourceUris::for_agent(&input.agent_id),
                     state: snapshot.state,
+                    result_detail: input.result_detail,
                 };
+                let mut output = output;
+                output.state.motd = motd_for_tool_result(output.state.motd, output.result_detail);
                 tool_success(
                     format!(
                         "{} is {:?} as {}.",
@@ -161,9 +197,16 @@ impl IrcMcpService {
     #[tool(
         name = "irc.join",
         description = "Join one channel using the actor's correlated IRC command path.",
-        output_schema = schema_for_output::<JoinOutput>()
+        output_schema = schema_for_output::<JoinOutput>(),
+        annotations(
+            title = "Join channel",
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn irc_join(&self, Parameters(input): Parameters<JoinInput>) -> CallToolResult {
+        let result_detail = input.result_detail;
         if let Err(error) = validate_irc_atom(input.channel.as_str(), "channel") {
             return tool_error(error);
         }
@@ -182,8 +225,10 @@ impl IrcMcpService {
         {
             Ok(result) => {
                 let failure = is_failure_outcome(result.outcome).then_some(result.outcome);
+                let outcome = result.outcome;
+                let result = command_result_for_detail(result, result_detail);
                 command_tool_result(
-                    format!("JOIN {}: {:?}.", input.channel, result.outcome),
+                    format!("JOIN {}: {outcome:?}.", input.channel),
                     &JoinOutput {
                         resource: ResourceUris::channel(&input.agent_id, input.channel.as_str()),
                         channel: input.channel,
@@ -200,7 +245,13 @@ impl IrcMcpService {
     #[tool(
         name = "irc.part",
         description = "Part one channel and correlate the server echo or rejection.",
-        output_schema = schema_for_output::<CommandResult>()
+        output_schema = schema_for_output::<CommandResult>(),
+        annotations(
+            title = "Leave channel",
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn irc_part(&self, Parameters(input): Parameters<PartInput>) -> CallToolResult {
         if let Err(error) = validate_irc_atom(input.channel.as_str(), "channel") {
@@ -218,6 +269,7 @@ impl IrcMcpService {
             CompletionMode::Auto,
             input.timeout_ms,
             "PART",
+            input.result_detail,
         )
         .await
     }
@@ -226,7 +278,13 @@ impl IrcMcpService {
     #[tool(
         name = "irc.send",
         description = "Send PRIVMSG, NOTICE, ACTION, or TAGMSG with negotiated-safe semantics.",
-        output_schema = schema_for_output::<SendOutput>()
+        output_schema = schema_for_output::<SendOutput>(),
+        annotations(
+            title = "Send message",
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn irc_send(&self, Parameters(input): Parameters<SendInput>) -> CallToolResult {
         match self.send_message(input).await {
@@ -239,11 +297,8 @@ impl IrcMcpService {
                             && result.outcome != CommandOutcome::SentUnconfirmed
                     })
                     .map(|result| result.outcome);
-                command_tool_result(
-                    format!("Sent {} IRC line(s).", output.line_count),
-                    &output,
-                    failed,
-                )
+                let summary = send_result_summary(output.line_count, failed);
+                command_tool_result(summary, &output, failed)
             }
             Err(error) => tool_error(error),
         }
@@ -253,17 +308,20 @@ impl IrcMcpService {
     #[tool(
         name = "irc.history",
         description = "Read IRCv3 CHATHISTORY, with an explicitly reported legacy/unavailable fallback.",
-        output_schema = schema_for_output::<HistoryOutput>()
+        output_schema = schema_for_output::<HistoryOutput>(),
+        annotations(
+            title = "Read channel history",
+            read_only_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn irc_history(&self, Parameters(input): Parameters<HistoryInput>) -> CallToolResult {
         match self.history(input).await {
             Ok(output) => {
                 let outcome = output.result.as_ref().map(|result| result.outcome);
-                command_tool_result(
-                    "History query completed.".into(),
-                    &output,
-                    outcome.filter(|outcome| is_failure_outcome(*outcome)),
-                )
+                let failure = outcome.filter(|outcome| is_failure_outcome(*outcome));
+                let summary = history_result_summary(failure);
+                command_tool_result(summary, &output, failure)
             }
             Err(error) => tool_error(error),
         }
@@ -273,9 +331,15 @@ impl IrcMcpService {
     #[tool(
         name = "irc.query",
         description = "Run a typed WHOIS, WHO, NAMES, MODE, MOTD, HELP, or other common IRC query.",
-        output_schema = schema_for_output::<CommandResult>()
+        output_schema = schema_for_output::<CommandResult>(),
+        annotations(
+            title = "Run server query",
+            read_only_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn irc_query(&self, Parameters(input): Parameters<QueryInput>) -> CallToolResult {
+        let result_detail = input.result_detail;
         let message = match query_message(input.query) {
             Ok(message) => message,
             Err(error) => return tool_error(error),
@@ -286,6 +350,7 @@ impl IrcMcpService {
             CompletionMode::Auto,
             input.timeout_ms,
             "Query",
+            result_detail,
         )
         .await
     }
@@ -294,9 +359,16 @@ impl IrcMcpService {
     #[tool(
         name = "irc.execute",
         description = "Execute a structured IRC command without accepting raw CRLF-delimited lines.",
-        output_schema = schema_for_output::<CommandResult>()
+        output_schema = schema_for_output::<CommandResult>(),
+        annotations(
+            title = "Execute IRC command",
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn irc_execute(&self, Parameters(input): Parameters<ExecuteInput>) -> CallToolResult {
+        let result_detail = input.result_detail;
         let message = OutboundMessage {
             tags: input.tags,
             command: input.command,
@@ -314,6 +386,7 @@ impl IrcMcpService {
             mode,
             input.timeout_ms,
             "IRC command",
+            result_detail,
         )
         .await
     }
@@ -322,7 +395,12 @@ impl IrcMcpService {
     #[tool(
         name = "irc.events.read",
         description = "Read an agent's bounded event journal after an explicit caller-owned cursor.",
-        output_schema = schema_for_output::<EventsReadOutput>()
+        output_schema = schema_for_output::<EventsReadOutput>(),
+        annotations(
+            title = "Read event journal",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn irc_events_read(
         &self,
@@ -356,7 +434,13 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.chat.open",
         description = "Send an ordinary or reverse DCC CHAT offer to one peer.",
-        output_schema = schema_for_output::<DccSessionOutput>()
+        output_schema = schema_for_output::<DccSessionOutput>(),
+        annotations(
+            title = "Offer direct chat",
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn irc_dcc_chat_open(
         &self,
@@ -376,7 +460,13 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.chat.send",
         description = "Send one bounded line through an established DCC CHAT socket.",
-        output_schema = schema_for_output::<DccChatSendOutput>()
+        output_schema = schema_for_output::<DccChatSendOutput>(),
+        annotations(
+            title = "Send direct chat line",
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn irc_dcc_chat_send(
         &self,
@@ -402,7 +492,13 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.send",
         description = "Offer and stream one local file through ordinary or reverse DCC SEND.",
-        output_schema = schema_for_output::<DccSessionOutput>()
+        output_schema = schema_for_output::<DccSessionOutput>(),
+        annotations(
+            title = "Offer file transfer",
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn irc_dcc_send(&self, Parameters(input): Parameters<DccSendInput>) -> CallToolResult {
         match self
@@ -425,7 +521,13 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.accept",
         description = "Accept one incoming DCC CHAT or SEND offer with explicit file conflict behavior.",
-        output_schema = schema_for_output::<DccSessionOutput>()
+        output_schema = schema_for_output::<DccSessionOutput>(),
+        annotations(
+            title = "Accept direct offer",
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn irc_dcc_accept(
         &self,
@@ -450,7 +552,13 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.reject",
         description = "Reject one incoming offered DCC session.",
-        output_schema = schema_for_output::<DccSessionOutput>()
+        output_schema = schema_for_output::<DccSessionOutput>(),
+        annotations(
+            title = "Reject direct offer",
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn irc_dcc_reject(
         &self,
@@ -470,7 +578,13 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.cancel",
         description = "Cancel one active or offered DCC session and close its direct resources.",
-        output_schema = schema_for_output::<DccSessionOutput>()
+        output_schema = schema_for_output::<DccSessionOutput>(),
+        annotations(
+            title = "Cancel direct session",
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn irc_dcc_cancel(
         &self,
@@ -493,7 +607,12 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.list",
         description = "List active and recently terminal DCC sessions for one guest.",
-        output_schema = schema_for_output::<DccListOutput>()
+        output_schema = schema_for_output::<DccListOutput>(),
+        annotations(
+            title = "List direct sessions",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn irc_dcc_list(&self, Parameters(input): Parameters<DccListInput>) -> CallToolResult {
         match self
@@ -536,18 +655,21 @@ impl IrcMcpService {
         mode: CompletionMode,
         timeout_ms: u64,
         operation: &str,
+        result_detail: ToolResultDetail,
     ) -> CallToolResult {
         match self.execute(agent_id, message, mode, timeout_ms).await {
-            Ok(result) => command_tool_result(
-                format!("{operation}: {:?}.", result.outcome),
-                &result,
-                is_failure_outcome(result.outcome).then_some(result.outcome),
-            ),
+            Ok(result) => {
+                let outcome = result.outcome;
+                let failure = is_failure_outcome(outcome).then_some(outcome);
+                let result = command_result_for_detail(result, result_detail);
+                command_tool_result(format!("{operation}: {outcome:?}."), &result, failure)
+            }
             Err(error) => tool_error(error),
         }
     }
 
     async fn send_message(&self, input: SendInput) -> Result<SendOutput, GatewayError> {
+        let result_detail = input.result_detail;
         validate_irc_atom(input.target.as_str(), "target")?;
         let snapshot = self.gateway.snapshot(&input.agent_id).await?;
         if input.reply_to.is_some() && !capability_active(&snapshot, "message-tags") {
@@ -579,6 +701,10 @@ impl IrcMcpService {
                 .await?,
             );
         }
+        let results: Vec<_> = results
+            .into_iter()
+            .map(|result| command_result_for_detail(result, result_detail))
+            .collect();
         Ok(SendOutput {
             line_count: results.len(),
             results,
@@ -607,6 +733,7 @@ impl IrcMcpService {
                 availability: HistoryAvailability::Unavailable,
                 result: None,
                 events: Vec::new(),
+                result_detail: input.result_detail,
             });
         };
         let before = snapshot.journal.latest;
@@ -646,10 +773,18 @@ impl IrcMcpService {
             });
         }
         events.truncate(input.limit);
+        let failure = is_failure_outcome(result.outcome);
+        let result_detail = if failure {
+            ToolResultDetail::Full
+        } else {
+            input.result_detail
+        };
+        let result = history_command_result_for_detail(result, result_detail);
         Ok(HistoryOutput {
             availability,
             result: Some(result),
             events,
+            result_detail,
         })
     }
 }
@@ -663,6 +798,7 @@ impl ServerHandler for IrcMcpService {
                 .enable_resources()
                 .enable_resources_subscribe()
                 .enable_resources_list_changed()
+                .enable_completions()
                 .build(),
         )
         .with_server_info(Implementation::new(
@@ -672,11 +808,24 @@ impl ServerHandler for IrcMcpService {
         .with_instructions(MCP_INSTRUCTIONS)
     }
 
+    /// List agent resources one bounded page at a time.
+    ///
+    /// Six resources exist per connected agent, so at the configured agent
+    /// ceiling an unpaginated reply would be large enough to break clients that
+    /// bound response size. The cursor is the index of the first item on the
+    /// next page, which is stable because `agent_ids` is ordered.
     async fn list_resources(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
+        let offset = match request.and_then(|request| request.cursor) {
+            None => 0,
+            Some(cursor) => cursor.parse::<usize>().map_err(|_| {
+                McpError::invalid_params(format!("unrecognized resource cursor: {cursor}"), None)
+            })?,
+        };
+
         let mut resources = Vec::new();
         for agent_id in self.gateway.agent_ids().await {
             let uris = ResourceUris::for_agent(&agent_id);
@@ -687,22 +836,44 @@ impl ServerHandler for IrcMcpService {
                     .with_mime_type("application/json")
             }));
         }
-        Ok(ListResourcesResult::with_all_items(resources))
+
+        if offset > resources.len() {
+            return Err(McpError::invalid_params(
+                format!("resource cursor {offset} is past the end of the list"),
+                None,
+            ));
+        }
+        let mut page: Vec<Resource> = resources.split_off(offset);
+        let next_cursor = (page.len() > RESOURCE_PAGE_SIZE).then(|| {
+            page.truncate(RESOURCE_PAGE_SIZE);
+            (offset + RESOURCE_PAGE_SIZE).to_string()
+        });
+
+        let mut result = ListResourcesResult::with_all_items(page);
+        result.next_cursor = next_cursor;
+        Ok(result)
     }
 
+    /// The template set is a fixed single entry, so it is never paginated and
+    /// any supplied cursor is meaningless rather than merely ignored.
     async fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
         Ok(ListResourceTemplatesResult::with_all_items(vec![
-            ResourceTemplate::new(
-                "irc://agents/{agent_id}/channels/{encoded_channel}",
-                "irc-channel-state",
-            )
-            .with_title("IRC channel state")
-            .with_description("Best-effort state for one channel joined by one explicit agent")
-            .with_mime_type("application/json"),
+            ResourceTemplate::new(CHANNEL_STATE_TEMPLATE, "irc-channel-state")
+                .with_title("IRC channel state")
+                .with_description("Best-effort state for one channel joined by one explicit agent")
+                .with_mime_type("application/json"),
+            ResourceTemplate::new(EVENT_CURSOR_TEMPLATE, "irc-events-after")
+                .with_title("IRC events after a cursor")
+                .with_description(
+                    "Every retained event after the given sequence, with the next cursor to \
+                     read from. Subscribe to the agent's events resource and read this on \
+                     each notification to consume the journal without polling.",
+                )
+                .with_mime_type("application/json"),
         ]))
     }
 
@@ -713,20 +884,122 @@ impl ServerHandler for IrcMcpService {
     ) -> Result<ReadResourceResponse, McpError> {
         let uri = AgentResourceUri::from_str(&request.uri)
             .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
+
+        // Only a genuinely absent agent is "not found". Anything else went
+        // wrong on our side, and a caller retrying a different URI would be
+        // chasing the wrong problem.
         let snapshot = self
             .gateway
             .snapshot(&uri.agent_id)
             .await
-            .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
-        let payload = snapshot
-            .resource(&uri)
-            .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
-        let text = serde_json::to_string_pretty(&payload)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            .map_err(|error| match error {
+                GatewayError::AgentNotFound(_) => {
+                    McpError::resource_not_found(error.to_string(), None)
+                }
+                other => McpError::internal_error(other.to_string(), None),
+            })?;
+
+        // A cursor page is a live journal read rather than a snapshot field, so
+        // it is served straight from the gateway. This is the read half of the
+        // subscribe-then-read loop, and it deliberately does not long poll: the
+        // notification already said there is something to collect. The stream
+        // id comes from the snapshot, so the page reports a genuine gap or
+        // reset instead of silently restarting the caller.
+        let text = if let ResourceKind::EventsAfter(sequence) = uri.kind {
+            let page = self
+                .gateway
+                .read_events(
+                    &uri.agent_id,
+                    Some(EventCursor {
+                        stream_id: snapshot.journal.stream_id.clone(),
+                        sequence,
+                    }),
+                    self.gateway.config().limits.max_event_page_size,
+                    Duration::ZERO,
+                    EventFilter::default(),
+                )
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            serde_json::to_string_pretty(&page)
+        } else {
+            let payload = snapshot
+                .resource(&uri)
+                .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
+            serde_json::to_string_pretty(&payload)
+        }
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+
         Ok(ReadResourceResult::new(vec![
             ResourceContents::text(text, request.uri).with_mime_type("application/json"),
         ])
         .into())
+    }
+
+    /// Complete the channel-state template arguments from live gateway state.
+    ///
+    /// Both arguments are drawn from sets the gateway already knows exactly, so
+    /// a caller should never have to guess an agent handle or work out the
+    /// percent-encoding of a channel name by hand.
+    async fn complete(
+        &self,
+        request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, McpError> {
+        let Reference::Resource(reference) = &request.r#ref else {
+            return Ok(CompleteResult::default());
+        };
+        if reference.uri != CHANNEL_STATE_TEMPLATE {
+            return Ok(CompleteResult::default());
+        }
+
+        let prefix = request.argument.value.as_str();
+        let values = match request.argument.name.as_str() {
+            "agent_id" => self
+                .gateway
+                .agent_ids()
+                .await
+                .into_iter()
+                .map(|agent_id| agent_id.to_string())
+                .filter(|candidate| candidate.starts_with(prefix))
+                .collect(),
+            "encoded_channel" => {
+                // Prefer the agent already chosen for the sibling argument, so
+                // the offered channels are ones that agent has actually joined.
+                let chosen = request
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.arguments.as_ref())
+                    .and_then(|arguments| arguments.get("agent_id"))
+                    .cloned();
+                let mut channels = BTreeSet::new();
+                for agent_id in self.gateway.agent_ids().await {
+                    if chosen
+                        .as_ref()
+                        .is_some_and(|wanted| *wanted != agent_id.to_string())
+                    {
+                        continue;
+                    }
+                    if let Ok(snapshot) = self.gateway.snapshot(&agent_id).await {
+                        channels.extend(
+                            snapshot
+                                .state
+                                .channels
+                                .values()
+                                .map(|channel| encode_channel_segment(&channel.name)),
+                        );
+                    }
+                }
+                channels
+                    .into_iter()
+                    .filter(|candidate| candidate.starts_with(prefix))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
+        CompletionInfo::new(values)
+            .map(CompleteResult::new)
+            .map_err(|error| McpError::internal_error(error, None))
     }
 
     fn accepted_subscription_filter(
@@ -1069,6 +1342,55 @@ fn dcc_session_result(summary: &str, session: DccSession) -> CallToolResult {
     tool_success(summary, &DccSessionOutput { session })
 }
 
+/// Keep one presentation copy of the MOTD in normal tool traffic. The stable
+/// MOTD resource remains the lossless source for line boundaries and numerics.
+fn motd_for_tool_result(
+    mut motd: crate::agent::state::MotdState,
+    detail: ToolResultDetail,
+) -> crate::agent::state::MotdState {
+    if detail == ToolResultDetail::Compact {
+        motd.lines.clear();
+        motd.wire_replies.clear();
+    }
+    motd
+}
+
+/// Lossless replies remain authoritative for ordinary compact command output;
+/// omit only the third, derived semantic projection.
+fn command_result_for_detail(mut result: CommandResult, detail: ToolResultDetail) -> CommandResult {
+    if detail == ToolResultDetail::Compact {
+        result.semantic_result = None;
+    }
+    result
+}
+
+/// History events are authoritative in compact history output. Retain the
+/// command envelope while removing its equivalent successful reply batch.
+fn history_command_result_for_detail(
+    mut result: CommandResult,
+    detail: ToolResultDetail,
+) -> CommandResult {
+    if detail == ToolResultDetail::Compact {
+        result.replies.clear();
+        result.semantic_result = None;
+    }
+    result
+}
+
+fn send_result_summary(line_count: usize, failure: Option<CommandOutcome>) -> String {
+    failure.map_or_else(
+        || format!("Sent {line_count} IRC line(s)."),
+        |outcome| format!("IRC send failed after processing {line_count} line(s): {outcome:?}."),
+    )
+}
+
+fn history_result_summary(failure: Option<CommandOutcome>) -> String {
+    failure.map_or_else(
+        || "History query completed.".into(),
+        |outcome| format!("History query failed: {outcome:?}."),
+    )
+}
+
 fn tool_success(summary: impl Into<String>, value: &impl Serialize) -> CallToolResult {
     structured_result(summary, value, false)
 }
@@ -1244,6 +1566,7 @@ mod tests {
             reply_to: None,
             multiline: MultilinePolicy::Prefer,
             timeout_ms: 1_000,
+            result_detail: ToolResultDetail::Full,
         };
         assert!(matches!(
             build_send_messages(&tagmsg, 512, 0, 512, 1),
@@ -1290,6 +1613,14 @@ mod tests {
                 "response_mode",
                 &["auto", "collect", "fire_and_forget"][..],
             ),
+            ("irc.connect", "result_detail", &["compact", "full"][..]),
+            ("irc.status", "result_detail", &["compact", "full"][..]),
+            ("irc.join", "result_detail", &["compact", "full"][..]),
+            ("irc.part", "result_detail", &["compact", "full"][..]),
+            ("irc.send", "result_detail", &["compact", "full"][..]),
+            ("irc.history", "result_detail", &["compact", "full"][..]),
+            ("irc.query", "result_detail", &["compact", "full"][..]),
+            ("irc.execute", "result_detail", &["compact", "full"][..]),
         ] {
             let description = description(tool, property);
             for token in tokens {
@@ -1311,6 +1642,106 @@ mod tests {
     }
 
     #[test]
+    fn compact_motd_keeps_instructions_but_drops_duplicate_protocol_forms() {
+        let wire = crate::irc::wire::WireMessage::parse(bytes::Bytes::from_static(
+            b":irc.example 372 Athena :- Read the rules",
+        ))
+        .expect("wire MOTD");
+        let motd = crate::agent::state::MotdState {
+            lines: vec!["Read the rules".into()],
+            text: "Read the rules".into(),
+            wire_replies: vec![wire],
+            ..Default::default()
+        };
+
+        let compact = motd_for_tool_result(motd.clone(), ToolResultDetail::Compact);
+        assert_eq!(compact.text, "Read the rules");
+        assert!(compact.lines.is_empty());
+        assert!(compact.wire_replies.is_empty());
+
+        let full = motd_for_tool_result(motd, ToolResultDetail::Full);
+        assert_eq!(full.lines, ["Read the rules"]);
+        assert_eq!(full.wire_replies.len(), 1);
+    }
+
+    #[test]
+    fn compact_history_keeps_the_envelope_without_repeating_event_data() {
+        let wire = crate::irc::wire::WireMessage::parse(bytes::Bytes::from_static(
+            b":Athena!u@h PRIVMSG #control :hello",
+        ))
+        .expect("history wire");
+        let result = CommandResult {
+            command_id: crate::irc::correlation::CommandId::new(),
+            agent_id: crate::agent::AgentId::new(),
+            command: "CHATHISTORY".into(),
+            outcome: CommandOutcome::Completed,
+            written: true,
+            acknowledged: true,
+            retriable: false,
+            label: Some("history-label".into()),
+            replies: vec![wire],
+            semantic_result: Some(Vec::new()),
+            warnings: Vec::new(),
+            first_event_cursor: None,
+        };
+
+        let compact_command = command_result_for_detail(result.clone(), ToolResultDetail::Compact);
+        assert_eq!(compact_command.replies.len(), 1);
+        assert!(compact_command.semantic_result.is_none());
+
+        let compact = history_command_result_for_detail(result.clone(), ToolResultDetail::Compact);
+        assert_eq!(compact.command, "CHATHISTORY");
+        assert!(compact.replies.is_empty());
+        assert!(compact.semantic_result.is_none());
+
+        let full = history_command_result_for_detail(result, ToolResultDetail::Full);
+        assert_eq!(full.replies.len(), 1);
+        assert!(full.semantic_result.is_some());
+    }
+
+    #[test]
+    fn ordinary_command_detail_defaults_to_full_for_existing_callers() {
+        let agent_id = crate::agent::AgentId::new();
+        let input: ExecuteInput = serde_json::from_value(serde_json::json!({
+            "agent_id": agent_id.as_str(),
+            "command": "VERSION"
+        }))
+        .expect("execute input");
+        assert_eq!(input.result_detail, ToolResultDetail::Full);
+    }
+
+    #[test]
+    fn rejected_send_and_history_summaries_are_not_success_phrased() {
+        let send = send_result_summary(1, Some(CommandOutcome::Rejected));
+        assert_eq!(
+            send,
+            "IRC send failed after processing 1 line(s): Rejected."
+        );
+        assert!(!send.contains("Sent 1"));
+        let send_result = command_tool_result(
+            send.clone(),
+            &serde_json::json!({"outcome": "rejected"}),
+            Some(CommandOutcome::Rejected),
+        );
+        assert_eq!(send_result.is_error, Some(true));
+        assert_eq!(send_result.content[0].as_text().expect("text").text, send);
+
+        let history = history_result_summary(Some(CommandOutcome::TimedOut));
+        assert_eq!(history, "History query failed: TimedOut.");
+        assert!(!history.contains("completed"));
+        let history_result = command_tool_result(
+            history.clone(),
+            &serde_json::json!({"outcome": "timed_out"}),
+            Some(CommandOutcome::TimedOut),
+        );
+        assert_eq!(history_result.is_error, Some(true));
+        assert_eq!(
+            history_result.content[0].as_text().expect("text").text,
+            history
+        );
+    }
+
+    #[test]
     fn utf8_splitting_is_lossless_and_bounded() {
         let chunks = split_utf8("Māui🙂Athena", 5).expect("split");
         assert!(chunks.iter().all(|chunk| chunk.len() <= 5));
@@ -1328,6 +1759,7 @@ mod tests {
             reply_to: Some("message-id".into()),
             multiline: MultilinePolicy::Split,
             timeout_ms: 1_000,
+            result_detail: ToolResultDetail::Full,
         };
         let messages = build_send_messages(&input, 512, 0, 5, 1).expect("message");
         assert_eq!(messages[0].tags[0].key, "+reply");
@@ -1358,6 +1790,7 @@ mod tests {
             reply_to: None,
             multiline: MultilinePolicy::Split,
             timeout_ms: 1_000,
+            result_detail: ToolResultDetail::Full,
         };
 
         // Without the reservation this text fits one line, which is exactly how
@@ -1396,6 +1829,7 @@ mod tests {
             reply_to: None,
             multiline: MultilinePolicy::Split,
             timeout_ms: 1_000,
+            result_detail: ToolResultDetail::Full,
         };
         let messages =
             build_send_messages(&input, 512, prefix.len() + 4, 64 * 1024, 256).expect("send");
@@ -1416,6 +1850,7 @@ mod tests {
             reply_to: None,
             multiline: MultilinePolicy::Split,
             timeout_ms: 1_000,
+            result_detail: ToolResultDetail::Full,
         };
         assert!(matches!(
             build_send_messages(&input, 512, 512, 64 * 1024, 256),

@@ -7,6 +7,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::wire::OutboundMessage;
+
 /// Registration phase in which a command is valid.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -733,6 +735,65 @@ pub fn strategy_for(command: &str, negotiated: &dyn CapabilityLookup) -> Respons
     )
 }
 
+/// Collector for one fully structured outbound message.
+///
+/// A few IRC commands use the same verb for both reads and mutations. Their
+/// completion signal therefore depends on the encoded parameter shape rather
+/// than the command name alone: TOPIC and MODE queries end in numerics, while
+/// setters echo the applied state; MONITOR list/status/mutation operations
+/// likewise have different reply forms.
+pub fn strategy_for_message(
+    message: &OutboundMessage,
+    negotiated: &dyn CapabilityLookup,
+) -> ResponseStrategy {
+    if message.command.eq_ignore_ascii_case("TOPIC") && message.trailing.is_some() {
+        return ResponseStrategy::Echo {
+            commands: &["TOPIC"],
+        };
+    }
+
+    let mode_mutation = message
+        .params
+        .get(1)
+        .is_some_and(|modes| modes.starts_with(['+', '-']))
+        && !(message.params.len() == 2
+            && message.params[1]
+                .trim_start_matches('+')
+                .chars()
+                .all(|mode| matches!(mode, 'b' | 'e' | 'I')));
+    if message.command.eq_ignore_ascii_case("MODE") && mode_mutation {
+        return ResponseStrategy::Echo {
+            commands: &["MODE"],
+        };
+    }
+
+    if message.command.eq_ignore_ascii_case("MONITOR") {
+        let operation = message.params.first().map(|value| value.as_str());
+        return match operation {
+            Some(operation) if operation.eq_ignore_ascii_case("L") => {
+                ResponseStrategy::NumericSequence {
+                    terminators: MONITOR_END,
+                }
+            }
+            Some(operation)
+                if operation.eq_ignore_ascii_case("S")
+                    || operation == "+"
+                    || operation == "-"
+                    || operation.eq_ignore_ascii_case("C") =>
+            {
+                if negotiated.is_negotiated("labeled-response") {
+                    ResponseStrategy::Ack
+                } else {
+                    ResponseStrategy::Unconfirmed
+                }
+            }
+            _ => strategy_for(&message.command, negotiated),
+        };
+    }
+
+    strategy_for(&message.command, negotiated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,6 +855,76 @@ mod tests {
             ResponseStrategy::Ack
         );
         assert_eq!(strategy_for("FUTURE", &[]), ResponseStrategy::Unconfirmed);
+    }
+
+    #[test]
+    fn structured_message_shape_selects_query_and_mutation_collectors() {
+        let labels = ["labeled-response"];
+
+        let topic_query = OutboundMessage::new("TOPIC", vec!["#room".into()]);
+        assert!(matches!(
+            strategy_for_message(&topic_query, &labels),
+            ResponseStrategy::NumericSequence { .. }
+        ));
+        let topic_set = topic_query.clone().with_trailing("new topic");
+        assert_eq!(
+            strategy_for_message(&topic_set, &labels),
+            ResponseStrategy::Echo {
+                commands: &["TOPIC"]
+            }
+        );
+
+        let mode_query = OutboundMessage::new("MODE", vec!["#room".into()]);
+        assert!(matches!(
+            strategy_for_message(&mode_query, &labels),
+            ResponseStrategy::NumericSequence { .. }
+        ));
+        let mode_set = OutboundMessage::new("MODE", vec!["#room".into(), "+i".into()]);
+        assert_eq!(
+            strategy_for_message(&mode_set, &labels),
+            ResponseStrategy::Echo {
+                commands: &["MODE"]
+            }
+        );
+        let mode_list = OutboundMessage::new("MODE", vec!["#room".into(), "+b".into()]);
+        assert!(matches!(
+            strategy_for_message(&mode_list, &labels),
+            ResponseStrategy::NumericSequence { .. }
+        ));
+        let alternate_channel_mode_list =
+            OutboundMessage::new("MODE", vec!["&room".into(), "+e".into()]);
+        assert!(matches!(
+            strategy_for_message(&alternate_channel_mode_list, &labels),
+            ResponseStrategy::NumericSequence { .. }
+        ));
+
+        let monitor_list = OutboundMessage::new("MONITOR", vec!["L".into()]);
+        assert!(matches!(
+            strategy_for_message(&monitor_list, &labels),
+            ResponseStrategy::NumericSequence { .. }
+        ));
+        for operation in ["S", "+", "-", "C"] {
+            let message = OutboundMessage::new("MONITOR", vec![operation.into()]);
+            assert_eq!(
+                strategy_for_message(&message, &labels),
+                ResponseStrategy::Ack
+            );
+        }
+    }
+
+    #[test]
+    fn monitor_without_labels_does_not_claim_an_ambiguous_completion() {
+        let status = OutboundMessage::new("MONITOR", vec!["S".into(), "alice".into()]);
+        assert_eq!(
+            strategy_for_message(&status, &[]),
+            ResponseStrategy::Unconfirmed
+        );
+
+        let mutation = OutboundMessage::new("MONITOR", vec!["+".into(), "alice".into()]);
+        assert_eq!(
+            strategy_for_message(&mutation, &[]),
+            ResponseStrategy::Unconfirmed
+        );
     }
 
     #[test]

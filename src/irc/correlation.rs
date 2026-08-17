@@ -3,10 +3,7 @@
 //! Callers register before writing, attribute and ingest inbound messages, and
 //! advance deadlines through [`Correlator::tick`].
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-
-#[cfg(test)]
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -302,6 +299,8 @@ pub struct Correlator {
     order: VecDeque<CommandId>,
     by_label: HashMap<String, CommandId>,
     by_batch: HashMap<String, CommandId>,
+    deferred_batch_outcomes: HashMap<CommandId, CommandOutcome>,
+    satisfied_batch_collectors: HashSet<CommandId>,
     batches: BatchTracker,
     nickname: Option<Nickname>,
     case_mapping: CaseMapping,
@@ -338,9 +337,10 @@ impl MessageAttribution {
 
     /// Whether the line belongs to a batch of `kind`, directly or by nesting.
     pub(crate) fn has_batch_kind(&self, kind: &str) -> bool {
+        let expected = FeatureId::of(kind);
         self.batch_lineage
             .iter()
-            .any(|batch| batch.kind.eq_ignore_ascii_case(kind))
+            .any(|batch| FeatureId::of(&batch.kind) == expected)
     }
 
     /// Direct batch kind for an open/close line or direct `batch` tag.
@@ -363,6 +363,8 @@ impl Correlator {
             order: VecDeque::new(),
             by_label: HashMap::new(),
             by_batch: HashMap::new(),
+            deferred_batch_outcomes: HashMap::new(),
+            satisfied_batch_collectors: HashSet::new(),
             batches: BatchTracker::new(limits.max_active_batches),
             nickname: None,
             case_mapping: CaseMapping::default(),
@@ -392,6 +394,8 @@ impl Correlator {
         self.order.clear();
         self.by_label.clear();
         self.by_batch.clear();
+        self.deferred_batch_outcomes.clear();
+        self.satisfied_batch_collectors.clear();
         self.batches.clear();
     }
 
@@ -536,7 +540,7 @@ impl Correlator {
         message: &WireMessage,
         attribution: MessageAttribution,
     ) -> Vec<Completion> {
-        let Some(command_id) = attribution.command_id else {
+        let Some(command_id) = attribution.command_id.clone() else {
             return Vec::new();
         };
         let Some(entry) = self.pending.get_mut(&command_id) else {
@@ -547,7 +551,7 @@ impl Correlator {
         }
 
         let strategy = entry.response;
-        let outcome = classify(
+        let candidate = classify(
             message,
             strategy,
             &entry.command,
@@ -557,6 +561,47 @@ impl Correlator {
         if let Some(warning) = standard_reply(message) {
             entry.warnings.push(warning);
         }
+        let inside_batch = !attribution.batch_lineage.is_empty();
+        let outcome = if inside_batch {
+            match candidate {
+                Some(outcome @ (CommandOutcome::Rejected | CommandOutcome::Indeterminate)) => {
+                    self.deferred_batch_outcomes
+                        .entry(command_id.clone())
+                        .and_modify(|stored| {
+                            if outcome == CommandOutcome::Rejected {
+                                *stored = outcome;
+                            }
+                        })
+                        .or_insert(outcome);
+                }
+                Some(CommandOutcome::Completed)
+                    if matches!(strategy, ResponseStrategy::Batch { .. }) =>
+                {
+                    self.satisfied_batch_collectors.insert(command_id.clone());
+                }
+                _ => {}
+            }
+
+            if attribution.closing_batch_is_root {
+                if let Some(outcome) = self.deferred_batch_outcomes.remove(&command_id) {
+                    Some(outcome)
+                } else if !matches!(strategy, ResponseStrategy::Batch { .. })
+                    || self.satisfied_batch_collectors.remove(&command_id)
+                {
+                    Some(CommandOutcome::Completed)
+                } else {
+                    // A labeled command can receive an unrelated extension
+                    // batch before the batch type its explicit collector
+                    // requested. Keep it observable without completing that
+                    // collector.
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            candidate
+        };
         match outcome {
             Some(outcome) => self
                 .finish(&command_id, outcome, outcome == CommandOutcome::Completed)
@@ -690,6 +735,8 @@ impl Correlator {
             self.by_label.remove(label);
         }
         self.by_batch.retain(|_, owner| owner != command_id);
+        self.deferred_batch_outcomes.remove(command_id);
+        self.satisfied_batch_collectors.remove(command_id);
         self.order.retain(|open| open != command_id);
         Some(Completion {
             command_id: entry.command_id,
@@ -1042,6 +1089,74 @@ mod tests {
     }
 
     #[test]
+    fn a_single_reply_collector_keeps_the_complete_labeled_response_batch() {
+        let mut correlator = correlator();
+        let entry = pending("VERSION", ResponseStrategy::SingleReply, Some("cmd_v"));
+        let command_id = entry.command_id.clone();
+        correlator.register(entry).expect("register");
+        correlator.record_write(&command_id, true);
+
+        assert!(
+            correlator
+                .ingest(&parse(
+                    "@label=cmd_v :server BATCH +version labeled-response"
+                ))
+                .is_empty()
+        );
+        assert!(
+            correlator
+                .ingest(&parse("@batch=version :server 351 me ergo-2.19 server"))
+                .is_empty()
+        );
+        assert!(
+            correlator
+                .ingest(&parse(
+                    "@batch=version :server 005 me NICKLEN=32 :are supported"
+                ))
+                .is_empty()
+        );
+
+        let completions = correlator.ingest(&parse(":server BATCH -version"));
+
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].outcome, CommandOutcome::Completed);
+        assert!(completions[0].acknowledged);
+        assert_eq!(completions[0].replies.len(), 4);
+        assert_eq!(completions[0].replies[1].numeric(), Some(351));
+        assert_eq!(completions[0].replies[2].numeric(), Some(5));
+    }
+
+    #[test]
+    fn a_rejection_inside_a_labeled_batch_finishes_on_the_outer_close() {
+        let mut correlator = correlator();
+        let entry = pending("VERSION", ResponseStrategy::SingleReply, Some("cmd_v"));
+        let command_id = entry.command_id.clone();
+        correlator.register(entry).expect("register");
+        correlator.record_write(&command_id, true);
+
+        assert!(
+            correlator
+                .ingest(&parse(
+                    "@label=cmd_v :server BATCH +version labeled-response"
+                ))
+                .is_empty()
+        );
+        assert!(
+            correlator
+                .ingest(&parse(
+                    "@batch=version :server 421 me VERSION :Unknown command"
+                ))
+                .is_empty()
+        );
+        let completions = correlator.ingest(&parse(":server BATCH -version"));
+
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].outcome, CommandOutcome::Rejected);
+        assert!(!completions[0].acknowledged);
+        assert_eq!(completions[0].replies.len(), 3);
+    }
+
+    #[test]
     fn an_echo_completes_only_for_our_own_nickname() {
         let mut correlator = correlator();
         let entry = pending("JOIN", strategy("JOIN"), None);
@@ -1152,6 +1267,86 @@ mod tests {
         let completions = correlator.ingest(&parse(":server BATCH -outer"));
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].replies.len(), 5);
+    }
+
+    #[test]
+    fn an_expected_batch_nested_in_a_labeled_response_completes_on_outer_close() {
+        let mut correlator = correlator();
+        let entry = pending(
+            "CHATHISTORY",
+            ResponseStrategy::Batch {
+                expected_type: "chathistory",
+            },
+            Some("cmd_nested_response"),
+        );
+        let command_id = entry.command_id.clone();
+        correlator.register(entry).expect("register");
+        correlator.record_write(&command_id, true);
+
+        assert!(
+            correlator
+                .ingest(&parse(
+                    "@label=cmd_nested_response :server BATCH +response labeled-response"
+                ))
+                .is_empty()
+        );
+        assert!(
+            correlator
+                .ingest(&parse(
+                    "@batch=response :server BATCH +history draft/chathistory #room"
+                ))
+                .is_empty()
+        );
+        assert!(
+            correlator
+                .ingest(&parse("@batch=history :alice PRIVMSG #room :old"))
+                .is_empty()
+        );
+        assert!(
+            correlator
+                .ingest(&parse("@batch=response :server BATCH -history"))
+                .is_empty()
+        );
+
+        let completions = correlator.ingest(&parse(":server BATCH -response"));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].outcome, CommandOutcome::Completed);
+        assert_eq!(completions[0].replies.len(), 5);
+    }
+
+    #[test]
+    fn a_batch_collector_retains_rejection_from_a_labeled_response_envelope() {
+        let mut correlator = correlator();
+        let entry = pending(
+            "CHATHISTORY",
+            ResponseStrategy::Batch {
+                expected_type: "chathistory",
+            },
+            Some("cmd_rejected_history"),
+        );
+        let command_id = entry.command_id.clone();
+        correlator.register(entry).expect("register");
+        correlator.record_write(&command_id, true);
+
+        assert!(
+            correlator
+                .ingest(&parse(
+                    "@label=cmd_rejected_history :server BATCH +response labeled-response"
+                ))
+                .is_empty()
+        );
+        assert!(
+            correlator
+                .ingest(&parse(
+                    "@batch=response :server FAIL CHATHISTORY INVALID_PARAMS :Bad selector"
+                ))
+                .is_empty()
+        );
+
+        let completions = correlator.ingest(&parse(":server BATCH -response"));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].outcome, CommandOutcome::Rejected);
+        assert_eq!(completions[0].replies.len(), 3);
     }
 
     #[test]

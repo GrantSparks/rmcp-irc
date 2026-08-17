@@ -14,7 +14,8 @@ use crate::{
     },
     irc::{
         codec::MalformedReason,
-        semantic::{SemanticClass, SemanticProjection},
+        isupport::CaseMapping,
+        semantic::{SemanticClass, SemanticEvent, SemanticProjection, Source},
         wire::WireMessage,
     },
     time::Timestamp,
@@ -278,6 +279,9 @@ pub struct NewEvent {
     pub correlation: EventCorrelation,
     /// Optional typed payload.
     pub semantic: Option<EventPayload>,
+    /// Whether this event is addressed to the owning agent. See
+    /// [`IrcEvent::mentions_me`].
+    pub mentions_me: bool,
     /// Complete parsed wire data when the event came from IRC.
     pub wire: Option<WireMessage>,
 }
@@ -309,6 +313,11 @@ pub struct IrcEvent {
     pub semantic: Option<EventPayload>,
     /// Lossless wire representation when applicable.
     pub wire: Option<WireMessage>,
+    /// Whether this event is addressed to the owning agent: a private message
+    /// or notice sent to it, or a channel message naming its current nickname.
+    /// Always false for the agent's own echoed messages.
+    #[serde(default)]
+    pub mentions_me: bool,
 }
 
 /// Optional filters applied during a cursor read.
@@ -326,6 +335,9 @@ pub struct EventFilter {
     pub origin: Option<EventOrigin>,
     /// Detail level.
     pub verbosity: Option<EventVerbosity>,
+    /// Keep only events addressed to this agent when true, or only events that
+    /// are not when false.
+    pub mentions_me: Option<bool>,
 }
 
 impl EventFilter {
@@ -344,7 +356,79 @@ impl EventFilter {
             && self.direction.is_none_or(|value| event.direction == value)
             && self.origin.is_none_or(|value| event.origin == value)
             && self.verbosity.is_none_or(|value| event.verbosity == value)
+            && self
+                .mentions_me
+                .is_none_or(|value| event.mentions_me == value)
     }
+}
+
+/// Decide whether an inbound message is addressed to the agent itself.
+///
+/// A private message or notice sent directly to the agent always counts. In a
+/// channel, the nickname must appear as a whole token, so `Theseus` is a
+/// mention but `Theseusian` is not. Comparison folds case using the server's
+/// advertised `CASEMAPPING`, and the agent's own echoed messages never count.
+pub fn addresses_nickname(
+    event: &SemanticEvent,
+    nickname: &str,
+    case_mapping: CaseMapping,
+) -> bool {
+    if nickname.is_empty() {
+        return false;
+    }
+    let folded_nick = case_mapping.fold(nickname);
+    let is_self = |source: &Source| case_mapping.fold(&source.name) == folded_nick;
+
+    let (source, target, text) = match event {
+        SemanticEvent::MessageChannel {
+            source,
+            channel,
+            text,
+        } => (source, channel.as_str().to_string(), text),
+        SemanticEvent::MessagePrivate {
+            source,
+            target,
+            text,
+        }
+        | SemanticEvent::MessageAction {
+            source,
+            target,
+            text,
+        }
+        | SemanticEvent::MessageNotice {
+            source,
+            target,
+            text,
+        } => (source, target.clone(), text),
+        _ => return false,
+    };
+
+    if is_self(source) {
+        return false;
+    }
+    // Addressed straight at us: the target is our nickname, not a channel.
+    if case_mapping.fold(&target) == folded_nick {
+        return true;
+    }
+    names_nickname(text, &folded_nick, case_mapping)
+}
+
+/// Whether `text` contains `folded_nick` as a whole token.
+fn names_nickname(text: &str, folded_nick: &str, case_mapping: CaseMapping) -> bool {
+    // RFC 2812 nickname characters, plus the specials servers commonly allow.
+    let is_nick_char =
+        |character: char| character.is_alphanumeric() || "[]\\`_^{|}-".contains(character);
+    // Scan the folded text throughout, so match offsets always index the same
+    // string they came from.
+    let folded_text = case_mapping.fold(text);
+    folded_text
+        .match_indices(folded_nick)
+        .any(|(index, matched)| {
+            let before = folded_text[..index].chars().next_back();
+            let after = folded_text[index + matched.len()..].chars().next();
+            before.is_none_or(|character| !is_nick_char(character))
+                && after.is_none_or(|character| !is_nick_char(character))
+        })
 }
 
 /// Relationship between a requested cursor and retained events.
@@ -374,7 +458,9 @@ pub struct EventPage {
     pub latest: EventCursor,
     /// Ordered matching retained events.
     pub events: Vec<IrcEvent>,
-    /// Cursor callers should supply on their next read.
+    /// Cursor callers should supply on their next read. This advances only
+    /// over events present in `events`, so a filtered read never consumes what
+    /// its filter excluded and the cursor stays safe to reuse across filters.
     pub next_cursor: EventCursor,
 }
 
@@ -455,6 +541,7 @@ impl EventJournal {
             correlation: event.correlation,
             semantic: event.semantic,
             wire: event.wire,
+            mentions_me: event.mentions_me,
         };
         let raw_bytes = event.wire.as_ref().map_or(0, |wire| wire.raw_bytes.len());
         let bytes = serde_json::to_vec(&event)?.len().saturating_add(raw_bytes);
@@ -503,22 +590,25 @@ impl EventJournal {
             Some(requested) => (CursorStatus::Current, requested.sequence),
         };
 
-        let mut inspected_sequence = after_sequence;
-        let events = self
+        let events: Vec<IrcEvent> = self
             .events
             .iter()
-            .filter(|(event, _)| event.cursor.sequence > after_sequence)
-            .scan((), |(), (event, _)| {
-                inspected_sequence = event.cursor.sequence;
-                Some(event)
-            })
+            .map(|(event, _)| event)
+            .filter(|event| event.cursor.sequence > after_sequence)
             .filter(|event| filter.matches(event))
             .take(limit)
             .cloned()
             .collect();
+        // Advance only over events actually returned. A filter narrows the view;
+        // it must never consume what it excluded, because the same caller may
+        // read again through a different filter and would otherwise never see
+        // those events. Rescanning is bounded by the journal's own capacity.
+        let next_sequence = events
+            .last()
+            .map_or(after_sequence, |event| event.cursor.sequence);
         let next_cursor = EventCursor {
             stream_id: self.stream_id.clone(),
-            sequence: inspected_sequence.min(latest.sequence),
+            sequence: next_sequence.min(latest.sequence),
         };
 
         EventPage {
@@ -568,7 +658,112 @@ mod tests {
             correlation: EventCorrelation::default(),
             semantic: None,
             wire: None,
+            mentions_me: false,
         }
+    }
+
+    fn channel_message(sender: &str, text: &str) -> SemanticEvent {
+        SemanticEvent::MessageChannel {
+            source: Source {
+                name: sender.into(),
+                user: None,
+                host: None,
+                account: None,
+            },
+            channel: "#control".parse().expect("fixture channel"),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn a_channel_message_naming_the_nickname_is_a_mention() {
+        let mapping = CaseMapping::Rfc1459;
+        for text in [
+            "Theseus: please pick this up",
+            "cc theseus",
+            "ping THESEUS!",
+            "(theseus) look here",
+        ] {
+            assert!(
+                addresses_nickname(&channel_message("grant", text), "Theseus", mapping),
+                "expected a mention in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nickname_inside_a_longer_word_is_not_a_mention() {
+        let mapping = CaseMapping::Rfc1459;
+        for text in [
+            "theseusian ships",
+            "atheseus",
+            "Theseus_two is someone else",
+        ] {
+            assert!(
+                !addresses_nickname(&channel_message("grant", text), "Theseus", mapping),
+                "expected no mention in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agents_own_echoed_message_never_mentions_itself() {
+        assert!(!addresses_nickname(
+            &channel_message("Theseus", "Theseus reporting in"),
+            "Theseus",
+            CaseMapping::Rfc1459,
+        ));
+    }
+
+    #[test]
+    fn a_private_message_is_a_mention_without_naming_the_nickname() {
+        let direct = SemanticEvent::MessagePrivate {
+            source: Source {
+                name: "grant".into(),
+                user: None,
+                host: None,
+                account: None,
+            },
+            target: "Theseus".into(),
+            text: "no nickname in this body at all".into(),
+        };
+        assert!(addresses_nickname(&direct, "Theseus", CaseMapping::Rfc1459));
+    }
+
+    #[test]
+    fn mentions_fold_case_using_the_servers_mapping() {
+        // Under RFC 1459 the bracket characters fold onto the brace forms, so a
+        // nickname spelled either way is the same person.
+        let event = channel_message("grant", "nudging thes{us");
+        assert!(addresses_nickname(&event, "Thes[us", CaseMapping::Rfc1459));
+        assert!(!addresses_nickname(&event, "Thes[us", CaseMapping::Ascii));
+    }
+
+    #[test]
+    fn the_mention_filter_selects_only_addressed_events() {
+        let agent_id = AgentId::new();
+        let mut journal = EventJournal::new(8, 16 * 1024);
+        journal
+            .push(event(&agent_id, EventClass::MessageChannel))
+            .expect("ordinary channel traffic");
+        let addressed = journal
+            .push(NewEvent {
+                mentions_me: true,
+                ..event(&agent_id, EventClass::MessageChannel)
+            })
+            .expect("addressed");
+
+        let page = journal.read(
+            None,
+            10,
+            &EventFilter {
+                mentions_me: Some(true),
+                ..EventFilter::default()
+            },
+        );
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].cursor, addressed);
+        assert!(page.events[0].mentions_me);
     }
 
     #[test]
@@ -614,40 +809,60 @@ mod tests {
     }
 
     #[test]
-    fn filtered_reads_advance_past_inspected_non_matches() {
+    fn a_filtered_read_never_consumes_non_matching_events() {
         let agent_id = AgentId::new();
         let mut journal = EventJournal::new(4, 16 * 1024);
         journal
             .push(event(&agent_id, EventClass::ProtocolReply))
-            .expect("skip");
+            .expect("leading reply");
         let wanted = journal
             .push(event(&agent_id, EventClass::MessagePrivate))
             .expect("wanted");
-        journal
+        let trailing = journal
             .push(event(&agent_id, EventClass::ProtocolReply))
-            .expect("skip");
+            .expect("trailing reply");
 
-        let page = journal.read(
-            None,
-            1,
-            &EventFilter {
-                class: Some(EventClass::MessagePrivate),
-                ..EventFilter::default()
-            },
-        );
+        let private = EventFilter {
+            class: Some(EventClass::MessagePrivate),
+            ..EventFilter::default()
+        };
+
+        let page = journal.read(None, 1, &private);
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.next_cursor, wanted);
 
-        let page = journal.read(
-            Some(&wanted),
-            1,
-            &EventFilter {
-                class: Some(EventClass::MessagePrivate),
-                ..EventFilter::default()
-            },
-        );
+        // Nothing further matches, so the cursor must stay put rather than
+        // racing ahead over the trailing non-match.
+        let page = journal.read(Some(&wanted), 1, &private);
         assert!(page.events.is_empty());
-        assert_eq!(page.next_cursor.sequence, 3);
+        assert_eq!(page.next_cursor, wanted);
+
+        // The regression that matters: the same cursor read through a
+        // different filter must still see the event the first filter skipped.
+        let page = journal.read(Some(&wanted), 10, &EventFilter::default());
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].cursor, trailing);
+        assert_eq!(page.next_cursor, trailing);
+    }
+
+    #[test]
+    fn an_unfiltered_read_advances_only_to_the_last_returned_event() {
+        let agent_id = AgentId::new();
+        let mut journal = EventJournal::new(8, 16 * 1024);
+        journal
+            .push(event(&agent_id, EventClass::ProtocolReply))
+            .expect("first");
+        let second = journal
+            .push(event(&agent_id, EventClass::ProtocolReply))
+            .expect("second");
+        journal
+            .push(event(&agent_id, EventClass::ProtocolReply))
+            .expect("third");
+
+        let page = journal.read(None, 2, &EventFilter::default());
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(page.next_cursor, second);
+        assert_eq!(page.latest.sequence, 3);
     }
 
     #[test]
@@ -684,6 +899,7 @@ mod tests {
             correlation: EventCorrelation::default(),
             semantic: None,
             wire: None,
+            mentions_me: false,
         };
         let mut journal = EventJournal::new(4, 4096);
         journal.push(event).expect("push");

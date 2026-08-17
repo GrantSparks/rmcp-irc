@@ -3,6 +3,7 @@
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -10,7 +11,7 @@ use std::{
 use crate::{
     agent::{
         actor::CompletionMode,
-        journal::{EventClass, EventFilter},
+        journal::{EventClass, EventDirection, EventFilter},
     },
     config::{Config, IrcTransport},
     dcc::negotiation::{CtcpMessage, DccOffer, parse_address},
@@ -293,6 +294,72 @@ async fn serve_client(
                 )
                 .await;
             }
+            "VERSION" => {
+                let target = nickname.as_deref().unwrap_or("*");
+                let label = message.tag_value("label").unwrap_or("version");
+                write_line(
+                    &mut writer,
+                    &format!("@label={label} :fake BATCH +{label} labeled-response"),
+                )
+                .await;
+                write_line(
+                    &mut writer,
+                    &format!("@batch={label} :fake 351 {target} ergo-test fake"),
+                )
+                .await;
+                write_line(
+                    &mut writer,
+                    &format!("@batch={label} :fake 005 {target} NICKLEN=30 :supported"),
+                )
+                .await;
+                write_line(&mut writer, &format!(":fake BATCH -{label}")).await;
+            }
+            "TOPIC" if message.trailing.is_some() => {
+                let channel = message.params.first().map_or("#test", String::as_str);
+                let text = message.trailing.as_deref().unwrap_or_default();
+                let tag = label_prefix(&message);
+                write_line(
+                    &mut writer,
+                    &format!(
+                        "{tag}:{}!guest@localhost TOPIC {channel} :{text}",
+                        nickname.as_deref().unwrap_or("guest")
+                    ),
+                )
+                .await;
+            }
+            "MODE"
+                if message
+                    .params
+                    .get(1)
+                    .is_some_and(|modes| modes.starts_with(['+', '-'])) =>
+            {
+                let target = message.params.first().map_or("#test", String::as_str);
+                let modes = &message.params[1];
+                let tag = label_prefix(&message);
+                write_line(
+                    &mut writer,
+                    &format!(
+                        "{tag}:{}!guest@localhost MODE {target} {modes}",
+                        nickname.as_deref().unwrap_or("guest")
+                    ),
+                )
+                .await;
+            }
+            "MONITOR" => {
+                let target = nickname.as_deref().unwrap_or("*");
+                let tag = label_prefix(&message);
+                let operation = message.params.first().map_or("", String::as_str);
+                if operation == "+" {
+                    let monitored = message.params.get(1).map_or("peer", String::as_str);
+                    write_line(
+                        &mut writer,
+                        &format!("{tag}:fake 730 {target} :{monitored}!u@h"),
+                    )
+                    .await;
+                } else {
+                    write_line(&mut writer, &format!("{tag}:fake ACK")).await;
+                }
+            }
             "CHATHISTORY" => {
                 let target = message.params.get(1).map_or("#test", String::as_str);
                 let label = message.tag_value("label").unwrap_or("history");
@@ -465,6 +532,69 @@ async fn live_gateway_registers_queries_history_and_keeps_cursors_independent() 
         assert!(time.acknowledged);
         assert_eq!(time.replies.len(), 1);
         assert_eq!(time.replies[0].command, "391");
+    }
+
+    let version = gateway
+        .execute(
+            &connected.agent_id,
+            OutboundMessage::new("VERSION", Vec::new()),
+            CompletionMode::Auto,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("batched VERSION");
+    assert_eq!(version.outcome, CommandOutcome::Completed);
+    assert!(version.acknowledged);
+    assert_eq!(
+        version
+            .replies
+            .iter()
+            .map(|reply| reply.command.as_str())
+            .collect::<Vec<_>>(),
+        ["BATCH", "351", "005", "BATCH"]
+    );
+    let version_events = gateway
+        .read_events(
+            &connected.agent_id,
+            None,
+            1_000,
+            Duration::ZERO,
+            EventFilter {
+                command_id: Some(version.command_id.as_str().to_owned()),
+                ..EventFilter::default()
+            },
+        )
+        .await
+        .expect("VERSION events");
+    assert_eq!(
+        version_events
+            .events
+            .iter()
+            .filter(|event| event.direction == EventDirection::Inbound)
+            .count(),
+        4
+    );
+
+    for message in [
+        OutboundMessage::new("TOPIC", vec!["#agents".into()]).with_trailing("stress topic"),
+        OutboundMessage::new("MODE", vec!["#agents".into(), "+i".into()]),
+        OutboundMessage::new("MONITOR", vec!["S".into(), "peer".into()]),
+        OutboundMessage::new("MONITOR", vec!["+".into(), "peer".into()]),
+        OutboundMessage::new("MONITOR", vec!["-".into(), "peer".into()]),
+    ] {
+        let command = message.command.clone();
+        let result = gateway
+            .execute(
+                &connected.agent_id,
+                message,
+                CompletionMode::Auto,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{command} mutation: {error}"));
+        assert_eq!(result.outcome, CommandOutcome::Completed, "{command}");
+        assert!(result.acknowledged, "{command}");
+        assert_eq!(result.replies.len(), 1, "{command}");
     }
 
     let before = gateway
@@ -924,6 +1054,160 @@ async fn reconnect_keeps_the_stream_refreshes_motd_and_requests_history_after_th
         Some(crate::agent::state::MotdSource::Query)
     );
     assert_eq!(snapshot.state.motd.text, "Fresh instructions.");
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+/// An agent's own echoed message must never register as a mention.
+///
+/// This exercises the wiring that the `journal` unit tests cannot reach: the
+/// actor has to have a registered nickname in reduced state at ingest time and
+/// fold it with the server's advertised `CASEMAPPING`. If any of that is
+/// missing, an agent addressing someone else would flag itself on every line
+/// it sends. The fixture echoes a PRIVMSG back sourced from the sender, so the
+/// message names `Athena` and arrives from `Athena`.
+#[tokio::test]
+async fn an_agents_own_echoed_message_is_never_flagged_as_a_mention() {
+    let fake = FakeErgo::spawn().await;
+    let gateway = Gateway::new(fake.config());
+    let connected = gateway
+        .connect(connect_request("Athena"))
+        .await
+        .expect("connect");
+
+    let sent = gateway
+        .execute(
+            &connected.agent_id,
+            OutboundMessage::new("PRIVMSG", vec!["#agents".into()])
+                .with_trailing("Athena here, handing off to Hermes"),
+            CompletionMode::Auto,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("PRIVMSG");
+    assert_eq!(sent.outcome, CommandOutcome::Completed);
+
+    let echoed = gateway
+        .read_events(
+            &connected.agent_id,
+            None,
+            50,
+            Duration::from_millis(200),
+            EventFilter {
+                class: Some(EventClass::MessageChannel),
+                direction: Some(EventDirection::Inbound),
+                ..EventFilter::default()
+            },
+        )
+        .await
+        .expect("read echoed message");
+    assert!(
+        !echoed.events.is_empty(),
+        "the fixture should echo the message back"
+    );
+    assert!(
+        echoed.events.iter().all(|event| !event.mentions_me),
+        "an agent's own nickname in its own message is not a mention"
+    );
+
+    // The mention filter must therefore select nothing here, and doing so must
+    // not drag the cursor past the echoed traffic it declined.
+    let mentions = gateway
+        .read_events(
+            &connected.agent_id,
+            None,
+            50,
+            Duration::ZERO,
+            EventFilter {
+                mentions_me: Some(true),
+                ..EventFilter::default()
+            },
+        )
+        .await
+        .expect("read mentions");
+    assert!(mentions.events.is_empty());
+    assert!(
+        mentions.next_cursor.sequence < echoed.next_cursor.sequence,
+        "an empty filtered read must not consume the events it filtered out"
+    );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+/// The cursor resource must deliver everything after a consumed sequence, so
+/// that `subscriptions/listen` plus `resources/read` is a complete loop with no
+/// tool call and no polling in it.
+#[tokio::test]
+async fn event_cursor_pages_carry_the_journal_forward_without_a_tool_call() {
+    let fake = FakeErgo::spawn().await;
+    let gateway = Gateway::new(fake.config());
+    let connected = gateway
+        .connect(connect_request("Athena"))
+        .await
+        .expect("connect");
+
+    let uri = format!(
+        "irc://agents/{}/events/after/0",
+        connected.agent_id.as_str()
+    );
+    let parsed = crate::mcp::resources::AgentResourceUri::from_str(&uri).expect("parse cursor URI");
+    assert_eq!(
+        parsed.kind,
+        crate::mcp::resources::ResourceKind::EventsAfter(0)
+    );
+
+    // Registration alone puts events in the journal, so reading from zero must
+    // return a positioned page rather than an unpositioned preview.
+    let snapshot = gateway
+        .snapshot(&connected.agent_id)
+        .await
+        .expect("snapshot");
+    let first = gateway
+        .read_events(
+            &connected.agent_id,
+            Some(crate::agent::journal::EventCursor {
+                stream_id: snapshot.journal.stream_id.clone(),
+                sequence: 0,
+            }),
+            10,
+            Duration::ZERO,
+            EventFilter::default(),
+        )
+        .await
+        .expect("first cursor page");
+    assert!(!first.events.is_empty());
+    assert_eq!(
+        first.status,
+        crate::agent::journal::CursorStatus::Current,
+        "reading from zero is a normal read, not a gap"
+    );
+
+    // Reading again from the cursor the page handed back must not repeat work
+    // and must stay positioned on the same stream.
+    let second = gateway
+        .read_events(
+            &connected.agent_id,
+            Some(first.next_cursor.clone()),
+            10,
+            Duration::ZERO,
+            EventFilter::default(),
+        )
+        .await
+        .expect("second cursor page");
+    assert_eq!(second.stream_id, first.stream_id);
+    assert!(
+        second
+            .events
+            .iter()
+            .all(|event| event.cursor.sequence > first.next_cursor.sequence),
+        "a page must never re-deliver what the previous cursor consumed"
+    );
 
     gateway
         .disconnect(&connected.agent_id, None)

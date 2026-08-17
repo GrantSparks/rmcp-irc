@@ -97,7 +97,9 @@ DCC CHAT offer, and sends it through CTCP. The tool returns the session snapshot
 once the offer is written; it does not wait for the peer. Connection progress
 is delivered through DCC events and the DCC resource. The offer's outbound IRC
 wire event remains observable; the DCC tool result does not claim peer
-acceptance.
+acceptance. An ordinary offer's listener remains available for `offer_ttl_ms`;
+the shorter `connect_timeout_ms` applies only when this gateway actively opens
+a TCP connection to an endpoint advertised by the peer.
 
 ## `irc.dcc.chat.send`
 
@@ -165,8 +167,11 @@ peer-supplied offer.
 
 Input contains `agent_id` and offered `dcc_session_id`. It marks the session
 `rejected`, closes reserved listener/socket state, emits a terminal event, and
-updates the DCC resource. No non-standard peer reply is invented unless the
-negotiated variant defines one.
+updates the DCC resource. Ordinary DCC defines rejection as ignoring the offer,
+so this terminal state is local: the offerer cannot distinguish rejection from
+an ignored or lost offer and eventually records an ambiguous offer-expiry
+failure. The gateway does not invent a peer-control reply or treat a nickname
+as authorization for one.
 
 ## `irc.dcc.cancel`
 
@@ -174,7 +179,12 @@ Input contains `agent_id` and `dcc_session_id`. It may cancel an offered,
 connecting, active, or transferring session. The manager closes direct sockets
 and file handles, performs safe partial-file cleanup, marks the session
 `cancelled`, and returns its final snapshot. Cancelling an already terminal
-session is idempotent and returns that terminal state.
+session is idempotent and returns that terminal state. Closing an established
+ordinary DCC socket has no interoperable terminal-reason frame. The peer can
+observe EOF (or an incomplete SEND), but cannot truthfully infer whether the
+local cause was cancellation, shutdown, or another clean CHAT close; the
+gateway therefore preserves `cancelled` locally without fabricating that state
+for the peer.
 
 ## `irc.dcc.list`
 
@@ -220,10 +230,11 @@ contain metadata and byte counts only, never file bodies.
 ## Bounds, timeouts, and shutdown
 
 Each agent enforces the configured session and per-peer offer counts, offer
-TTL, port interval, connection deadline, idle deadline, transfer buffer, and
-maximum receive size. The byte limit also applies when a peer omits the SEND
-size. Exhaustion returns a bounded resource error without dropping unrelated
-sessions.
+TTL, port interval, active-connect deadline, idle deadline, transfer buffer,
+and maximum receive size. `offer_ttl_ms` covers the wait on a listener-backed
+offer; `connect_timeout_ms` covers an active TCP connect to a peer endpoint.
+The byte limit also applies when a peer omits the SEND size. Exhaustion returns
+a bounded resource error without dropping unrelated sessions.
 
 On `irc.disconnect` or orderly process shutdown, active DCC sessions become
 cancelled or failed as appropriate, terminal events are emitted when still

@@ -47,7 +47,9 @@ file sources and destinations outside the repository.
    identities and that the configured port range is free.
 4. Use an MCP client that can display both text and `structuredContent`, issue
    concurrent calls, preserve event cursors, and close stdio cleanly. The two
-   transports expose the same service; they are not separate APIs.
+   transports expose the same service; they are not separate APIs. Record
+   whether the client exposes MCP resource subscriptions. If it does not, keep
+   an `irc.events.read` long poll active throughout the run.
 
 ## Start both transports
 
@@ -74,12 +76,12 @@ addresses, local paths, or credentials do not belong in committed evidence.
 
 | Area | Procedure | Required assertion |
 | --- | --- | --- |
-| Registration | Call `irc.connect` once through stdio and once through HTTP with distinct names; make at least one requested name longer than nine bytes. | Each call returns only after registration and complete MOTD collection. The gateway does not shorten a name before ISUPPORT exists; when the eventual `NICKLEN` confirms the name is valid, it remains unchanged, `nickname_adjusted` is false, and handles differ. |
-| Discovery | Read protocol, status, MOTD, state, events, and DCC resources plus one channel resource. Query every joined channel's topic. | Resources belong to the requested handle; exact capabilities and ISUPPORT are present; resource links resolve; topics complete without reply crossover. |
+| Registration | Call `irc.connect` once through stdio and once through HTTP with distinct names; make at least one requested name longer than nine bytes. | Each call returns only after registration and complete MOTD collection. Default compact results keep the MOTD instruction text visible without inline line/raw duplication. The gateway does not shorten a name before ISUPPORT exists; when the eventual `NICKLEN` confirms the name is valid, it remains unchanged, `nickname_adjusted` is false, and handles differ. |
+| Discovery | Read protocol, status, MOTD, state, events, and DCC resources plus one channel resource. Query every joined channel's topic. | Resources belong to the requested handle; exact capabilities and ISUPPORT are present; resource links resolve; the MOTD resource contains complete lines and wire replies even though default status is compact; topics complete without reply crossover. |
 | Messaging | Join the dedicated channel with both identities. Send one channel message and a private message in each direction. | Sends are acknowledged when server features permit; echo, `msgid`, `server-time`, direction, target, and semantic class remain observable. |
-| Cursors | Hold a long poll from a known cursor while the peer sends a marker. Repeat with channel/private filters and with a filtered non-match before a match. | The marker wakes the read; filters return only matches; returned cursors advance past inspected non-matches; the IRC reader remains responsive. |
+| Cursors | Hold a long poll from a known cursor while the peer sends a marker. Repeat with channel/private filters and with a filtered non-match before a match. If the client supports resource subscriptions, separately verify that an event-resource update is delivered as a wake-up hint. | The marker wakes the read; filters return only matches; returned cursors advance past inspected non-matches; the IRC reader remains responsive. Clients without subscription support remain responsive through the continuous long-poll fallback. |
 | Correlation | Overlap at least two `TOPIC` calls and concurrent `WHOIS`, `NAMES`, and history operations. | Every `command_id`/label owns only its replies, including labeled batches that finish out of order. |
-| History | Send a unique marker that the actor observes live, then call `irc.history` latest twice for that channel. | Both explicit calls return the marker in typed `events` with `origin: history`, even though its `msgid` was seen live and in the first query. Raw replies and typed projection agree. |
+| History | Send a unique marker that the actor observes live, then call `irc.history` latest twice for that channel with default compact detail; repeat once with `result_detail: "full"`. | Every explicit call returns the marker in typed `events` with `origin: history`, even though its `msgid` was seen live and earlier. Compact results do not repeat successful reply/projection arrays; the full result's raw replies and typed projection agree. |
 | DCC CHAT | Open an ordinary chat offer from one identity and accept it promptly from the other. Exchange lines in both directions, then cancel or disconnect. Also allow one offer to expire. | Both sessions become active; lines are ordered `dcc.chat.message` events; terminal state and timeout are exact; cancelling a terminal session describes its actual state. |
 | DCC SEND | Create a small random or fixed file outside the tree, record size and SHA-256, offer it, accept with `conflict: fail`, and wait for terminal state. | Sender and receiver report the same byte count and `completed`; source and destination hashes match; no file body appears in MCP results or event data. |
 | Lifecycle | Disconnect both handles, close stdio input, and stop HTTP gracefully. Inspect processes and server presence. | QUIT is attempted, DCC sessions close, handles become invalid, stdio exits on EOF, HTTP stops on cancellation, and no gateway or IRC identity is orphaned. |

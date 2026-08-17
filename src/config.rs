@@ -456,9 +456,9 @@ pub struct DccConfig {
     pub transfer_buffer_bytes: usize,
     /// Maximum bytes accepted for one incoming file transfer.
     pub max_transfer_bytes: u64,
-    /// How long an unaccepted incoming offer remains available.
+    /// How long an offer and its listener remain available for peer acceptance.
     pub offer_ttl_ms: u64,
-    /// Deadline for a direct peer connection.
+    /// Deadline while actively connecting to a peer endpoint.
     pub connect_timeout_ms: u64,
     /// Idle direct-session timeout.
     pub idle_timeout_ms: u64,

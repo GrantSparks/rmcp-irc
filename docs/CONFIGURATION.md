@@ -142,8 +142,8 @@ server cannot force unbounded allocation.
 | `max_offers_per_peer` | positive integer | `4` | Simultaneous incoming offers retained from one nickname. |
 | `transfer_buffer_bytes` | positive integer | `65536` | Bounded streaming buffer; never a whole-file allocation. |
 | `max_transfer_bytes` | positive integer | `1073741824` | Hard receive ceiling, including offers that omit a size. |
-| `offer_ttl_ms` | positive integer | `120000` | Time an unaccepted incoming offer remains available. |
-| `connect_timeout_ms` | positive integer | `15000` | Direct connection establishment deadline. |
+| `offer_ttl_ms` | positive integer | `120000` | Time a retained incoming offer or listener-backed offer remains available for peer acceptance. |
+| `connect_timeout_ms` | positive integer | `15000` | Deadline while actively connecting to a peer endpoint; it does not shorten a listener-backed offer's lifetime. |
 | `idle_timeout_ms` | positive integer | `300000` | Idle CHAT/transfer deadline. |
 | `automatic_accept_chat` | boolean | `false` | Accept valid incoming CHAT offers without an MCP call. |
 | `automatic_accept_send` | boolean | `false` | Accept valid incoming SEND offers into `download_directory` without an MCP call. |

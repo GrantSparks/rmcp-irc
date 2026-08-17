@@ -9,6 +9,29 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Fixed
 
+- `irc.connect` and `irc.status` now default to compact MOTD results that keep
+  the joined instruction text visible without repeating its line array and
+  expanded raw numerics; `result_detail: "full"` restores the legacy inline
+  form, and the MOTD resource remains lossless.
+- Successful `irc.history` results now default to one authoritative event form
+  instead of repeating the same raw and semantic records in the command
+  envelope; callers can opt into `full`, while failures always retain complete
+  diagnostics.
+- Correlated join, part, send, query, and execute tools now accept a
+  backward-compatible `result_detail` control: the default `full` form is
+  unchanged, while `compact` keeps lossless replies and sets their duplicate
+  semantic projection to `null`.
+- Rejected or timed-out `irc.send` and `irc.history` calls no longer pair
+  `isError: true` with success-phrased text content.
+- Event-delivery guidance now states that MCP clients without resource
+  subscription support must keep a cursor-based `irc.events.read` long poll
+  active instead of waiting for unavailable wake-up notifications.
+- TOPIC and MODE mutations and MONITOR status/mutation operations now select
+  collectors from their structured parameter shape instead of waiting for
+  query-only numerics that never arrive.
+- Single-reply, numeric, and echo collectors now retain an entire outer
+  labeled-response batch, propagate the parent command correlation to every
+  child, and report completion or rejection only when that batch closes.
 - Explicit `irc.execute` collection now completes when a multi-message labeled
   response batch closes instead of retaining all replies until the request
   times out.

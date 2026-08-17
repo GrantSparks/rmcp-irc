@@ -18,6 +18,10 @@ connection is never an IRC identity.
 - Every operation after `irc.connect` carries `agent_id`, in both transports.
 - All successful tools return concise `TextContent` plus schema-valid
   `structuredContent`. The structured result is authoritative.
+- `irc.connect`, `irc.status`, and `irc.history` default `result_detail` to
+  `compact` so equivalent presentation, parsed-wire, and semantic data is not
+  repeated in one response. Callers that need the legacy inline forms can set
+  `result_detail` to `full`; stable resources are complete in either mode.
 - Timestamps use RFC 3339 UTC strings. Durations and deadlines use integer
   milliseconds unless a field says otherwise.
 - IRC names retain server-provided casing. Equality and validation use the
@@ -87,6 +91,12 @@ Commands that await IRC completion use this common result envelope:
 appear in `warnings`; `FAIL` and known error numerics produce `isError: true`
 while retaining their raw replies.
 
+`irc.join`, `irc.part`, `irc.send`, `irc.query`, and `irc.execute` accept
+`result_detail`. It defaults to `full` for backward compatibility. Explicit
+`compact` retains the lossless `replies` array, including rejection diagnostics,
+but sets its third, derived `semantic_result` representation to `null`. This
+control does not alter command outcome or acknowledgment metadata.
+
 ## Identity tools
 
 ### `irc.connect`
@@ -104,6 +114,7 @@ Input:
 | `username` | string | no | Overrides the configured guest username template. |
 | `real_name` | string | no | Overrides the configured real-name template. |
 | `channels` | string array | no | Initial channels in addition to configured defaults. |
+| `result_detail` | `compact` or `full` | no | Defaults to `compact`. Compact keeps joined MOTD text but clears duplicate `lines` and `wire_replies`; `full` returns the legacy lossless MOTD inline. |
 
 The operation performs CAP negotiation and guest `NICK`/`USER` registration,
 using PASS or SASL only when configured for the endpoint. Registration-time
@@ -152,12 +163,17 @@ Minimum successful result:
     "state": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/state",
     "events": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/events",
     "dcc": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/dcc"
-  }
+  },
+  "result_detail": "compact"
 }
 ```
 
 `motd.status` is `received` or `not_available` in a successful initial result.
-The ordered MOTD text is prominent in both text and structured output.
+The ordered MOTD text remains prominent in both text and structured output so
+server onboarding instructions are visible without another round trip. In the
+default compact result, empty `lines` and `wire_replies` mean those duplicate
+forms were omitted, as declared by `result_detail`; they remain complete at
+`resources.motd`. Set `result_detail: "full"` to include them inline.
 
 ### `irc.disconnect`
 
@@ -169,25 +185,32 @@ the count of DCC sessions closed.
 
 ### `irc.status`
 
-Returns `{ state, advertised_capabilities, negotiated_capabilities, events,
-resources }`. `state` contains the `agent_id`, connection/registration and
-reconnect state, identity, joined channels, latest MOTD, reducer cursor, and
-last error. `events` contains the current stream and retained cursor bounds.
+Input contains `agent_id` and optional `result_detail`, which defaults to
+`compact`. Returns `{ state, advertised_capabilities, negotiated_capabilities,
+events, resources, result_detail }`. `state` contains the `agent_id`,
+connection/registration and reconnect state, identity, joined channels, latest
+MOTD, reducer cursor, and last error. In compact mode the latest MOTD retains
+its status, joined text, source, and receive time while its duplicate `lines`
+and `wire_replies` arrays are empty. The linked MOTD resource remains complete;
+`full` restores the legacy inline state. `events` contains the current stream
+and retained cursor bounds.
 
 ## Channel and messaging tools
 
 ### `irc.join`
 
-Input contains `agent_id`, `channel`, optional `key`, and optional `timeout_ms`
-(default `10000`). It completes on the matching JOIN echo, labeled failure, or
-relevant error numeric. The result uses the common command envelope and adds
-the case-preserved channel and channel resource URI.
+Input contains `agent_id`, `channel`, optional `key`, optional `timeout_ms`
+(default `10000`), and optional `result_detail`. It completes on the matching
+JOIN echo, labeled failure, or relevant error numeric. The result uses the
+common command envelope and adds the case-preserved channel and channel
+resource URI.
 
 ### `irc.part`
 
-Input contains `agent_id`, `channel`, optional `reason`, and optional
-`timeout_ms` (default `10000`). It completes on the matching PART echo, labeled
-failure, or relevant error numeric and returns the common command envelope.
+Input contains `agent_id`, `channel`, optional `reason`, optional `timeout_ms`
+(default `10000`), and optional `result_detail`. It completes on the matching
+PART echo, labeled failure, or relevant error numeric and returns the common
+command envelope.
 
 ### `irc.send`
 
@@ -203,6 +226,7 @@ Input:
 | `reply_to` | string | no | Server message ID being replied to. |
 | `multiline` | `require`, `prefer`, `split`, or `reject_if_too_long` | no | Defaults to `prefer`. |
 | `timeout_ms` | integer | no | Completion deadline; defaults to `10000` and is capped by `limits.max_command_timeout_ms`. |
+| `result_detail` | `compact` or `full` | no | Defaults to `full`; compact keeps lossless replies but sets their duplicate semantic projection to null. |
 
 The gateway does not negotiate the work-in-progress `draft/multiline`
 extension. Splitting occurs only for
@@ -229,7 +253,8 @@ message IDs and server time. Without an exact confirmation, the outcome is
 ### `irc.history`
 
 Input contains `agent_id`, `target`, tagged `selector`, `limit`,
-`include_non_message_events`, and `timeout_ms`. For example,
+`include_non_message_events`, `timeout_ms`, and optional `result_detail`. For
+example,
 `{"selector":{"kind":"before","anchor":{"kind":"timestamp","value":"2026-08-17T00:00:00Z"}}}`.
 Selectors are `latest`, `before`, `after`, `around`, or `between`; anchors are
 typed `timestamp` or `message_id` values. The gateway validates and encodes the
@@ -243,10 +268,18 @@ available, the tool returns `unavailable` rather than implying local history.
 `limit` defaults to `100` and must be positive; `timeout_ms` defaults to
 `10000` and is capped by `limits.max_command_timeout_ms`.
 
+`result_detail` defaults to `compact`. Because `events` is the authoritative
+history projection, compact successful results retain the command metadata but
+clear `result.replies` and set `result.semantic_result` to `null` rather than
+returning the same records again. Set it to `full` for the legacy repeated
+forms. Failed commands always report `result_detail: "full"` and retain
+collected diagnostic replies regardless of the request.
+
 ### `irc.query`
 
 Provides typed projections for common read-only queries while always retaining
-their collected wire replies. Input uses a tagged `query` object, for example
+their collected wire replies. Input uses a tagged `query` object plus optional
+`result_detail`, for example
 `{"agent_id":"agent-...","query":{"kind":"whois","nickname":"alice"}}`.
 Query kinds are:
 
@@ -256,8 +289,9 @@ Query kinds are:
 - `motd`, `version`, `time`, `admin`, `info`, `lusers`, `stats`, and `links`;
 - `help` index or subject.
 
-The result uses the command envelope and contains projected `semantic_result`
-plus complete `replies`. A successful MOTD query refreshes
+The result uses the command envelope and normally contains projected
+`semantic_result` plus complete `replies`; explicit compact detail sets only
+the projection to `null`. A successful MOTD query refreshes
 the shared MOTD resource and emits the same events/notifications as a reconnect
 MOTD. `timeout_ms` defaults to `10000` and is capped by
 `limits.max_command_timeout_ms`.
@@ -277,7 +311,8 @@ service, or future IRC command.
   "trailing": null,
   "tags": [],
   "response_mode": "auto",
-  "timeout_ms": 10000
+  "timeout_ms": 10000,
+  "result_detail": "full"
 }
 ```
 
@@ -298,6 +333,8 @@ service, or future IRC command.
   rejects the command.
 - `timeout_ms` defaults to `10000` and is capped by
   `limits.max_command_timeout_ms`.
+- `result_detail` defaults to `full`; explicit `compact` keeps lossless replies
+  but sets their duplicate semantic projection to `null`.
 
 The result is the common command envelope.
 
@@ -321,6 +358,11 @@ Output contains `stream_id`, `requested_cursor`, `status`, `oldest_available`,
 ownership or journal retention. `limit` defaults to `100` and must be between
 1 and `limits.max_event_page_size`; `wait_ms` is capped by
 `limits.max_event_wait_ms`. See [EVENTS_AND_STATE.md](EVENTS_AND_STATE.md).
+
+Keep one long poll active when prompt event handling matters: pass the last
+consumed `next_cursor`, choose a positive `wait_ms`, and immediately issue the
+next read after each response. This is also the required fallback for MCP
+clients that do not expose resource subscription requests.
 
 ## DCC tools
 
@@ -347,7 +389,9 @@ storage.
 ### `irc://agents/{agent_id}/status`
 
 Contains the same connection/protocol summary as `irc.status`, including
-reconnect state and stable resource links.
+reconnect state and stable resource links. Resource reads are explicitly
+lossless and therefore include the complete MOTD state regardless of the
+tool's default compact detail.
 
 ### `irc://agents/{agent_id}/protocol`
 
@@ -360,7 +404,8 @@ shape is defined in [PROTOCOL_COMPATIBILITY.md](PROTOCOL_COMPATIBILITY.md).
 
 Contains best-effort own identity, connection, joined-channel, topic, mode,
 membership, and monitored-presence state. It includes snapshot time and the
-event cursor through which reduction is complete.
+event cursor through which reduction is complete, including the complete MOTD
+state.
 
 ### `irc://agents/{agent_id}/motd`
 
@@ -397,7 +442,9 @@ contain a durable consumption position and never replace `irc.events.read`.
 
 The same `rmcp` subscription listener is used by both transports. Whether an
 MCP host wakes or invokes an LLM after a notification is host behavior, not a
-gateway guarantee.
+gateway guarantee. A client whose API does not expose resource subscriptions
+will not receive these hints; it must use the cursor-based `irc.events.read`
+long-poll loop described above instead.
 
 ## Stable surface summary
 

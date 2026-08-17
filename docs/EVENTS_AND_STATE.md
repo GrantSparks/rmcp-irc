@@ -246,3 +246,8 @@ their owning `command_id`; they never share a cursor-only projection window.
 not carry a durable event position and is not an alternative event transport.
 Clients respond by reading the indicated resource and, for events, calling
 `irc.events.read` with their own cursor.
+
+Resource subscriptions are not exposed by every MCP client. Such a client
+cannot receive the hint and must keep a bounded `irc.events.read` long poll
+active, immediately continuing from each returned `next_cursor`. This fallback
+uses the same durable cursor contract and does not require subscription support.

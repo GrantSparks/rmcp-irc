@@ -28,7 +28,7 @@ use crate::{
         chat::{DccChatEvent, DccChatHandle, spawn_chat},
         manager::DccManager,
         negotiation::{CtcpMessage, DccOffer, encode_address, parse_address, validate_filename},
-        runtime::{accept as accept_direct, bind_listener, connect as connect_direct},
+        runtime::{accept_offer, bind_listener, connect as connect_direct, offer_accept_timeout},
         session::{DccDirection, DccKind, DccSession, DccSessionId, DccState},
         transfer::{
             DestinationConflict, ReceiveOptions, ReceivedFile, TransferOptions, TransferProgress,
@@ -42,7 +42,7 @@ use crate::{
             SaslMechanism, SaslPolicy,
         },
         codec::{CodecError, InboundFrame, IrcCodec, OutboundFrame},
-        commands::{ResponseStrategy, strategy_for},
+        commands::{ResponseStrategy, strategy_for_message},
         correlation::{
             CommandId, CommandResult, Completion, Correlator, CorrelatorLimits, MessageAttribution,
             PendingCommand,
@@ -63,7 +63,7 @@ use super::{
     journal::{
         ConnectionEvent, CorrelationRole, DccChatMessage, DccFailure, EventClass, EventCorrelation,
         EventCursor, EventDirection, EventFilter, EventOrigin, EventPage, EventPayload,
-        EventVerbosity, IrcEvent, JournalStats, MalformedLine, NewEvent,
+        EventVerbosity, IrcEvent, JournalStats, MalformedLine, NewEvent, addresses_nickname,
     },
     reconnect::ReconnectBackoff,
     state::{AgentState, ConnectionState, MotdSource, MotdState, MotdStatus},
@@ -1065,7 +1065,7 @@ impl AgentActor {
         }
         let labeled = self.capabilities.is_active("labeled-response");
         let strategy = match request.completion_mode {
-            CompletionMode::Auto => strategy_for(&request.message.command, &self.capabilities),
+            CompletionMode::Auto => strategy_for_message(&request.message, &self.capabilities),
             CompletionMode::Collect if labeled => ResponseStrategy::Ack,
             CompletionMode::Collect => {
                 let _ = completion.send(Err(GatewayError::InvalidMessage(
@@ -1455,6 +1455,7 @@ impl AgentActor {
             correlation: EventCorrelation::default(),
             semantic: Some(EventPayload::Motd(motd.clone())),
             wire: None,
+            mentions_me: false,
         });
         self.notify_resources(&["motd", "state", "events"]);
     }
@@ -1567,6 +1568,7 @@ impl AgentActor {
         let projection = project(&message, &self.isupport);
         let class = EventClass::from(projection.class);
         let target = message.params.first().cloned();
+        let mentions_me = self.addresses_me(&projection);
         let event = NewEvent {
             agent_id: self.id.clone(),
             direction: EventDirection::Inbound,
@@ -1579,6 +1581,7 @@ impl AgentActor {
             correlation,
             semantic: Some(EventPayload::Irc(projection.clone())),
             wire: Some(message.clone()),
+            mentions_me,
         };
         match self.journal.push(event) {
             Ok(cursor) => {
@@ -1690,6 +1693,7 @@ impl AgentActor {
             },
             semantic: (!awaits_echo).then_some(EventPayload::Irc(projection)),
             wire: Some(wire),
+            mentions_me: false,
         };
         if self.journal.push(event).is_ok() {
             self.notify_resources(&["events"]);
@@ -1717,6 +1721,7 @@ impl AgentActor {
             correlation: EventCorrelation::default(),
             semantic: Some(semantic),
             wire: None,
+            mentions_me: false,
         };
         if self.journal.push(event).is_ok() {
             self.notify_resources(&["events"]);
@@ -1746,6 +1751,7 @@ impl AgentActor {
                 state: connection,
             })),
             wire: None,
+            mentions_me: false,
         };
         let _ = self.journal.push(event);
         self.notify_resources(&["status", "state", "events"]);
@@ -1778,6 +1784,7 @@ impl AgentActor {
             correlation: EventCorrelation::default(),
             semantic: Some(EventPayload::Motd(motd.clone())),
             wire: None,
+            mentions_me: false,
         };
         let _ = self.journal.push(event);
         self.notify_resources(&["status", "state", "motd", "protocol", "events"]);
@@ -1941,6 +1948,7 @@ impl AgentActor {
         let now = Timestamp::now();
         let mut session = DccSession::offered(DccKind::Chat, DccDirection::Outbound, &peer, now);
         session.reverse = reverse;
+        let mut ordinary_listener = None;
         let offer = if reverse {
             let token = uuid::Uuid::new_v4().simple().to_string();
             session.token = Some(token.clone());
@@ -1952,10 +1960,7 @@ impl AgentActor {
         } else {
             let listener = bind_listener(&self.config.dcc, &self.config.irc).await?;
             session.endpoint = Some(listener.advertised_endpoint);
-            self.spawn_chat_connection(
-                session.id.clone(),
-                accept_direct(listener.listener, self.dcc_connect_timeout()),
-            );
+            ordinary_listener = Some(listener.listener);
             DccOffer::Chat {
                 address: encode_address(listener.advertised_endpoint.ip()),
                 port: listener.advertised_endpoint.port(),
@@ -1971,6 +1976,14 @@ impl AgentActor {
                 .fail(&session.id, error.to_string(), Timestamp::now());
             self.cancel_dcc_runtime(&session.id);
             return Err(error);
+        }
+        // Start the deadline only after the IRC offer is written so the peer
+        // receives the complete configured acceptance window.
+        if let Some(listener) = ordinary_listener {
+            self.spawn_chat_connection(
+                session.id.clone(),
+                accept_offer(listener, offer_accept_timeout(&self.config.dcc)),
+            );
         }
         self.notify_dcc_change(EventClass::DccChatOffered, &session);
         Ok(session)
@@ -2002,15 +2015,7 @@ impl AgentActor {
     ) -> Result<DccSession> {
         validate_peer(&peer)?;
         self.dcc.ensure_capacity().map_err(dcc_manager_error)?;
-        let metadata = tokio::fs::metadata(&source_path)
-            .await
-            .map_err(|source| GatewayError::io("inspect DCC source", source))?;
-        if !metadata.is_file() {
-            return Err(GatewayError::Dcc(format!(
-                "DCC source is not a regular file: {}",
-                source_path.display()
-            )));
-        }
+        let metadata = dcc_source_metadata(&source_path).await?;
         let filename = advertised_filename.unwrap_or_else(|| {
             source_path
                 .file_name()
@@ -2025,6 +2030,7 @@ impl AgentActor {
         session.filename = Some(filename.clone());
         session.local_path = Some(source_path.clone());
         session.total_bytes = Some(metadata.len());
+        let mut ordinary_listener = None;
         let offer = if reverse {
             let token = uuid::Uuid::new_v4().simple().to_string();
             session.token = Some(token.clone());
@@ -2038,15 +2044,7 @@ impl AgentActor {
         } else {
             let listener = bind_listener(&self.config.dcc, &self.config.irc).await?;
             session.endpoint = Some(listener.advertised_endpoint);
-            let (resume_tx, resume_rx) = watch::channel(0);
-            self.dcc_resume_offsets
-                .insert(session.id.clone(), resume_tx);
-            self.spawn_send_transfer(
-                session.id.clone(),
-                accept_direct(listener.listener, self.dcc_connect_timeout()),
-                source_path,
-                resume_rx,
-            );
+            ordinary_listener = Some(listener.listener);
             DccOffer::Send {
                 filename,
                 address: encode_address(listener.advertised_endpoint.ip()),
@@ -2064,6 +2062,19 @@ impl AgentActor {
                 .fail(&session.id, error.to_string(), Timestamp::now());
             self.cancel_dcc_runtime(&session.id);
             return Err(error);
+        }
+        // Start the deadline only after the IRC offer is written so the peer
+        // receives the complete configured acceptance window.
+        if let Some(listener) = ordinary_listener {
+            let (resume_tx, resume_rx) = watch::channel(0);
+            self.dcc_resume_offsets
+                .insert(session.id.clone(), resume_tx);
+            self.spawn_send_transfer(
+                session.id.clone(),
+                accept_offer(listener, offer_accept_timeout(&self.config.dcc)),
+                source_path,
+                resume_rx,
+            );
         }
         self.notify_dcc_change(EventClass::DccTransferOffered, &session);
         Ok(session)
@@ -2140,7 +2151,7 @@ impl AgentActor {
             DccKind::Chat => match stream {
                 DirectSetup::Accept(listener) => self.spawn_chat_connection(
                     request.session_id.clone(),
-                    accept_direct(listener, self.dcc_connect_timeout()),
+                    accept_offer(listener, offer_accept_timeout(&self.config.dcc)),
                 ),
                 DirectSetup::Connect(endpoint) => self.spawn_chat_connection(
                     request.session_id.clone(),
@@ -2153,7 +2164,7 @@ impl AgentActor {
                 match stream {
                     DirectSetup::Accept(listener) => self.spawn_receive_transfer(
                         request.session_id.clone(),
-                        accept_direct(listener, self.dcc_connect_timeout()),
+                        accept_offer(listener, offer_accept_timeout(&self.config.dcc)),
                         destination,
                         request.conflict,
                         expected,
@@ -2995,11 +3006,22 @@ impl AgentActor {
             correlation: EventCorrelation::default(),
             semantic: Some(semantic),
             wire: None,
+            mentions_me: false,
         };
         if self.journal.push(event).is_ok() {
             self.notify_resources(&["events"]);
             self.flush_event_reads(false);
         }
+    }
+
+    /// Whether an inbound projection is addressed to this agent's current
+    /// nickname. Returns false before registration, when no nickname is known.
+    fn addresses_me(&self, projection: &crate::irc::semantic::SemanticProjection) -> bool {
+        let state = self.state.borrow();
+        let Some(nickname) = state.identity.nickname.as_deref() else {
+            return false;
+        };
+        addresses_nickname(&projection.event, nickname, self.isupport.case_mapping())
     }
 
     fn dcc_connect_timeout(&self) -> Duration {
@@ -3079,6 +3101,19 @@ enum ConnectionExit {
 enum DirectSetup {
     Accept(tokio::net::TcpListener),
     Connect(SocketAddr),
+}
+
+async fn dcc_source_metadata(source_path: &std::path::Path) -> Result<std::fs::Metadata> {
+    let metadata = tokio::fs::metadata(source_path).await.map_err(|source| {
+        GatewayError::io("inspect DCC source_path on the gateway host", source)
+    })?;
+    if !metadata.is_file() {
+        return Err(GatewayError::Dcc(format!(
+            "DCC source_path on the gateway host is not a regular file: {}",
+            source_path.display()
+        )));
+    }
+    Ok(metadata)
 }
 
 async fn confined_dcc_destination(
@@ -3222,6 +3257,21 @@ mod tests {
             confined_dcc_destination(&root, std::path::Path::new("../escape.txt"))
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dcc_send_source_errors_name_the_gateway_host() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let missing = directory.path().join("missing.bin");
+        let error = dcc_source_metadata(&missing)
+            .await
+            .expect_err("missing source must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("source_path on the gateway host")
         );
     }
 

@@ -47,7 +47,9 @@ max_sessions = 16
 max_offers_per_peer = 4
 transfer_buffer_bytes = 65536
 max_transfer_bytes = 1073741824
+# Retain incoming offers and listener-backed outbound offers for this long.
 offer_ttl_ms = 120000
+# Bound active TCP connects to endpoints advertised by peers.
 connect_timeout_ms = 15000
 idle_timeout_ms = 300000
 automatic_accept_chat = false

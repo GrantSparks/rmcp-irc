@@ -27,6 +27,19 @@ use crate::{
     mcp::resources::ResourceUris,
 };
 
+/// Amount of redundant protocol detail included directly in a tool result.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultDetail {
+    /// Return the authoritative presentation/event form once, or retain
+    /// lossless command replies with their duplicate semantic projection null.
+    #[default]
+    Compact,
+    /// Retain every legacy raw and semantic projection directly in the tool
+    /// result, even when equivalent data is repeated.
+    Full,
+}
+
 /// Tool names exposed by the service. `irc.execute` covers other IRC commands.
 #[cfg(test)]
 pub const TOOL_NAMES: &[&str] = &[
@@ -69,6 +82,11 @@ pub struct ConnectInput {
     /// defaults.
     #[serde(default)]
     pub channels: Vec<ChannelName>,
+    /// Result detail: `compact` (default) keeps the MOTD text but omits its
+    /// duplicate line array and raw numerics; `full` returns the legacy
+    /// lossless MOTD inline. The linked MOTD resource is always complete.
+    #[serde(default)]
+    pub result_detail: ToolResultDetail,
 }
 
 /// Successful initial guest registration.
@@ -82,10 +100,13 @@ pub struct ConnectOutput {
     pub nickname_adjusted: bool,
     /// Always true for a successful result.
     pub registered: bool,
-    /// Complete initial MOTD in lossless and presentation forms.
+    /// Initial MOTD in the requested detail; joined presentation text is
+    /// always retained and the linked resource is always lossless.
     pub motd: MotdState,
     /// Stable links for subsequent reads.
     pub resources: ResourceUris,
+    /// Detail actually included in this result.
+    pub result_detail: ToolResultDetail,
 }
 
 /// Input for an operation on one agent.
@@ -94,6 +115,11 @@ pub struct ConnectOutput {
 pub struct AgentInput {
     /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
+    /// Result detail: `compact` (default) keeps one MOTD text representation
+    /// in state but omits duplicate lines and raw numerics; `full` returns the
+    /// legacy state inline. The linked MOTD resource is always complete.
+    #[serde(default)]
+    pub result_detail: ToolResultDetail,
 }
 
 /// Clean actor shutdown request.
@@ -132,6 +158,8 @@ pub struct StatusOutput {
     pub events: crate::agent::journal::JournalStats,
     /// Stable links for follow-up reads.
     pub resources: ResourceUris,
+    /// Detail actually included in this result.
+    pub result_detail: ToolResultDetail,
 }
 
 /// Join one channel.
@@ -148,6 +176,10 @@ pub struct JoinInput {
     /// configured maximum, 30000 by default; anything else is rejected.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// Result detail: `full` (default) retains lossless replies and their
+    /// semantic projection; `compact` sets the duplicate projection to null.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
 }
 
 /// Join result with a stable channel resource link.
@@ -175,6 +207,10 @@ pub struct PartInput {
     /// configured maximum, 30000 by default; anything else is rejected.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// Result detail: `full` (default) retains lossless replies and their
+    /// semantic projection; `compact` sets the duplicate projection to null.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
 }
 
 /// Kind accepted by `irc.send`.
@@ -233,6 +269,11 @@ pub struct SendInput {
     /// configured maximum, 30000 by default; anything else is rejected.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// Result detail for every line: `full` (default) retains lossless replies
+    /// and their semantic projection; `compact` sets the duplicate projection
+    /// to null.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
 }
 
 /// Result of sending one logical message, which may require several lines.
@@ -306,6 +347,12 @@ pub struct HistoryInput {
     /// configured maximum, 30000 by default; anything else is rejected.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// Result detail: `compact` (default) returns history records in `events`
+    /// without repeating successful command replies and projections;
+    /// `full` retains the legacy duplicates. Failed commands always retain
+    /// their diagnostic replies.
+    #[serde(default)]
+    pub result_detail: ToolResultDetail,
 }
 
 /// Quality of history support used for this request.
@@ -329,6 +376,9 @@ pub struct HistoryOutput {
     pub result: Option<CommandResult>,
     /// History events projected from the reply batch.
     pub events: Vec<crate::agent::journal::IrcEvent>,
+    /// Detail actually included in this result. This is `full` after a command
+    /// failure because diagnostic replies are never discarded.
+    pub result_detail: ToolResultDetail,
 }
 
 /// Typed common server query.
@@ -447,6 +497,10 @@ pub struct QueryInput {
     /// configured maximum, 30000 by default; anything else is rejected.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// Result detail: `full` (default) retains lossless replies and their
+    /// semantic projection; `compact` sets the duplicate projection to null.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
 }
 
 /// Completion behavior requested from `irc.execute`.
@@ -486,6 +540,10 @@ pub struct ExecuteInput {
     /// configured maximum, 30000 by default; anything else is rejected.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// Result detail: `full` (default) retains lossless replies and their
+    /// semantic projection; `compact` sets the duplicate projection to null.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
 }
 
 /// Cursor-based event read and optional long poll.
@@ -495,7 +553,9 @@ pub struct EventsReadInput {
     /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// Last cursor consumed by this caller: pass back the `next_cursor` from
-    /// the previous read. Omit it to start at the oldest retained event.
+    /// the previous read. Omit it to start at the oldest retained event. The
+    /// cursor advances only over events actually returned, so narrowing or
+    /// changing the filter between reads never skips anything.
     pub cursor: Option<EventCursor>,
     /// Maximum ordered events returned.
     #[serde(default = "default_event_limit")]
@@ -516,6 +576,11 @@ pub struct EventsReadInput {
     pub origin: Option<EventOrigin>,
     /// Optional detail-level filter.
     pub verbosity: Option<EventVerbosity>,
+    /// Set true to return only events addressed to this agent — a private
+    /// message or notice sent to it, or a channel message naming its current
+    /// nickname. The agent's own echoed messages never qualify. Set false to
+    /// return only everything else; omit for both.
+    pub mentions_me: Option<bool>,
 }
 
 impl EventsReadInput {
@@ -528,6 +593,7 @@ impl EventsReadInput {
             direction: self.direction,
             origin: self.origin,
             verbosity: self.verbosity,
+            mentions_me: self.mentions_me,
         }
     }
 }
@@ -658,4 +724,8 @@ pub const fn default_timeout_ms() -> u64 {
 /// Default event page size.
 pub const fn default_event_limit() -> usize {
     100
+}
+
+const fn default_full_result_detail() -> ToolResultDetail {
+    ToolResultDetail::Full
 }

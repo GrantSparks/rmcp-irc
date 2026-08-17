@@ -452,6 +452,16 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_reject_and_cancel_are_not_fabricated_dcc_variants() {
+        for body in ["REJECT SEND report.txt 5000", "CANCEL CHAT 5000"] {
+            assert!(matches!(
+                DccOffer::parse(body),
+                Err(DccNegotiationError::UnsupportedVariant(_))
+            ));
+        }
+    }
+
+    #[test]
     fn numeric_ipv4_is_network_order() {
         assert_eq!(
             parse_address("2130706433").expect("address"),
