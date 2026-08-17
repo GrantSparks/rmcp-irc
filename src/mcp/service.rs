@@ -107,8 +107,23 @@ const PROMPT_NAMES: &[&str] = &[
     "irc-summarize-respond",
 ];
 
-/// The single MCP revision this server implements.
-const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
+/// MCP revisions this server will serve, preferred revision first.
+///
+/// The whole design targets `2026-07-28`: per-request declarations, no session,
+/// tasks, and input round trips. But version negotiation is exact-match — a
+/// server that lists only its preferred revision answers *every* older client
+/// with `2026-07-28`, and a client that speaks the `initialize` lifecycle then
+/// sends ordinary requests carrying none of the `_meta` that revision requires
+/// and is refused on its first call. Listing the two session-lifecycle
+/// revisions in current use makes the handshake honest instead: such a client
+/// negotiates a revision it can actually speak, and gets the base surface,
+/// because features here are enabled by what a request declares rather than by
+/// the version on it.
+const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2026_07_28,
+    ProtocolVersion::V_2025_11_25,
+    ProtocolVersion::V_2025_06_18,
+];
 
 /// Tools that can be run as MCP tasks.
 ///
@@ -2525,15 +2540,18 @@ impl ServerHandler for IrcMcpService {
         .with_instructions(MCP_INSTRUCTIONS)
     }
 
-    /// This server speaks exactly one protocol revision.
+    /// The revisions negotiation may agree to, preferred first.
     ///
-    /// Everything it exposes assumes the stateless request model: identity and
-    /// capabilities arrive per request, cross-request state is named by an
-    /// explicit handle, and there is no handshake to remember. Advertising an
-    /// older revision would promise a lifecycle none of that implements, so the
-    /// narrower list is the honest one — and it is what makes a per-request
-    /// version outside the set an explicit `-32022` instead of a request served
-    /// under assumptions the caller does not share.
+    /// Everything this server exposes assumes the stateless request model:
+    /// identity and capabilities arrive per request, cross-request state is
+    /// named by an explicit handle, and there is no handshake to remember. That
+    /// model is what `2026-07-28` describes, and it stays the preferred
+    /// revision. The two session-lifecycle revisions behind it are here so a
+    /// client that speaks only those negotiates one of them rather than being
+    /// told `2026-07-28` and then refused for the per-request metadata its own
+    /// revision never defined; a request declaring anything outside the set is
+    /// still an explicit `-32022` rather than one served under assumptions the
+    /// caller does not share. See [`SUPPORTED_PROTOCOL_VERSIONS`].
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
         std::borrow::Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
@@ -5027,16 +5045,33 @@ mod tests {
     }
 
     #[test]
-    fn the_server_speaks_only_the_stateless_protocol_revision() {
+    fn the_server_prefers_the_stateless_revision_and_still_answers_session_clients() {
         let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
         assert_eq!(
             service.supported_protocol_versions().as_ref(),
-            [ProtocolVersion::V_2026_07_28]
+            [
+                ProtocolVersion::V_2026_07_28,
+                ProtocolVersion::V_2025_11_25,
+                ProtocolVersion::V_2025_06_18,
+            ],
+            "negotiation is exact-match, so every revision a current client asks \
+             for must be listed or that client is answered with one it cannot speak"
         );
         assert_eq!(
             service.get_info().protocol_version,
             ProtocolVersion::V_2026_07_28,
-            "the advertised version must match what the handler will accept"
+            "the preferred version is the one this server is designed around"
+        );
+        assert_eq!(
+            service.supported_protocol_versions().first(),
+            Some(&service.get_info().protocol_version),
+            "the fallback a client is offered must be the preferred revision"
+        );
+        assert!(
+            !service
+                .supported_protocol_versions()
+                .contains(&ProtocolVersion::V_2025_03_26),
+            "the pre-elicitation revisions promise a surface this server does not have"
         );
     }
 

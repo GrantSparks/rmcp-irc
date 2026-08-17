@@ -9,9 +9,12 @@
 //! through it in-process, so a regression in the request envelope is a failing
 //! test rather than a client that cannot connect.
 //!
-//! Every request here is a complete 2026-07-28 request: no session header, the
-//! `MCP-Protocol-Version` header matching `_meta`, `Mcp-Method` (and `Mcp-Name`
-//! where the method carries one), and both required `_meta` fields.
+//! Unless a test is about what happens without one, every request here is a
+//! complete 2026-07-28 request: no session header, the `MCP-Protocol-Version`
+//! header matching `_meta`, `Mcp-Method` (and `Mcp-Name` where the method
+//! carries one), and both required `_meta` fields. The exception worth naming is
+//! [`a_client_that_negotiates_through_initialize_is_served`], which sends what a
+//! session-lifecycle client sends instead.
 
 use std::{str::FromStr, sync::Arc, time::Duration};
 
@@ -424,7 +427,9 @@ async fn scheduled_attention_checks_are_ordinary_strict_stateless_requests() {
 
 #[tokio::test]
 async fn a_request_declaring_another_protocol_version_is_refused() {
-    let legacy = ProtocolVersion::V_2025_11_25.as_str();
+    // Old enough that this server has none of what it promises: no elicitation
+    // to answer an input round with, and no structured tool output.
+    let legacy = ProtocolVersion::V_2025_03_26.as_str();
     let mut envelope = Envelope::new("resources/list").with_meta(Some(serde_json::json!({
         "io.modelcontextprotocol/protocolVersion": legacy,
         "io.modelcontextprotocol/clientCapabilities": {},
@@ -435,6 +440,46 @@ async fn a_request_declaring_another_protocol_version_is_refused() {
     assert_eq!(
         body["error"]["code"], -32022,
         "an unsupported version must say so rather than be served under other assumptions: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_client_that_negotiates_through_initialize_is_served() {
+    // Codex, and every other host still on the `initialize` lifecycle, asks for
+    // an older revision and then sends ordinary requests carrying no `_meta` at
+    // all. Answering such a handshake with `2026-07-28` stranded it: the first
+    // call after the handshake was refused for metadata its own revision never
+    // defined, which the client reports as a server that failed to start.
+    let router = router(CallerPolicy::Local);
+    let mut handshake = Envelope::new("initialize").with_meta(None);
+    handshake.params = serde_json::json!({
+        "protocolVersion": ProtocolVersion::V_2025_06_18.as_str(),
+        "capabilities": { "elicitation": { "form": {}, "url": {} } },
+        "clientInfo": { "name": "codex-mcp-client", "version": "0.0.0" },
+    });
+    handshake.protocol_version_header = None;
+    let (status, body) = send(&router, handshake).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["protocolVersion"],
+        ProtocolVersion::V_2025_06_18.as_str(),
+        "negotiation must land on a revision the client actually speaks: {body}"
+    );
+
+    // What the client sends next: the negotiated revision in the header, and
+    // nothing in `_meta` but the progress token it opted in with.
+    let mut listing = Envelope::new("tools/list").with_meta(Some(serde_json::json!({
+        "progressToken": 0,
+    })));
+    listing.protocol_version_header = Some(ProtocolVersion::V_2025_06_18.as_str().to_owned());
+    let (status, body) = send(&router, listing).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert!(body["error"].is_null(), "{body}");
+    assert!(
+        body["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "a client that negotiated an older revision still gets the tool surface: {body}"
     );
 }
 
@@ -2125,8 +2170,13 @@ async fn server_discover_reports_this_servers_capabilities_and_the_revision_it_s
     let result = &body["result"];
     assert_eq!(
         result["supportedVersions"],
-        serde_json::json!([VERSION]),
-        "this server serves exactly one revision, and says so: {body}"
+        serde_json::json!([
+            VERSION,
+            ProtocolVersion::V_2025_11_25.as_str(),
+            ProtocolVersion::V_2025_06_18.as_str(),
+        ]),
+        "discovery names the preferred revision first and the session-lifecycle \
+         revisions negotiation may still agree to: {body}"
     );
     for capability in ["tools", "resources", "prompts", "completions"] {
         assert!(

@@ -8,6 +8,45 @@ The stdio and Streamable HTTP transports expose the same service, tools,
 resources, schemas, event model, and error semantics. An MCP transport
 connection is never an IRC identity.
 
+## Protocol revisions
+
+This service is designed around MCP `2026-07-28`: identity and capabilities are
+read per request from `_meta`, no session is minted or read, and features are
+enabled by what a request declares. That is the preferred revision, and a client
+that speaks it gets the whole surface.
+
+Negotiation is exact-match, so `2025-11-25` and `2025-06-18` are also offered —
+a client that speaks only the `initialize` lifecycle negotiates one of those
+instead of being handed `2026-07-28` and then refused on its first ordinary
+call. Anything older is declined, and a request whose `_meta` declares a
+revision outside the offered set is refused with `-32022`.
+
+What a client that negotiated `2025-11-25` or `2025-06-18` gets is the base
+surface: tools, resources, prompts, completions, progress notifications, and the
+full two-branch result envelope in `structuredContent`. What it does not get is
+everything keyed to a per-request declaration or to `2026-07-28` itself:
+
+- **No tasks.** `irc.dcc.send` and `irc.dcc.accept` run inline for the life of
+  the call, reporting progress, instead of returning a task handle.
+- **No input round trips.** The four flows under [Input round
+  trips](#input-round-trips) take their fallback instead: a structured error,
+  the ordinary rejection, or a refusal. With `mcp.confirm_destructive` enabled,
+  `irc.kick` and `irc.message.redact` are refused rather than confirmed, so
+  leave it off for such a client or drive those operations from one that
+  declares `elicitation`.
+- **No top-level MRTR fields.** Results carry no `resultType`, `ttlMs`, or
+  `cacheScope`; the payload itself is unchanged.
+- **No asynchronous notifications.** `subscriptions/listen` is refused below
+  `2026-07-28`, and the older `resources/subscribe` is not implemented here, so
+  event delivery is the polling path described under [`irc.attention.open` and
+  `irc.attention.check`](#ircattentionopen-and-ircattentioncheck) — already the
+  documented fallback for hosts a notification cannot resume. `server/discover`
+  is likewise `2026-07-28` only.
+
+A declaration is per request, never per connection, so these are properties of
+each call: the same client can send a complete `2026-07-28` request and get the
+full surface for it.
+
 ## General conventions
 
 - Tool names are stable and are not generated from the connected server's

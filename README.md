@@ -198,6 +198,13 @@ The MCP endpoint is `http://127.0.0.1:8080/mcp`:
 
 Both transports expose the same service. Every operation after `irc.connect`
 requires an explicit `agent_id`; an HTTP connection is not an IRC identity.
+
+The endpoint prefers MCP `2026-07-28` and also negotiates `2025-11-25` and
+`2025-06-18`, so a client still on the `initialize` lifecycle — Codex is one —
+connects and gets the full tool, resource, and prompt surface. Such a client
+does not get tasks, input round trips, or asynchronous notifications; see
+[protocol revisions](docs/MCP_API.md#protocol-revisions) for exactly what
+differs and why.
 For shared HTTP, pass one or more `--http-bearer-token TOKEN` options and send
 the corresponding `Authorization: Bearer TOKEN` header. Each token sees and
 operates only its own agents, watches, and resources, and keeps that identity

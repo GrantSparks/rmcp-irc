@@ -7,6 +7,11 @@
 //! response from *those* declarations. [`RequestProfile`] is that reading, taken
 //! once per request.
 //!
+//! A client that negotiated an older revision declares nothing per request and
+//! so reads as an empty profile. That is deliberate: nothing in this process
+//! remembers a handshake, so an empty profile means the base surface rather than
+//! a capability inferred from something said earlier on another request.
+//!
 //! Two constraints shape this module.
 //!
 //! The first is a correctness trap in the SDK. Inbound `_meta` is hoisted out of
@@ -64,10 +69,12 @@ impl RequestProfile {
 
     /// Whether the request carried every `_meta` field 2026-07-28 requires.
     ///
-    /// False means the request is not self-describing. The transport and the
-    /// SDK already reject those before dispatch, so a handler seeing `false`
-    /// is looking at a legacy or hand-rolled caller and should not infer
-    /// support for anything.
+    /// False means the request is not self-describing. A request that *claims*
+    /// 2026-07-28 and omits the rest is rejected before dispatch, so a handler
+    /// seeing `false` is looking at a caller that negotiated an older revision
+    /// through `initialize`, or a hand-rolled one, and should not infer support
+    /// for anything: capabilities a handshake declared are not this request's
+    /// declarations.
     pub fn declares_required_metadata(&self) -> bool {
         self.required_metadata_present
     }

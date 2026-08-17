@@ -9,14 +9,21 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Changed
 
-- The gateway now serves MCP protocol revision `2026-07-28` exclusively. Client
+- The gateway is now built around MCP protocol revision `2026-07-28`. Client
   identity and capabilities are evaluated per request from `_meta`
   (`io.modelcontextprotocol/protocolVersion`, `clientCapabilities`); there is no
-  session lifecycle, `Mcp-Session-Id` is never read or minted, and Streamable
-  HTTP enforces the revision's request-metadata and header requirements. On
-  unauthenticated trusted HTTP (loopback, or the explicit network opt-in) all
-  callers share the one local owner; bearer tokens remain the durable principal
-  for shared endpoints. (#10)
+  session lifecycle, `Mcp-Session-Id` is never read or minted, and a request
+  that declares `2026-07-28` must carry that revision's request metadata and
+  headers. Negotiation also offers `2025-11-25` and `2025-06-18` so a client on
+  the `initialize` lifecycle is served the base surface — tools, resources,
+  prompts, completions, progress — instead of being answered with a revision it
+  cannot speak and refused on its first call; tasks, input round trips,
+  `subscriptions/listen`, `server/discover`, and the top-level MRTR fields
+  remain available only to requests that declare them. See
+  [protocol revisions](docs/MCP_API.md#protocol-revisions). On unauthenticated
+  trusted HTTP (loopback, or the explicit network opt-in) all callers share the
+  one local owner; bearer tokens remain the durable principal for shared
+  endpoints. (#10)
 - Watch reads are idempotent and event positions are wholly caller-owned. (#9)
   `irc://watches/{watch_id}` is now an immutable filter/health descriptor —
   host-initiated re-reads consume nothing. Events are consumed through
