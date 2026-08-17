@@ -25,21 +25,27 @@ breaking changes to the CLI, configuration, or MCP surface.
   `irc://watches/{watch_id}/events/after/{stream_id}/{sequence}` resource
   template. Event pages report honest `has_more`, watch handles are bounded per
   owner (`limits.max_watches_per_owner`) and expire when unused
-  (`limits.watch_ttl_ms`), and `irc.watch.create` returns the stream's latest
-  cursor so consumption can start from "now".
+  (`limits.watch_ttl_ms`) — delivering a match counts as use, and a lapsed
+  watch announces its retirement with one final resource-updated notification —
+  and `irc.watch.create` returns the stream's latest cursor so consumption can
+  start from "now".
 - DCC transfers become MCP tasks by server direction: a request that declares
   the `io.modelcontextprotocol/tasks` extension in its `_meta` client
   capabilities receives a task handle for `irc.dcc.send`/`irc.dcc.accept`; the
   per-call metadata opt-in is gone. One process-wide, owner-bound task ledger
   backs `tasks/get`/`tasks/update`/`tasks/cancel` across stateless HTTP
   requests; another owner's task id answers exactly like an unknown one, and
-  tasks do not survive process restart. (#7)
+  tasks do not survive process restart. A tool-level failure — including the
+  agent disconnecting mid-transfer — settles the task as `completed` with an
+  error result; `failed` is reserved for protocol faults. (#7)
 - Every tool result is one schema-declared envelope discriminated by `ok`:
   successes carry the tool's output under `result`, failures carry the shared
   `error` shape (kind, message, retriability, and the correlated command result
   or DCC root listing when one exists), and each tool's advertised
   `outputSchema` is a closed `oneOf` of exactly those two branches — so error
-  results now conform to the schema they are returned under. (#5)
+  results now conform to the schema they are returned under. A partially
+  delivered multi-line `irc.send` failure retains the delivered lines'
+  correlated results and message ids. (#5)
 - The delivery-contract documentation states the accurate protocol position:
   resource notifications and `subscriptions/listen` wake the host application
   but cannot force or schedule a model turn; server-initiated sampling is
@@ -49,6 +55,11 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Added
 
+- Subscription-backed model attention. `irc.attention.open` tells the host how
+  to merge an agent's watch and lifecycle resources into one
+  `subscriptions/listen` stream and provides a provider-neutral one-minute
+  model wake-up fallback, closing the gap between host wake-ups and model
+  turns from the host's side of the contract.
 - Multi round-trip input requests. Where a call needs a time-bounded human
   decision and the request declared form elicitation, the tool returns
   `resultType: "input_required"` with a form and an integrity-protected
@@ -57,9 +68,10 @@ breaking changes to the CLI, configuration, or MCP surface.
   destination (receive root and relative path), nickname choice on collision
   under the new `elicit` conflict policy, channel key on `ERR_BADCHANNELKEY`,
   and — when `[mcp] confirm_destructive` is enabled — confirmation of
-  `irc.kick` and `irc.message.redact`. Declining, expiry, or a tampered state
-  refuses in-band and leaves the underlying action unapplied; input is resolved
-  before any task is created. (#6)
+  `irc.kick` and `irc.message.redact`, each confirmation redeemable exactly
+  once. Declining, expiry, or a tampered state refuses in-band and leaves the
+  underlying action unapplied; input is resolved before any task is created.
+  (#6)
 - Named DCC receive roots. `[[dcc.receive_roots]]` declares the directories
   incoming files may land in; `download_directory` seeds the default root.
   `irc.dcc.accept` takes a root name plus a relative destination, and
