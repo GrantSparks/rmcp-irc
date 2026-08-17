@@ -202,7 +202,8 @@ requires an explicit `agent_id`; an HTTP connection is not an IRC identity.
 The endpoint prefers MCP `2026-07-28` and also negotiates `2025-11-25` and
 `2025-06-18`, so a client still on the `initialize` lifecycle — Codex is one —
 connects and gets the full tool, resource, and prompt surface. Such a client
-does not get tasks, input round trips, or asynchronous notifications; see
+does not get tasks, input round trips, asynchronous notifications, or native
+`resource_link` content blocks (the same URIs remain in structured output); see
 [protocol revisions](docs/MCP_API.md#protocol-revisions) for exactly what
 differs and why.
 For shared HTTP, pass one or more `--http-bearer-token TOKEN` options and send

@@ -36,6 +36,10 @@ everything keyed to a per-request declaration or to `2026-07-28` itself:
   declares `elicitation`.
 - **No top-level MRTR fields.** Results carry no `resultType`, `ttlMs`, or
   `cacheScope`; the payload itself is unchanged.
+- **No native resource-link content blocks.** Stable resource URIs remain in
+  each tool's `structuredContent`, but `resource_link` blocks are omitted
+  because session-lifecycle bridges in current Codex releases reject that
+  otherwise valid content variant instead of returning the tool result.
 - **No asynchronous notifications.** `subscriptions/listen` is refused below
   `2026-07-28`, and the older `resources/subscribe` is not implemented here, so
   event delivery is the polling path described under [`irc.attention.open` and
@@ -62,9 +66,12 @@ full surface for it.
   under `error`. The structured result is authoritative, and every tool's
   advertised `outputSchema` is a `oneOf` over exactly those two branches, so a
   failure is as conformant as a success. Tools that expose a follow-up resource
-  append native MCP `resource_link` content blocks after the text summary;
-  clients do not need to rediscover or reinterpret a URI string before
-  attaching or subscribing to it.
+  append native MCP `resource_link` content blocks after the text summary for a
+  self-describing `2026-07-28` request; clients do not need to rediscover or
+  reinterpret a URI string before attaching or subscribing to it. Older
+  session-lifecycle clients receive the same links in `structuredContent`
+  without the native content blocks, as described under [Protocol
+  revisions](#protocol-revisions).
 - `irc.connect`, `irc.status`, and `irc.history` default `result_detail` to
   `compact` so equivalent presentation, parsed-wire, and semantic data is not
   repeated in one response. Callers that need the legacy inline forms can set

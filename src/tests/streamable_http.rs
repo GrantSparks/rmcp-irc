@@ -484,6 +484,31 @@ async fn a_client_that_negotiates_through_initialize_is_served() {
 }
 
 #[tokio::test]
+async fn a_session_lifecycle_client_receives_connect_without_native_resource_links() {
+    let server = FakeErgo::spawn().await;
+    let router = router_for(Arc::new(Gateway::new(server.config())), CallerPolicy::Local);
+    let mut connect =
+        Envelope::tool_call("irc.connect", serde_json::json!({ "nickname": "Ariadne" }))
+            .with_meta(Some(serde_json::json!({ "progressToken": 0 })));
+    connect.protocol_version_header = Some(ProtocolVersion::V_2025_06_18.as_str().to_owned());
+
+    let (status, body) = send(&router, connect).await;
+
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["structuredContent"]["ok"], true, "{body}");
+    assert!(
+        body["result"]["structuredContent"]["result"]["resources"]["status"].is_string(),
+        "structured resource URIs remain available: {body}"
+    );
+    assert!(
+        body["result"]["content"]
+            .as_array()
+            .is_some_and(|content| content.iter().all(|block| block["type"] != "resource_link")),
+        "the legacy client must not receive the content variant it cannot decode: {body}"
+    );
+}
+
+#[tokio::test]
 async fn a_session_header_changes_nothing() {
     // `Mcp-Session-Id` was removed from the protocol. A modern server must
     // ignore it, so the same request must behave identically with and without.

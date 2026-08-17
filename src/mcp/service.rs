@@ -2610,6 +2610,15 @@ impl ServerHandler for IrcMcpService {
         let mut response = self.tool_router.call(call).await?;
         if let CallToolResponse::Complete(result) = &mut response {
             adopt_unstructured(result);
+            // Session-lifecycle clients do not restate their negotiated
+            // capabilities per request. In particular, Codex's 2025-06-18
+            // bridge rejects otherwise valid tool results containing native
+            // `resource_link` blocks as an unexpected response type. Every
+            // linked URI is also present in structuredContent, so retain the
+            // richer blocks only for a self-describing modern request.
+            if !profile.declares_required_metadata() {
+                remove_native_resource_links(result);
+            }
             if carries_activity_hint {
                 self.hint_at_activity(agent_id.as_ref(), result).await;
             }
@@ -4881,6 +4890,12 @@ fn resource_link(uri: impl Into<String>) -> ContentBlock {
     ContentBlock::ResourceLink(crate::mcp::resources::describe(&parsed, None).into_resource())
 }
 
+fn remove_native_resource_links(result: &mut CallToolResult) {
+    result
+        .content
+        .retain(|block| !matches!(block, ContentBlock::ResourceLink(_)));
+}
+
 fn agent_resource_links(resources: &ResourceUris) -> Vec<ContentBlock> {
     resources
         .named()
@@ -5331,6 +5346,26 @@ mod tests {
         assert_eq!(
             linked_uris,
             resources.named().into_iter().map(|(_, uri)| uri).collect()
+        );
+        assert!(result.structured_content.is_some());
+    }
+
+    #[test]
+    fn legacy_result_keeps_text_and_structured_uris_without_native_links() {
+        let agent_id = crate::agent::AgentId::new();
+        let resources = ResourceUris::for_agent(&agent_id);
+        let mut result = tool_success_with_content(
+            "connected",
+            &serde_json::json!({"resources": resources}),
+            agent_resource_links(&resources),
+        );
+
+        remove_native_resource_links(&mut result);
+
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(
+            result.content[0].as_text().expect("summary text").text,
+            "connected"
         );
         assert!(result.structured_content.is_some());
     }

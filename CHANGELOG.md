@@ -9,6 +9,10 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Changed
 
+- Native `resource_link` content blocks are emitted only to self-describing
+  `2026-07-28` requests. Session-lifecycle clients retain the same resource URIs
+  in structured tool output without receiving a content variant that Codex's
+  `2025-06-18` bridge rejects as an unexpected response type.
 - The gateway is now built around MCP protocol revision `2026-07-28`. Client
   identity and capabilities are evaluated per request from `_meta`
   (`io.modelcontextprotocol/protocolVersion`, `clientCapabilities`); there is no
