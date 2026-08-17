@@ -33,15 +33,19 @@ state paths. The current request set is `batch`, `draft/chathistory` (or its
 equivalent advertised spelling), `cap-notify`, `labeled-response`,
 `message-tags`, `server-time`, `echo-message`, `account-tag`,
 `standard-replies`, `multi-prefix`, `userhost-in-names`, `extended-join`,
-`away-notify`, `account-notify`, `chghost`, `setname`, and `invite-notify`.
-SASL PLAIN is added only when configured and advertised.
+`away-notify`, `account-notify`, `chghost`, `setname`, `invite-notify`,
+`draft/message-redaction`, and `draft/read-marker`, including supported stable
+spellings when advertised. SASL PLAIN is added only when configured and
+advertised.
 
-`draft/multiline`, read markers, reactions, typing, redaction, metadata, and
-event-playback are deliberately not requested. Their exact advertisements stay
-visible as `observed_unnegotiated`; callers can still inspect unknown wire data
-and use `irc.execute` where no negotiated client behavior is required. The
-multiline draft is intentionally excluded because its published specification
-remains work in progress and recommends against production use.
+Reactions and typing are client-only message tags, not separately negotiated
+capabilities. Their typed tools require negotiated `message-tags` and honor the
+server's `CLIENTTAGDENY` policy. `draft/multiline`, metadata, and event-playback
+are deliberately not requested; their exact advertisements stay visible as
+`observed_unnegotiated`, and callers can still inspect unknown wire data or use
+`irc.execute` where no negotiated client behavior is required. The multiline
+draft is intentionally excluded because its published specification remains
+work in progress and recommends against production use.
 
 MONITOR is discovered through ISUPPORT and supported through typed read-only
 queries. CTCP ACTION/CLIENTINFO/PING/TIME/VERSION and ordinary/reverse DCC
@@ -276,8 +280,10 @@ result.
 | `server-time` | Use receipt time only with explicit local provenance; leave `server_time` absent. |
 | message IDs | Use a gateway event ID only; never present it as a server message ID. |
 | CHATHISTORY | Use Ergo `HISTORY` only as a reported `degraded` fallback; otherwise return `unavailable`. |
-| read markers | Return `unavailable`; do not emulate persistent read state. |
-| reply/reaction semantics | Reject operations requiring exact semantics instead of silently degrading to plain text. |
+| `read-marker` | Reject `irc.read.get`/`irc.read.set`; do not emulate persistent read state. |
+| `message-redaction` | Reject `irc.message.redact`; do not disguise deletion as a replacement message. |
+| `message-tags` or a permitted client-only reaction/typing tag | Reject the typed operation; do not silently degrade it to plain text. |
+| reply semantics | Reject operations requiring exact semantics instead of silently degrading to plain text. |
 | standard replies | Parse known numerics and notices through the static registry and retain raw forms. |
 | unknown advertised capability | Report `observed_unnegotiated` and do not request it automatically. |
 
@@ -290,4 +296,6 @@ commands are sent to Ergo, whose response is authoritative.
 
 This boundary permits rejecting unsafe/unrepresentable NUL, CR, LF, malformed
 tags, reserved correlation fields, invalid names, or overlong messages without
-creating a gateway authorization policy.
+inventing IRC privilege policy. Caller ownership of MCP agent/watch handles is
+a separate gateway authorization boundary and does not predict whether Ergo
+will accept an IRC command.

@@ -87,9 +87,9 @@ impl CallerPolicy {
 
     /// Identify the caller behind one request.
     ///
-    /// Fails closed: when the endpoint requires a credential, a request that
-    /// does not carry an accepted one is rejected rather than falling back to
-    /// a weaker identity.
+    /// Fails closed: a request without either an accepted configured
+    /// credential or an initialized session is rejected rather than falling
+    /// back to a weaker identity.
     pub fn identify(&self, context: &RequestContext<RoleServer>) -> Result<OwnerId, McpError> {
         let Self::Http { accepted } = self else {
             return Ok(OwnerId::local());
@@ -104,14 +104,13 @@ impl CallerPolicy {
             .map(OwnerId::from_bearer);
 
         if accepted.is_empty() {
-            // No credential is required, so callers are separated by session.
-            // Two sessions still cannot see each other's handles; they simply
-            // cannot prove a durable identity across reconnects.
-            return Ok(presented.unwrap_or_else(|| {
-                parts
-                    .and_then(session_id)
-                    .map_or_else(OwnerId::local, |session| OwnerId::from_session(&session))
-            }));
+            // No credential is required, so callers are separated strictly by
+            // their negotiated MCP session. Never fall back to the stdio-local
+            // owner here: two malformed or pre-initialization HTTP requests
+            // without a session header would otherwise collapse into the same
+            // identity. An unconfigured Authorization header is not accepted
+            // as a self-issued durable identity either.
+            return session_owner(parts);
         }
         match presented {
             Some(owner) if accepted.contains(&owner) => Ok(owner),
@@ -133,7 +132,20 @@ fn session_id(parts: &axum::http::request::Parts) -> Option<String> {
         .headers
         .get("mcp-session-id")
         .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
         .map(str::to_owned)
+}
+
+/// Resolve the fail-closed owner used by an HTTP endpoint without bearer
+/// credentials.
+fn session_owner(parts: Option<&axum::http::request::Parts>) -> Result<OwnerId, McpError> {
+    parts
+        .and_then(session_id)
+        .map(|session| OwnerId::from_session(&session))
+        .ok_or_else(|| {
+            McpError::invalid_request("this endpoint requires an initialized MCP session", None)
+        })
 }
 
 /// The error returned when a caller names a handle it does not own.
@@ -178,5 +190,26 @@ mod tests {
         // Anything more specific would let a caller probe for handles it does
         // not own.
         assert!(not_authorized("agent-1").message.contains("unknown"));
+    }
+
+    #[test]
+    fn session_only_http_fails_closed_without_a_session_header() {
+        let request = axum::http::Request::new(());
+        let (parts, _) = request.into_parts();
+        let error = session_owner(Some(&parts)).expect_err("missing session must fail");
+        assert!(error.message.contains("initialized MCP session"));
+    }
+
+    #[test]
+    fn session_only_http_uses_the_negotiated_session_as_owner() {
+        let request = axum::http::Request::builder()
+            .header("mcp-session-id", "session-a")
+            .body(())
+            .expect("request");
+        let (parts, _) = request.into_parts();
+        assert_eq!(
+            session_owner(Some(&parts)).expect("session owner"),
+            OwnerId::from_session("session-a")
+        );
     }
 }

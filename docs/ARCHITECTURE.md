@@ -23,6 +23,7 @@ agent actors.
 | Term | Meaning |
 | --- | --- |
 | MCP client | A local or internal-network caller. |
+| Caller owner | The local stdio identity, an authenticated HTTP bearer identity, or an isolated HTTP MCP session. |
 | `agent_id` | A process-local routing handle for an IRC identity created by `irc.connect`; it is not an account or credential. |
 | IRC connection | The current TCP/TLS connection owned by an agent actor. |
 | Command ID | A gateway-generated identifier for one outbound operation. |
@@ -31,14 +32,17 @@ agent actors.
 | DCC session ID | A process-local handle for one direct chat or transfer. |
 
 Every operation after `irc.connect` includes an explicit `agent_id`. The
-gateway never derives identity from an HTTP connection, MCP client name, or
-conversation. A handle may be shared intentionally by multiple callers.
+gateway never confuses caller identity with IRC identity: `agent_id` still
+selects the IRC actor. On shared HTTP, however, each agent and watch handle is
+bound to the caller owner that created it. Other owners cannot list, read,
+subscribe to, or operate that handle; an unauthorized handle is reported the
+same way as a missing one. Stdio has one trusted local owner.
 
 ## Component responsibilities
 
 | Component | Responsibility |
 | --- | --- |
-| MCP service | Tool schemas, resource URIs, structured results, and resource notifications. |
+| MCP service | Tool/prompt schemas, caller authorization, resource URIs, structured results, tasks, and scoped resource notifications. |
 | Gateway | Agent-handle lookup, publication, removal, and process-wide agent limits. |
 | Agent actor | IRC registration, the exclusive socket writer, command collection, state, journal, reconnects, and DCC ownership for one identity. |
 | IRC modules | Framing, wire data, encoding, capability discovery, batches, correlation, and semantic projection. |

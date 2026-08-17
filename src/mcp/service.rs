@@ -286,13 +286,18 @@ impl IrcMcpService {
             open_world_hint = true
         )
     )]
-    async fn irc_connect(&self, Parameters(input): Parameters<ConnectInput>) -> CallToolResult {
+    async fn irc_connect(
+        &self,
+        Parameters(input): Parameters<ConnectInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let owner = self.callers.identify(&context)?;
         let result_detail = input.result_detail;
         let request = match connect_request(input) {
             Ok(request) => request,
-            Err(error) => return tool_error(error),
+            Err(error) => return Ok(tool_error(error)),
         };
-        match self.gateway.connect(request).await {
+        Ok(match self.gateway.connect_as(owner, request).await {
             Ok(connected) => {
                 let output = ConnectOutput {
                     resources: ResourceUris::for_agent(&connected.agent_id),
@@ -318,7 +323,7 @@ impl IrcMcpService {
                 tool_success_with_content(summary, &output, content)
             }
             Err(error) => tool_error(error),
-        }
+        })
     }
 
     /// Disconnect and destroy one actor and all of its direct sessions.
@@ -2101,18 +2106,8 @@ impl ServerHandler for IrcMcpService {
             });
             return Ok(CreateTaskResult::new(task).into());
         }
-        let creates_agent = request.name == "irc.connect";
         let call = ToolCallContext::new(self, request, context);
-        let response = self.tool_router.call(call).await?;
-        // A handle only becomes reachable once it is bound to the caller that
-        // created it, so ownership is recorded before the result goes back.
-        if creates_agent
-            && let CallToolResponse::Complete(result) = &response
-            && let Some(agent_id) = created_agent_id(result)
-        {
-            self.gateway.assign_owner(&agent_id, owner).await;
-        }
-        Ok(response)
+        self.tool_router.call(call).await
     }
 
     async fn get_task(
@@ -2422,6 +2417,8 @@ impl ServerHandler for IrcMcpService {
         // A subscription outlives any one request, so the identity it was
         // opened under is the one its resynchronization is scoped to.
         let owner = self.callers.identify(context.request_context())?;
+        self.authorize_resource_subscriptions(&owner, context.accepted())
+            .await?;
         let mut updates = self.gateway.subscribe_resource_updates();
         loop {
             tokio::select! {
@@ -2430,9 +2427,10 @@ impl ServerHandler for IrcMcpService {
                     Ok(uri) if uri == "irc://agents" => {
                         let _ = context.sink().notify_resource_list_changed().await;
                     }
-                    Ok(uri) => {
+                    Ok(uri) if self.owner_may_observe_resource(&owner, &uri).await => {
                         let _ = context.sink().notify_resource_updated(uri).await;
                     }
+                    Ok(_) => {}
                     // Dropping notifications silently leaves a subscriber
                     // believing its last read is still current, which is the
                     // one failure a resource subscription must not have. Every
@@ -2452,6 +2450,54 @@ impl ServerHandler for IrcMcpService {
 }
 
 impl IrcMcpService {
+    /// Refuse subscriptions to another caller's agent or watch resource.
+    ///
+    /// The SDK acknowledges the requested filter before entering `listen`, so
+    /// this is the earliest request-context-aware authorization point. An
+    /// unauthorized filter is closed immediately and can never receive an
+    /// update. Individual broadcasts are checked again below so a shared
+    /// gateway cannot leak another owner's resource activity.
+    async fn authorize_resource_subscriptions(
+        &self,
+        owner: &OwnerId,
+        filter: &SubscriptionFilter,
+    ) -> Result<(), McpError> {
+        let Some(uris) = filter.resource_subscriptions.as_ref() else {
+            return Ok(());
+        };
+        for uri in uris {
+            if let Some(handle) = uri.strip_prefix(WATCH_URI_PREFIX) {
+                let watch_id = WatchId::from_str(handle)
+                    .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
+                self.gateway.authorize_watch(owner, &watch_id).await?;
+            } else {
+                let resource = AgentResourceUri::from_str(uri)
+                    .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
+                self.gateway
+                    .authorize_agent(owner, &resource.agent_id)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether one caller may receive an update for a stable resource URI.
+    async fn owner_may_observe_resource(&self, owner: &OwnerId, uri: &str) -> bool {
+        if let Some(handle) = uri.strip_prefix(WATCH_URI_PREFIX) {
+            let Ok(watch_id) = WatchId::from_str(handle) else {
+                return false;
+            };
+            return self.gateway.authorize_watch(owner, &watch_id).await.is_ok();
+        }
+        let Ok(resource) = AgentResourceUri::from_str(uri) else {
+            return false;
+        };
+        self.gateway
+            .authorize_agent(owner, &resource.agent_id)
+            .await
+            .is_ok()
+    }
+
     /// Refuse a tool call that names a handle the caller does not own.
     ///
     /// Both handle kinds are checked here rather than in each tool, so a tool
@@ -2607,16 +2653,6 @@ fn task_agent_id(request: &CallToolRequestParams) -> Result<AgentId, TaskExit> {
                 None,
             ))
         })
-}
-
-/// The agent handle `irc.connect` reports having created.
-fn created_agent_id(result: &CallToolResult) -> Option<AgentId> {
-    result
-        .structured_content
-        .as_ref()?
-        .get("agent_id")?
-        .as_str()
-        .and_then(|value| AgentId::from_str(value).ok())
 }
 
 /// The session a DCC tool result reports having started, when it started one.

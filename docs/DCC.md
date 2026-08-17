@@ -132,10 +132,14 @@ or later I/O failure through session state/events. It streams bytes through the
 configured buffer; the body is never loaded wholly into memory and never
 appears in MCP results, logs, resources, or events.
 
-The tool returns after the offer is written with a session snapshot. Progress,
-completion, cancellation, and failure are asynchronous. Successful completion
-requires the negotiated DCC acknowledgment behavior, not merely end-of-file on
-the source read.
+By default the tool returns after the offer is written with a session snapshot.
+Progress, completion, cancellation, and failure are asynchronous. If the MCP
+call requests the tasks extension, the tool instead returns a task handle;
+task status follows the transfer's state and byte progress, task cancellation
+cancels the DCC session, and the terminal result contains the final session and
+a native link to `irc://agents/{agent_id}/dcc/{dcc_session_id}`. Successful
+completion requires the negotiated DCC acknowledgment behavior, not merely
+end-of-file on the source read.
 
 ## `irc.dcc.accept`
 
@@ -157,7 +161,10 @@ For CHAT, acceptance establishes the direct connection. For SEND, acceptance
 resolves a relative path beneath `download_directory`, rejects a path whose
 resolved parent escapes that root, and starts a bounded streamed transfer. An
 absolute path is accepted only when it is already below the same root. The
-result is the updated session snapshot.
+default result is the updated session snapshot. When the call requests the MCP
+tasks extension, it instead returns a task handle and follows the same
+progress, cancellation, terminal-result, and native-resource-link behavior as
+task-augmented `irc.dcc.send`.
 
 The destination's parent directory must already exist and be writable by the
 gateway process. The gateway never creates an implicit directory tree from a

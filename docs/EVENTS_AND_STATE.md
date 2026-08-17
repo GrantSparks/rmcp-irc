@@ -108,7 +108,11 @@ Class names may become more specific while retaining these families:
 | Private `PRIVMSG` | `message.private` |
 | CTCP ACTION | `message.action` |
 | `NOTICE` | `message.notice` (CTCP framing remains visible in wire data) |
-| `TAGMSG` | `message.tagged`; extension tags remain lossless in `wire` |
+| Generic `TAGMSG` | `message.tagged`; extension tags remain lossless in `wire` |
+| `TAGMSG` with `+draft/react` and `+reply` | `message.tagged` with a typed reaction change and referenced message ID |
+| `TAGMSG` with `+typing` | `presence` with typed `active`, `paused`, or `done` state |
+| `REDACT` | `message.tagged` with target, message ID, source, and optional reason |
+| `MARKREAD` | `protocol.reply` with target and synchronized timestamp or cleared marker |
 | CTCP query/reply | `ctcp` |
 | `JOIN`, `PART`, `KICK`, `INVITE`, `QUIT` | `membership` |
 | `NICK`, `ACCOUNT`, `AWAY`, `CHGHOST`, `SETNAME` | `presence` |
@@ -117,7 +121,6 @@ Class names may become more specific while retaining these families:
 | `FAIL`, `WARN`, `NOTE`, `ACK`, numerics | `protocol.reply` or a more specific correlated class |
 | Completed MOTD sequence | `server.motd` with ordered text and raw replies |
 | History/event-playback batch | Normal semantic class with `origin: history` |
-| Unnegotiated redaction/reaction/typing extensions | `protocol.unknown` or `message.tagged`, with full wire tags |
 | Unknown command, numeric, batch, or semantics | `protocol.unknown` with full wire data |
 | Connection transitions | `connection.lifecycle`, with typed state in `semantic` |
 | Incoming DCC control | `dcc.chat.offered`, `dcc.transfer.offered`, acceptance/rejection, or negotiation failure |

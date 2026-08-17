@@ -7,34 +7,45 @@
 
 `rmcp-irc` is a native Rust MCP gateway for Ergo IRC networks. It serves local
 MCP clients over stdio or multiple clients through one Streamable HTTP
-endpoint. Each agent created with `irc.connect` owns an independent IRC
+endpoint. Each agent created with `irc.connect` has an independent IRC
 connection, state snapshot, and bounded event stream.
 
 ## Features
 
 - Native TCP/TLS IRC connections with CAP, SASL, ISUPPORT, HELP, and MOTD
   discovery.
-- Equivalent tools and resources over stdio and Streamable HTTP.
-- Typed tools for common operations and structured `irc.execute` access to
-  other IRC commands. No tool accepts raw IRC lines.
+- Resource-first context: compact inboxes and transcripts for models, separate
+  topics/members for channels, and lossless wire data for diagnosis. Native
+  links and annotations tell hosts what to attach and subscribe to.
+- Targeted watch resources with server-held cursors and subscription wake-ups;
+  bounded `irc.events.read` long polling remains the compatibility fallback.
+- Stable typed tools for common IRC operations, including negotiated reaction,
+  redaction, read-marker, and typing support. Structured `irc.execute` covers
+  other commands; no tool accepts raw IRC lines.
+- Four reusable MCP prompts for connecting, watching mentions, joining with
+  context, and summarizing/responding.
 - Lossless inbound and outbound wire events, including unknown extensions and
   invalid UTF-8 represented as base64.
 - Correlated command replies, caller-owned event cursors, and explicit stream
   reset and retention-gap handling.
+- Equivalent stdio and Streamable HTTP surfaces, with HTTP agent/watch handles
+  isolated by bearer identity or MCP session.
 - Reconnection, channel restoration, state resynchronization, and history
   recovery when the server supports it.
 - Bounded in-memory queues, journals, collectors, and DCC sessions.
 - Direct DCC CHAT and streamed DCC SEND, including reverse connections and
-  resume negotiation.
+  resume negotiation; file transfers can run as progress-reporting MCP tasks.
 
 The gateway connects to an existing Ergo server; it does not provision or
 configure one. Ergo remains responsible for accounts, permissions, channel
 policy, and retained history.
 
 > [!IMPORTANT]
-> Streamable HTTP has no MCP authentication or authorization. Non-loopback
-> binding therefore requires an explicit trusted-network opt-in and allowed
-> Host values. Agent IDs are routing handles, not credentials.
+> Streamable HTTP binds every agent and watch handle to its caller. Configure
+> repeatable `--http-bearer-token` values for durable authenticated identities;
+> without them, callers are isolated by MCP session. Non-loopback binding still
+> requires an explicit trusted-network opt-in and allowed Host values. Agent
+> IDs remain routing handles, not credentials.
 
 ## Quick start
 
@@ -158,20 +169,25 @@ The MCP endpoint is `http://127.0.0.1:8080/mcp`:
 
 Both transports expose the same service. Every operation after `irc.connect`
 requires an explicit `agent_id`; an HTTP connection is not an IRC identity.
-Browser `Origin` requests are denied unless explicitly allowlisted. A trusted
-container-network deployment must additionally pass
+For shared HTTP, pass one or more `--http-bearer-token TOKEN` options and send
+the corresponding `Authorization: Bearer TOKEN` header. Each token sees and
+operates only its own agents, watches, and resources. Without configured
+tokens, separate MCP sessions remain isolated but have no durable identity
+across a session restart. Browser `Origin` requests are denied unless explicitly
+allowlisted. A trusted container-network deployment must additionally pass
 `--allow-unauthenticated-network --allow-host HOST`; the bundled image already
-does this for its `irc` network alias.
+does this for its `irc` network alias. HTTP responses are marked
+`Cache-Control: private, no-store`.
 
 ## MCP surface
 
 | Area | Tools |
 | --- | --- |
 | Identity | `irc.connect`, `irc.disconnect`, `irc.status` |
-| Channels and messages | `irc.join`, `irc.part`, `irc.send`, `irc.history` |
+| Channels and messages | `irc.join`, `irc.part`, `irc.send`, `irc.history`, typed topic/reaction/redaction/read/typing tools |
 | Queries and commands | `irc.query`, `irc.execute` |
-| Events | `irc.events.read` |
-| DCC | `irc.dcc.chat.open`, `irc.dcc.chat.send`, `irc.dcc.send`, `irc.dcc.accept`, `irc.dcc.reject`, `irc.dcc.cancel`, `irc.dcc.list` |
+| Events | `irc.watch.create`, `irc.watch.close`, `irc.events.read` |
+| DCC | `irc.dcc.chat.open`, `irc.dcc.chat.send`, `irc.dcc.send`, `irc.dcc.accept`, `irc.dcc.reject`, `irc.dcc.cancel`, `irc.dcc.list`; SEND/accept can run as MCP tasks |
 
 The stable typed semantic surface additionally includes WHOIS, NAMES, LIST,
 HELP, topic, nickname, away, invite, kick, monitor, and mode tools. Four
@@ -181,10 +197,16 @@ redaction, synchronized read markers, and privacy-sensitive typing indicators
 without implying that a resource notification can start a model turn by
 itself.
 
-Per-agent resources expose connection status, protocol discovery, MOTD,
-reduced state, event bounds, DCC sessions, and channel snapshots under
-`irc://agents/{agent_id}/...`. See the [MCP API](docs/MCP_API.md) for inputs,
-results, errors, and resource shapes.
+Resources are the primary context plane: per-agent URIs expose connection
+status, protocol discovery, MOTD, reduced state, a compact inbox and
+conversation transcripts, lossless wire diagnostics, event bounds, DCC
+sessions, and separate channel state/member/topic views under
+`irc://agents/{agent_id}/...`. `irc.watch.create` turns a durable event filter
+into a subscribable `irc://watches/{watch_id}` resource whose cursor advances
+when read. This lets subscription-capable hosts wake on relevant activity and
+retrieve only the new matching context; `irc.events.read` remains the explicit
+long-poll fallback. See the [MCP API](docs/MCP_API.md) for inputs, results,
+errors, and resource shapes.
 
 ## Events and state
 

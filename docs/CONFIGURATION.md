@@ -16,6 +16,9 @@ cargo run -- serve --transport stdio --config config/example.toml
 
 cargo run -- serve --transport http --listen 127.0.0.1:8080 \
   --config config/example.toml
+
+cargo run -- serve --transport http --listen 127.0.0.1:8080 \
+  --http-bearer-token "$RMCP_IRC_TOKEN" --config config/example.toml
 ```
 
 HTTP serves one Streamable HTTP endpoint at `/mcp`. `--listen` controls the MCP
@@ -24,9 +27,14 @@ writes MCP frames only to stdout and sends diagnostics to stderr.
 
 Non-loopback HTTP is refused unless both `--allow-unauthenticated-network` and
 at least one repeatable `--allow-host HOST` are supplied. This is an explicit
-trusted-network opt-in, not authentication. Browser requests carrying an
-`Origin` header are denied by default; add exact origins with repeatable
-`--allow-origin SCHEME://HOST[:PORT]`.
+network-listener opt-in, not caller authentication. Configure repeatable
+`--http-bearer-token TOKEN` values to require bearer authentication; each
+accepted token becomes a distinct owner whose handles are invisible to other
+owners. With no configured tokens, HTTP callers are isolated by MCP session
+instead, which does not provide a durable identity across session restarts.
+Browser requests carrying an `Origin` header are denied by default; add exact
+origins with repeatable `--allow-origin SCHEME://HOST[:PORT]`. Every HTTP
+response uses `Cache-Control: private, no-store`.
 
 ## `[irc]`: Ergo endpoint
 
@@ -182,10 +190,11 @@ error, with sensitive values redacted.
 ## Deployment guidance
 
 - Keep Streamable HTTP on loopback unless a trusted-network deployment is
-  explicitly required; non-loopback mode adds request validation but no MCP
-  authentication.
-- Treat `agent_id` as a shareable routing handle, not a secret authorization
-  token.
+  explicitly required; non-loopback mode adds request validation, while
+  `--http-bearer-token` independently enables caller authentication.
+- Treat `agent_id` as a routing handle, not a credential. The gateway enforces
+  its recorded caller ownership; do not expect a handle to cross bearer or MCP
+  session identities.
 - Choose `plain` or `tls` to match Ergo's configured listener.
 - Size event and command bounds for the number of agents while preserving
   predictable total memory.

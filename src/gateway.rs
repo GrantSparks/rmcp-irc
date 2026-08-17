@@ -131,6 +131,7 @@ impl Gateway {
     }
 
     /// Register a guest owned by the local caller.
+    #[cfg(test)]
     pub async fn connect(&self, request: ConnectRequest) -> Result<ConnectedAgent> {
         self.connect_as(OwnerId::local(), request).await
     }
@@ -554,17 +555,6 @@ impl Gateway {
             .filter(|(_, agent)| agent.owner == *owner)
             .map(|(agent_id, _)| agent_id.clone())
             .collect()
-    }
-
-    /// Bind an agent handle to the caller that created it.
-    ///
-    /// Separate from `connect_as` because the tool surface learns the caller
-    /// identity at dispatch, after the gateway has already published the
-    /// handle. A handle whose actor vanished in between is simply not bound.
-    pub async fn assign_owner(&self, agent_id: &AgentId, owner: OwnerId) {
-        if let Some(agent) = self.agents.write().await.get_mut(agent_id) {
-            agent.owner = owner;
-        }
     }
 
     /// Confirm one caller may use an agent handle.

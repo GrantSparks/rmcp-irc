@@ -61,6 +61,11 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Fixed
 
+- Shared-HTTP ownership is now attached before a newly connected agent is
+  published, eliminating a brief local-owner window. Session-only HTTP mode
+  fails closed when a request lacks an initialized MCP session, and resource
+  subscription updates are authorized against the listening caller before
+  delivery.
 - Watch and resource notifications that are dropped because a subscriber fell
   behind now trigger an explicit resynchronization — the resource list and
   every live URI are republished — instead of being skipped silently and

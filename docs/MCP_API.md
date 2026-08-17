@@ -13,8 +13,8 @@ connection is never an IRC identity.
 - Tool names are stable and are not generated from the connected server's
   command list.
 - `agent_id` is an opaque, process-local routing handle returned by
-  `irc.connect`. It is intentionally shareable and is not an authentication
-  credential.
+  `irc.connect`. It is not an authentication credential. On shared HTTP it is
+  usable only by the caller owner that created it.
 - Every operation after `irc.connect` carries `agent_id`, in both transports.
 - All successful tools return concise `TextContent` plus schema-valid
   `structuredContent`. The structured result is authoritative. Tools that
@@ -32,6 +32,21 @@ connection is never an IRC identity.
 - Collected IRC replies use the lossless wire representation defined in
   [PROTOCOL_COMPATIBILITY.md](PROTOCOL_COMPATIBILITY.md).
 - Tools never accept a CR/LF-delimited raw IRC line.
+
+### Caller ownership
+
+Stdio has one trusted local owner. Streamable HTTP identifies an owner by an
+accepted bearer token when `--http-bearer-token` is configured, or otherwise
+by the MCP session. Agent and watch handles are bound to that owner: other
+owners cannot list, read, subscribe to, or operate them, and an unauthorized
+handle is reported exactly like a missing one. This prevents a handle from
+becoming a bearer credential or an existence oracle.
+
+Bearer ownership is durable across MCP sessions that present the same token;
+session-only ownership is not. HTTP responses use `Cache-Control: private,
+no-store` because their contents are caller-specific. These checks are MCP
+caller authorization only; Ergo remains authoritative for IRC accounts,
+channel privileges, and command policy.
 
 ## Errors and command outcomes
 
@@ -172,6 +187,8 @@ Minimum successful result:
     "protocol": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/protocol",
     "state": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/state",
     "events": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/events",
+    "inbox": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/inbox",
+    "wire": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/wire",
     "dcc": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/dcc"
   },
   "result_detail": "compact"
@@ -189,9 +206,9 @@ forms were omitted, as declared by `result_detail`; they remain complete at
 
 Input contains `agent_id` and an optional `reason`. The actor sends `QUIT` when
 possible, cancels or fails its DCC sessions, closes direct sockets, removes the
-gateway handle, and stops. Any caller holding the shareable handle may invoke
-it. A successful result includes `agent_id`, `disconnected`, `quit_sent`, and
-the count of DCC sessions closed.
+gateway handle, and stops. Only the caller owner may invoke it. A successful
+result includes `agent_id`, `disconnected`, `quit_sent`, and the count of DCC
+sessions closed.
 
 ### `irc.status`
 
@@ -424,6 +441,20 @@ The result is the common command envelope.
 
 ## Event delivery
 
+### `irc.watch.create` and `irc.watch.close`
+
+`irc.watch.create` registers a caller-owned server-side selection over one
+agent's journal. Inputs are `agent_id`, optional case-preserved `targets`,
+optional semantic `classes`, `mentions_only`, `inbound_only`, and an optional
+starting `cursor`. It returns a native `irc://watches/{watch_id}` resource link.
+
+Subscribe to that URI when the host supports MCP resource subscriptions. Each
+resource read returns all retained matching events after the watch's stored
+position, advances that position without a cursor argument, and reports
+`current`, `stream_reset`, or `event_gap` plus `has_more`. Notifications are
+evaluated against the watch filter, so unrelated traffic does not wake it.
+`irc.watch.close` releases the handle and its notification state.
+
 ### `irc.events.read`
 
 Input contains:
@@ -465,10 +496,17 @@ conflict semantics are normative in [DCC.md](DCC.md). Every DCC operation uses
 an explicit `agent_id`; operations on an existing session also use its opaque
 `dcc_session_id`.
 
+`irc.dcc.send` and `irc.dcc.accept` are task-augmented tools. Their default
+calls retain the compatible immediate result after the offer or acceptance is
+written. When the call requests the MCP tasks extension, it returns a task
+handle instead; task status follows session state and byte progress,
+cancellation cooperatively cancels the DCC session, and the terminal result
+contains the final session plus its native resource link.
+
 ## Resources
 
-Resources are stable per-agent URIs. They are in-memory snapshots, not durable
-storage.
+Resources are stable in-memory URIs, not durable storage. Agent and watch
+resources are visible only to their caller owner.
 
 ### `irc://agents/{agent_id}/status`
 
@@ -504,10 +542,34 @@ Contains stream ID, oldest/latest cursors, retained count and byte use, a small
 recent window, and instructions for `irc.events.read`. It is not a substitute
 for cursor consumption.
 
+### `irc://agents/{agent_id}/events/after/{sequence}`
+
+An on-demand cursor page containing every retained event after `sequence` and
+the next cursor. It is the read half of the subscribe-to-events loop for hosts
+that support MCP resource subscriptions.
+
+### `irc://agents/{agent_id}/inbox`
+
+Contains compact conversational records addressed to the agent: private
+messages and channel messages that mention its current nickname. Protocol
+diagnostics and unrelated traffic stay out of this model-facing context.
+
+### `irc://agents/{agent_id}/wire`
+
+Contains the bounded recent lossless parsed IRC records and refused lines,
+including unknown extensions and invalid UTF-8 recovery. It is intended for
+operator diagnosis rather than routine conversation context.
+
 ### `irc://agents/{agent_id}/dcc`
 
 Contains all retained offered, connecting, active, transferring, completed,
 rejected, cancelled, and failed sessions. See [DCC.md](DCC.md).
+
+### `irc://agents/{agent_id}/dcc/{dcc_session_id}`
+
+Contains one retained direct session with its lifecycle state, peer, endpoint,
+byte progress, safe local path fields, and terminal error. DCC tools and task
+results link this resource directly.
 
 ### `irc://agents/{agent_id}/channels/{encoded_channel}`
 
@@ -517,12 +579,40 @@ Snapshot time and reducer cursor are available in the parent state resource.
 Channel changes update expanded resource URIs; they do not churn the resource
 list.
 
+### `irc://agents/{agent_id}/channels/{encoded_channel}/members`
+
+Contains only the channel's known member and presence projection, separated
+from topic and mode state so a host can attach the smallest useful context.
+
+### `irc://agents/{agent_id}/channels/{encoded_channel}/topic`
+
+Contains the current topic and setter metadata. It has high model-facing
+priority because channel topics commonly carry standing instructions.
+
+### `irc://agents/{agent_id}/transcripts/{encoded_target}`
+
+Contains a compact channel-or-peer conversation: speaker, time, message, and
+relevant conversational state changes without lossless protocol detail.
+
+### `irc://watches/{watch_id}`
+
+Contains the watch descriptor, cursor status, matching compact events, next
+server-held cursor, and `has_more`. Reading advances the watch; closing it with
+`irc.watch.close` removes the resource.
+
+All catalog entries and native links include MCP annotations. Conversational
+resources target model/user audiences with higher priorities; wire and
+protocol diagnostics target the operator. A `lastModified` hint is supplied
+when the gateway has an authoritative snapshot timestamp.
+
 ## Resource updates and subscriptions
 
 Material changes emit `notifications/resources/updated` for affected stable
-URIs. Event-resource notifications are coalescing wake-up signals; terminal
-DCC transitions and new MOTDs must be signaled promptly. Notifications do not
-contain a durable consumption position and never replace `irc.events.read`.
+URIs. Watch notifications apply their registered selection before waking a
+subscriber; event-resource notifications remain broader coalescing wake-up
+signals. Terminal DCC transitions and new MOTDs must be signaled promptly.
+Notifications do not contain a durable consumption position: read the watch or
+cursor expansion after each signal, or use `irc.events.read` as the fallback.
 
 The same `rmcp` subscription listener is used by both transports. Whether an
 MCP host wakes or invokes an LLM after a notification is host behavior, not a
@@ -544,9 +634,10 @@ irc.nick.set                irc.away.set               irc.kick
 irc.invite                  irc.monitor.update         irc.mode.set
 irc.reaction.update         irc.message.redact         irc.read.get
 irc.read.set                irc.typing.set              irc.execute
-irc.events.read             irc.dcc.chat.open          irc.dcc.chat.send
-irc.dcc.send                irc.dcc.accept             irc.dcc.reject
-irc.dcc.cancel              irc.dcc.list
+irc.watch.create            irc.watch.close            irc.events.read
+irc.dcc.chat.open           irc.dcc.chat.send          irc.dcc.send
+irc.dcc.accept              irc.dcc.reject             irc.dcc.cancel
+irc.dcc.list
 ```
 
 Complete IRC command coverage belongs in `irc.execute` and the lossless event
