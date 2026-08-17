@@ -9,17 +9,24 @@ use std::{
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
-    handler::server::{router::tool::ToolRouter, tool::schema_for_output, wrapper::Parameters},
+    handler::server::{
+        router::{prompt::PromptRouter, tool::ToolRouter},
+        tool::schema_for_output,
+        wrapper::Parameters,
+    },
     model::{
         CallToolResult, CompleteRequestParams, CompleteResult, CompletionInfo, ContentBlock,
         Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Reference, Resource,
-        ResourceContents, ResourceTemplate, ServerCapabilities, ServerInfo, SubscriptionFilter,
+        PromptMessage, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+        Reference, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
+        ServerInfo, SubscriptionFilter,
     },
+    prompt, prompt_handler, prompt_router,
     service::{RequestContext, RoleServer, SubscriptionContext},
     tool, tool_handler, tool_router,
 };
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     MCP_INSTRUCTIONS,
@@ -55,11 +62,20 @@ const EVENT_CURSOR_TEMPLATE: &str = "irc://agents/{agent_id}/events/after/{seque
 /// limits even at the configured agent ceiling.
 const RESOURCE_PAGE_SIZE: usize = 60;
 
+#[cfg(test)]
+const PROMPT_NAMES: &[&str] = &[
+    "irc-connect",
+    "irc-watch-mentions",
+    "irc-join",
+    "irc-summarize-respond",
+];
+
 /// MCP request handler backed by a shared gateway.
 #[derive(Clone, Debug)]
 pub struct IrcMcpService {
     gateway: Arc<Gateway>,
     tool_router: ToolRouter<Self>,
+    prompt_router: PromptRouter<Self>,
 }
 
 impl IrcMcpService {
@@ -68,7 +84,126 @@ impl IrcMcpService {
         Self {
             gateway,
             tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
         }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ConnectPromptInput {
+    /// Preferred mythological nickname, or omit to choose one during the workflow.
+    nickname: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WatchMentionsPromptInput {
+    /// Opaque handle returned by `irc.connect`.
+    agent_id: String,
+    /// Optional comma-separated channel or nickname targets; omit for all targets.
+    targets: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct JoinPromptInput {
+    /// Opaque handle returned by `irc.connect`.
+    agent_id: String,
+    /// Channel to join, including its server-advertised prefix.
+    channel: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SummarizeRespondPromptInput {
+    /// Opaque handle returned by `irc.connect`.
+    agent_id: String,
+    /// Channel or nickname conversation to read.
+    target: String,
+    /// Optional user objective that the summary and response should address.
+    objective: Option<String>,
+}
+
+#[prompt_router(router = "prompt_router")]
+impl IrcMcpService {
+    /// Connect, read onboarding state, and establish a safe IRC identity.
+    #[prompt(
+        name = "irc-connect",
+        description = "Connect an IRC guest, read the authoritative MOTD, and establish coordination context."
+    )]
+    async fn prompt_connect(
+        &self,
+        Parameters(input): Parameters<ConnectPromptInput>,
+    ) -> Vec<PromptMessage> {
+        let nickname = input.nickname.map_or_else(
+            || "Choose three candidates from different mythological traditions, check current/recent names when possible, and keep the most distinctive one.".into(),
+            |nickname| format!("Use `{nickname}` as the preferred nickname unless current or recent activity shows that it would recycle another session's identity."),
+        );
+        vec![PromptMessage::new_text(
+            Role::User,
+            format!(
+                "Establish a new IRC collaboration session. {nickname} Call `irc.connect`, then read and follow the returned MOTD before participating. Read the auto-joined channel topic, announce a concise hello with real task/worktree scope, and preserve the returned `agent_id` and native resource links for subsequent operations. Do not invent account registration for an ephemeral guest."
+            ),
+        )]
+    }
+
+    /// Create and consume a mentions-only live watch.
+    #[prompt(
+        name = "irc-watch-mentions",
+        description = "Create a mentions watch, subscribe when supported, and handle addressed IRC messages."
+    )]
+    async fn prompt_watch_mentions(
+        &self,
+        Parameters(input): Parameters<WatchMentionsPromptInput>,
+    ) -> Vec<PromptMessage> {
+        let targets = input.targets.map_or_else(
+            || "Watch all targets.".into(),
+            |targets| format!("Restrict the watch to these comma-separated targets: {targets}."),
+        );
+        vec![PromptMessage::new_text(
+            Role::User,
+            format!(
+                "For IRC agent `{}`, call `irc.watch.create` with `mentions_only: true`. {targets} Attach the returned native watch resource link and subscribe to it when the host supports MCP resource subscriptions. On each update, read from the watch's durable cursor, detect reset/gap status, and promptly answer direct messages or channel mentions in the same location. If subscriptions are unavailable, keep an `irc.events.read` long poll active as the explicit fallback. Resource notifications update the host but cannot themselves require a new model turn.",
+                input.agent_id
+            ),
+        )]
+    }
+
+    /// Join a channel and read its instructions before participating.
+    #[prompt(
+        name = "irc-join",
+        description = "Join an IRC channel, read its topic and context resources, then participate safely."
+    )]
+    async fn prompt_join(
+        &self,
+        Parameters(input): Parameters<JoinPromptInput>,
+    ) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            Role::User,
+            format!(
+                "Using IRC agent `{}`, call `irc.join` for `{}`. Follow the returned native channel resource link, read the topic before sending messages, and treat it as channel-specific instruction. Read the recent transcript/history and known members to avoid duplicating active work, then announce relevant intent and subscribe to the channel's live resources when supported.",
+                input.agent_id, input.channel
+            ),
+        )]
+    }
+
+    /// Summarize a conversation and prepare or send an appropriate response.
+    #[prompt(
+        name = "irc-summarize-respond",
+        description = "Summarize one IRC conversation and formulate a context-aware response."
+    )]
+    async fn prompt_summarize_respond(
+        &self,
+        Parameters(input): Parameters<SummarizeRespondPromptInput>,
+    ) -> Vec<PromptMessage> {
+        let objective = input.objective.map_or_else(
+            || "Identify the most important unanswered question or coordination need.".into(),
+            |objective| format!("Prioritize this user objective: {objective}"),
+        );
+        vec![PromptMessage::new_text(
+            Role::User,
+            format!(
+                "For IRC agent `{}`, read the semantic transcript resource for `{}` or fall back to `irc.history` plus cursor events. Distinguish history replay from live messages. Summarize participants, human directives, decisions, claimed scopes, risks, and open questions. {objective} Draft a concise response grounded only in observed context; send it with `irc.send` only when the selected workflow/user intent authorizes participation, and otherwise present the draft for review.",
+                input.agent_id, input.target
+            ),
+        )]
     }
 }
 
@@ -1465,11 +1600,13 @@ impl IrcMcpService {
 }
 
 #[tool_handler(router = self.tool_router)]
+#[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for IrcMcpService {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
+                .enable_prompts()
                 .enable_resources()
                 .enable_resources_subscribe()
                 .enable_resources_list_changed()
@@ -2371,6 +2508,41 @@ mod tests {
         assert_eq!(names, TOOL_NAMES.iter().copied().collect());
         assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
         let _ = CallToolRequestParams::new("irc.status");
+    }
+
+    #[test]
+    fn stable_prompt_list_is_exact_and_advertised() {
+        let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
+        let names: BTreeSet<_> = service
+            .prompt_router
+            .list_all()
+            .into_iter()
+            .map(|prompt| prompt.name)
+            .collect();
+        assert_eq!(
+            names,
+            PROMPT_NAMES.iter().map(|name| (*name).to_owned()).collect()
+        );
+        assert!(service.get_info().capabilities.prompts.is_some());
+    }
+
+    #[tokio::test]
+    async fn workflow_prompts_preserve_realtime_host_boundaries() {
+        let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
+        let messages = service
+            .prompt_watch_mentions(Parameters(WatchMentionsPromptInput {
+                agent_id: "agent-example".into(),
+                targets: Some("#control".into()),
+            }))
+            .await;
+        let text = messages[0].content.as_text().expect("prompt text");
+        assert!(text.text.contains("irc.watch.create"));
+        assert!(text.text.contains("resource subscriptions"));
+        assert!(
+            text.text
+                .contains("cannot themselves require a new model turn")
+        );
+        assert!(text.text.contains("irc.events.read"));
     }
 
     #[test]

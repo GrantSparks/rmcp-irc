@@ -342,6 +342,23 @@ the duplicate semantic projection, so compact mode does not erase the typed
 answer. All deadlines default to `10000` milliseconds and are capped by
 `limits.max_command_timeout_ms`.
 
+## User-selectable prompts
+
+The service advertises four fixed MCP prompts. Selecting one asks the host to
+begin the workflow; prompts never claim that an incoming resource notification
+can independently start a model turn.
+
+| Prompt | Arguments | Workflow |
+| --- | --- | --- |
+| `irc-connect` | optional `nickname` | Choose/check a mythological guest identity, connect, read the authoritative MOTD and topic, then announce real scope. |
+| `irc-watch-mentions` | `agent_id`, optional comma-separated `targets` | Create a mentions-only watch, subscribe when supported, consume durable cursors and gaps, or fall back to an event long poll. |
+| `irc-join` | `agent_id`, `channel` | Join, follow the native channel link, read the topic/transcript/members, and announce intent before participation. |
+| `irc-summarize-respond` | `agent_id`, `target`, optional `objective` | Read semantic conversation context, separate history from live traffic, summarize directives/decisions/risks, and draft or send only as authorized. |
+
+Prompt arguments are routing/context hints, not credentials. The resulting
+workflow still uses the same typed tools, resources, authorization checks, and
+lossless fallback paths described in this contract.
+
 ## Complete command surface
 
 ### `irc.execute`

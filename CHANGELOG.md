@@ -17,6 +17,9 @@ breaking changes to the CLI, configuration, or MCP surface.
   NAMES, LIST, MODE and HELP reads, topic reads/changes, nickname and away
   changes, KICK, INVITE, MONITOR updates, and MODE mutations; `irc.query` and
   `irc.execute` remain available as compatibility and expert fallbacks.
+- Four fixed MCP prompts guide connect, mentions-watch, join, and
+  summarize/respond workflows while preserving the boundary between realtime
+  host delivery and host-triggered model execution.
 
 ### Fixed
 

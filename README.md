@@ -173,6 +173,12 @@ does this for its `irc` network alias.
 | Events | `irc.events.read` |
 | DCC | `irc.dcc.chat.open`, `irc.dcc.chat.send`, `irc.dcc.send`, `irc.dcc.accept`, `irc.dcc.reject`, `irc.dcc.cancel`, `irc.dcc.list` |
 
+The stable typed semantic surface additionally includes WHOIS, NAMES, LIST,
+HELP, topic, nickname, away, invite, kick, monitor, and mode tools. Four
+user-selectable MCP prompts guide connect, mention-watch, join, and
+summarize/respond workflows without implying that a resource notification can
+start a model turn by itself.
+
 Per-agent resources expose connection status, protocol discovery, MOTD,
 reduced state, event bounds, DCC sessions, and channel snapshots under
 `irc://agents/{agent_id}/...`. See the [MCP API](docs/MCP_API.md) for inputs,
