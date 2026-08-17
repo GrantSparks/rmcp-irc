@@ -2,8 +2,9 @@
 
 This document is the normative asynchronous-delivery and state-reduction
 contract. IRC is a long-lived event protocol; MCP resource notifications only
-signal that something changed. Ordered delivery therefore comes from explicit,
-caller-owned cursors over each agent's bounded in-memory journal.
+signal that something changed. Ordered delivery therefore comes from explicit
+positions over each agent's bounded in-memory journal — held by a watch on the
+caller's behalf, or by the caller itself through `irc.events.read`.
 
 ## Event production rule
 
@@ -244,10 +245,42 @@ their owning `command_id`; they never share a cursor-only projection window.
 
 `notifications/resources/updated` is a hint that a stable URI changed. It does
 not carry a durable event position and is not an alternative event transport.
-Clients respond by reading the indicated resource and, for events, calling
-`irc.events.read` with their own cursor.
+Clients respond by reading the indicated resource.
 
-Resource subscriptions are not exposed by every MCP client. Such a client
-cannot receive the hint and must keep a bounded `irc.events.read` long poll
-active, immediately continuing from each returned `next_cursor`. This fallback
-uses the same durable cursor contract and does not require subscription support.
+### Watches
+
+A watch is the intended way to consume events. `irc.watch.create` registers a
+selection — targets, event classes, addressed-to-me, direction — and returns
+`irc://watches/{watch_id}`. Subscribing to that URI and reading it on each
+notification is a complete delivery loop:
+
+- the notification is evaluated against the watch's own filter, so a watch on
+  one channel is not woken by unrelated traffic;
+- each read returns everything matching since the previous read and advances
+  the watch, so no cursor argument is needed;
+- the read reports `status`, which is `current` unless records were lost, in
+  which case the reader is told explicitly rather than silently restarted;
+- `irc.watch.close` releases the handle.
+
+`irc.events.read` remains available for replay and for clients without
+subscription support. Such a client must keep a bounded long poll active,
+immediately continuing from each returned `next_cursor`. This fallback uses
+the same durable cursor contract.
+
+### What realtime delivery does and does not mean
+
+The gateway can deliver a notification to a capable MCP **host** as soon as
+something happens. It cannot make that host start a model turn. MCP has no
+mechanism by which a server requires a client to invoke its model, so:
+
+- *realtime delivery* — the host learns immediately, and a subsequent read
+  returns the new records with no polling interval in between — is what this
+  gateway provides;
+- *autonomous participation* — the model itself waking on a message and
+  answering it — additionally requires the host or runtime to schedule a turn
+  when a subscribed resource changes.
+
+A host that does not schedule turns will still see everything, at whatever
+point it next runs the model. Nothing is lost in the meantime: the watch holds
+its position, and a read after any delay returns the backlog with an explicit
+`status` if the retained window was exceeded.
