@@ -2509,7 +2509,11 @@ impl ServerHandler for IrcMcpService {
                     // recovers its own position from the cursor or status in
                     // the payload.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                        tracing::warn!(missed, "resource notifications lagged; resynchronizing");
+                        tracing::warn!(
+                            owner = %owner,
+                            missed,
+                            "resource notifications lagged; resynchronizing"
+                        );
                         self.notify_resynchronization(&context, &owner).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
@@ -2682,19 +2686,28 @@ impl IrcMcpService {
     async fn notify_resynchronization(&self, context: &SubscriptionContext, owner: &OwnerId) {
         let _ = context.sink().notify_resource_list_changed().await;
         let owned = self.gateway.agent_ids_for(owner).await;
+        let mut republished = 0_usize;
         for agent_id in &owned {
             let Ok(snapshot) = self.gateway.snapshot(agent_id).await else {
                 continue;
             };
             for descriptor in descriptors_for_agent(agent_id, &snapshot.state, None) {
                 let _ = context.sink().notify_resource_updated(descriptor.uri).await;
+                republished += 1;
             }
         }
         for watch in self.gateway.watches().list() {
             if owned.contains(&watch.agent_id) {
                 let _ = context.sink().notify_resource_updated(watch.uri).await;
+                republished += 1;
             }
         }
+        tracing::debug!(
+            owner = %owner,
+            agents = owned.len(),
+            republished,
+            "republished every owned resource after a subscription lag"
+        );
     }
 }
 

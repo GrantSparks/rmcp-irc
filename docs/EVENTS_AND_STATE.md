@@ -123,6 +123,7 @@ Class names may become more specific while retaining these families:
 | History/event-playback batch | Normal semantic class with `origin: history` |
 | Unknown command, numeric, batch, or semantics | `protocol.unknown` with full wire data |
 | Connection transitions | `connection.lifecycle`, with typed state in `semantic` |
+| Journal retention pressure | `journal.pressure`, with typed eviction accounting in `semantic` |
 | Incoming DCC control | `dcc.chat.offered`, `dcc.transfer.offered`, acceptance/rejection, or negotiation failure |
 | Direct DCC data | `dcc.chat.message`, `dcc.connected`, `dcc.transfer.progress`, `dcc.transfer.completed`, `dcc.cancelled`, or `dcc.failed` |
 
@@ -195,6 +196,66 @@ streams, or other readers. Resource notifications may coalesce, but journal
 records and terminal DCC transitions do not. Falling behind results in an
 explicit `event_gap`, never an unbounded per-client buffer.
 
+### Eviction accounting
+
+The journal measurements published by `irc.status`, `irc://agents/{id}/status`,
+and `irc://agents/{id}/events` carry the retained window and what has already
+left it:
+
+| Field | Meaning |
+| --- | --- |
+| `retained_events` | Records currently in the window. |
+| `retained_bytes` | Approximate serialized bytes those records occupy. |
+| `evicted_events` | Records eviction has discarded since this stream began. |
+| `evicted_bytes` | Approximate serialized bytes eviction has discarded since this stream began. |
+| `last_eviction_at` | When eviction most recently discarded a record, or null if it never has. |
+| `oversized_rejections` | Records refused outright because one event exceeded the whole byte budget. |
+
+The eviction counters are cumulative over the life of the stream, so sampling
+them twice tells a caller whether the window moved under it between reads
+without holding a cursor to find out. Oversized rejections are counted apart
+from eviction: those records were never retained, so no cursor ever addressed
+them and no reader can recover them.
+
+### The `journal.pressure` event
+
+`event_gap` is a report that a caller has already lost events. The
+`journal.pressure` event is the warning that precedes it: it is journaled once
+eviction has begun discarding records, which means every reader holding an old
+cursor is now on a clock. Its `semantic` payload carries `evicted_events`,
+`evicted_bytes`, `evicted_since_previous_report`, `oldest_available`,
+`retained_events`, and the configured `max_events`/`max_bytes` bounds. Emitting
+it also notifies the `status` resource, so a client watching connection health
+sees the pressure without reading the stream at all.
+
+Reporting is rate limited. A pressure record is itself a journal event, so an
+unthrottled one would compete for the budget it is warning about and would wake
+every subscriber once per evicted record — pressure reporting would amplify the
+pressure. The first eviction after a quiet interval is reported immediately, so
+the warning stays early; after that at most one record is emitted every ten
+seconds. Each report carries the loss accumulated since the previous one, so
+throttling changes the cadence of the warning and never the numbers read out of
+it, and a report never counts the eviction it caused itself.
+
+A client that sees `journal.pressure`, a rising `evicted_events`, or a recent
+`last_eviction_at` should:
+
+- read promptly — consume its events on each notification rather than batching
+  reads on a timer, because the retained window is now the deadline;
+- reconsider a narrow filter. `next_cursor` advances only over events actually
+  returned, so a heavily filtered reader's position sits behind every record its
+  filter excluded and is the first to reach `event_gap`. Under pressure, keep the
+  narrow selection on the watch or subscription that decides *when* to read, and
+  read the event stream itself widely so the stored position stays near the head;
+- raise `limits.event_count` / `limits.event_bytes` if the traffic genuinely
+  needs a longer window.
+
+Pressure is reported from the actor's housekeeping tick rather than from the
+eviction itself, which is what keeps the report rate independent of the arrival
+rate. Journal pressure is relay state and a durable event; it is never an MCP
+log message. See [MCP_API.md](MCP_API.md) for why this gateway declares no
+logging capability.
+
 ## History and recoverability
 
 Ergo history can repair only retained chat/state playback supported by the
@@ -246,6 +307,15 @@ Initial `irc.connect` waits for registration and MOTD completion, but initial
 joins and full state resynchronization must not delay its MOTD result
 indefinitely. On socket loss, the existing actor remains published in a
 `reconnecting` state and uses bounded exponential backoff.
+
+Degradation is relay state, not a log line. Every transition journals a
+`connection.lifecycle` event and notifies the `status` resource. While
+reconnecting, `state.reconnect` publishes the `attempt` count, the chosen
+`delay_ms`, and `next_attempt_at`, the instant the relay will try again; both
+time fields clear once the connection is ready. A failed reconnect never returns
+to a request, so `state.last_error` is where its reason lives: it names the SASL
+failure numeric together with the server's own explanation, and the nickname
+candidates a registration attempt exhausted.
 
 Deduplication is a reconnect-recovery rule, not an explicit-query filter.
 Every `irc.history` call projects its complete correlated reply batch into that

@@ -177,7 +177,9 @@ pub fn describe(uri: &AgentResourceUri, last_modified: Option<Timestamp>) -> Res
         ResourceKind::Status => (
             "status".to_string(),
             "Connection status".to_string(),
-            "Connection lifecycle, negotiated capability counts, and event bounds.".to_string(),
+            "Connection lifecycle, the scheduled reconnect attempt, negotiated capability counts, \
+             and event bounds with their eviction accounting."
+                .to_string(),
             FOR_MODEL,
             0.5,
         ),
@@ -477,7 +479,7 @@ pub struct StatusResource {
     pub advertised_capabilities: usize,
     /// Number of negotiated CAP tokens.
     pub negotiated_capabilities: usize,
-    /// Current event bounds.
+    /// Current event bounds, including how much eviction has already discarded.
     pub events: JournalStats,
     /// Stable links.
     pub resources: ResourceUris,

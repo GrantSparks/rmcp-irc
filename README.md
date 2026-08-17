@@ -220,7 +220,10 @@ and monotonic sequence. Callers maintain their own cursors:
 
 - an actor or process restart causes `stream_reset` for an old stream;
 - journal eviction causes `event_gap` and returns the retained bounds;
-- an IRC reconnect keeps the stream while the actor remains alive; and
+- a `journal.pressure` event and the eviction counters in `status` warn before
+  that gap opens, so a client knows to read soon;
+- an IRC reconnect keeps the stream while the actor remains alive, publishing
+  its next attempt time in `status`; and
 - resource notifications are wake-up signals, while cursor reads provide
   ordered delivery.
 

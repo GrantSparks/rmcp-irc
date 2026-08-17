@@ -931,7 +931,13 @@ async fn ordinary_dcc_chat_uses_a_real_direct_socket_and_emits_both_directions()
 async fn reconnect_keeps_the_stream_refreshes_motd_and_requests_history_after_the_last_msgid() {
     let fake = FakeErgo::spawn().await;
     let mut lines = fake.client_lines.subscribe();
-    let gateway = Gateway::new(fake.config());
+    let mut config = fake.config();
+    // A fixed, wide enough backoff so the scheduled attempt this test asserts on
+    // is observable through a status snapshot instead of only inferable from the
+    // delay the caller was handed.
+    config.reconnect.initial_delay_ms = 200;
+    config.reconnect.max_delay_ms = 200;
+    let gateway = Gateway::new(config);
     let connected = gateway
         .connect(connect_request("Brigid"))
         .await
@@ -968,12 +974,25 @@ async fn reconnect_keeps_the_stream_refreshes_motd_and_requests_history_after_th
         .await
         .expect("drop trigger");
 
+    // Sample the degraded window on the way past it: a reconnecting actor must
+    // publish when it will try again, not only how long it decided to wait.
+    let mut scheduled = None;
     let reconnected = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let snapshot = gateway
                 .snapshot(&connected.agent_id)
                 .await
                 .expect("reconnect snapshot");
+            if snapshot.state.connection_state == crate::agent::state::ConnectionState::Reconnecting
+                && let Some(next_attempt_at) = snapshot.state.reconnect.next_attempt_at
+            {
+                scheduled = Some((
+                    snapshot.state.reconnect.attempt,
+                    snapshot.state.reconnect.delay_ms,
+                    next_attempt_at,
+                    snapshot.state.snapshot_at,
+                ));
+            }
             if snapshot.state.connection_state == crate::agent::state::ConnectionState::Ready
                 && snapshot.state.motd.source == Some(crate::agent::state::MotdSource::Reconnect)
             {
@@ -985,6 +1004,22 @@ async fn reconnect_keeps_the_stream_refreshes_motd_and_requests_history_after_th
     .await
     .expect("reconnect deadline");
     assert_eq!(reconnected.journal.stream_id, initial.journal.stream_id);
+
+    let (attempt, delay_ms, next_attempt_at, snapshot_at) =
+        scheduled.expect("a reconnecting snapshot must publish its next attempt");
+    assert!(attempt >= 1);
+    assert_eq!(delay_ms, Some(200));
+    assert!(
+        next_attempt_at > snapshot_at,
+        "the scheduled attempt must lie ahead of the snapshot that published it, \
+         so a caller can tell how much of the wait is left"
+    );
+    assert!(
+        reconnected.state.reconnect.next_attempt_at.is_none(),
+        "a ready connection has no attempt pending"
+    );
+    assert_eq!(reconnected.state.reconnect.delay_ms, None);
+    assert_eq!(reconnected.state.reconnect.attempt, 0);
 
     let recovery = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -1055,6 +1090,67 @@ async fn reconnect_keeps_the_stream_refreshes_motd_and_requests_history_after_th
         Some(crate::agent::state::MotdSource::Query)
     );
     assert_eq!(snapshot.state.motd.text, "Fresh instructions.");
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+/// Journal pressure has to reach the caller as relay state, not only as a
+/// server-side trace.
+///
+/// The journal unit tests can prove the accounting and the rate limit, but not
+/// that anything emits the warning: the record is journaled from the actor's
+/// housekeeping tick, because pushing it from inside eviction would re-enter the
+/// journal while it is still over budget. This covers that wiring end to end.
+#[tokio::test]
+async fn a_journal_under_pressure_reports_eviction_in_status_and_as_an_event() {
+    let fake = FakeErgo::spawn().await;
+    let mut config = fake.config();
+    // Registration alone overruns a four-record window, so eviction is certain
+    // without having to manufacture traffic for it.
+    config.limits.event_count = 4;
+    let gateway = Gateway::new(config);
+    let connected = gateway
+        .connect(connect_request("Mnemosyne"))
+        .await
+        .expect("connect");
+
+    let (stats, event) = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let snapshot = gateway
+                .snapshot(&connected.agent_id)
+                .await
+                .expect("snapshot");
+            if snapshot.journal.evicted_events > 0
+                && let Some(event) = snapshot
+                    .recent_events
+                    .iter()
+                    .find(|event| event.class == EventClass::JournalPressure)
+            {
+                return (snapshot.journal.clone(), event.clone());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("journal pressure deadline");
+
+    assert!(stats.evicted_bytes > 0);
+    assert!(stats.last_eviction_at.is_some());
+    assert_eq!(
+        stats.oversized_rejections, 0,
+        "nothing here exceeds the byte budget, so only eviction should be counted"
+    );
+    assert_eq!(stats.retained_events, 4);
+    let Some(crate::agent::journal::EventPayload::Pressure(reported)) = event.semantic.as_ref()
+    else {
+        panic!("a pressure record must carry its typed accounting");
+    };
+    assert!(reported.evicted_since_previous_report > 0);
+    assert_eq!(reported.max_events, 4);
+    assert_eq!(reported.retained_events, 4);
 
     gateway
         .disconnect(&connected.agent_id, None)

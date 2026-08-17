@@ -79,8 +79,22 @@ command result has `isError: true` and retains collected replies.
 `stream_reset` and `event_gap` are successful event-page statuses carrying
 current bounds.
 
-Arbitrary IRC `NOTICE` traffic is not MCP logging. MCP logging is reserved for
-gateway diagnostics associated with an active request.
+This gateway declares no MCP logging capability and emits no
+`notifications/message`. Logging was deprecated in MCP `2026-07-28` by
+[SEP-2577](https://modelcontextprotocol.io/seps/2577-deprecate-roots-sampling-and-logging),
+and `logging/setLevel` is removed outright, so there is no legacy logging path
+to support here. Operational facts are split instead:
+
+- anything that affects what a caller should do is **relay state** — connection
+  degradation and the scheduled reconnect attempt in the status resource,
+  journal retention pressure in its eviction counters, and durable
+  `connection.lifecycle` and `journal.pressure` events in the journal;
+- anything that is purely operator diagnosis is server-side `tracing`, on
+  stderr or through an OpenTelemetry subscriber, and is never part of the
+  protocol surface a client sees.
+
+Arbitrary IRC `NOTICE` traffic is neither: it is ordinary IRC traffic and
+appears as a `message.notice` event.
 
 Commands that await IRC completion use this common result envelope:
 
@@ -219,8 +233,22 @@ connection/registration and reconnect state, identity, joined channels, latest
 MOTD, reducer cursor, and last error. In compact mode the latest MOTD retains
 its status, joined text, source, and receive time while its duplicate `lines`
 and `wire_replies` arrays are empty. The linked MOTD resource remains complete;
-`full` restores the legacy inline state. `events` contains the current stream
-and retained cursor bounds.
+`full` restores the legacy inline state.
+
+`state.reconnect` carries `attempt`, `delay_ms`, and `next_attempt_at`, so a
+degraded connection publishes *when* it will try again rather than only how long
+it decided to wait. Both `delay_ms` and `next_attempt_at` are null once the
+connection is ready. `state.last_error` carries the reason a reconnect failed,
+including the SASL failure numeric with the server's own explanation and the
+nickname candidates a registration attempt exhausted.
+
+`events` contains the current stream, the retained cursor bounds, and the
+journal's eviction accounting: `retained_events`, `retained_bytes`,
+`evicted_events`, `evicted_bytes`, `last_eviction_at`, and
+`oversized_rejections`. The eviction counters are cumulative over the stream, so
+sampling them twice tells a caller whether the window moved under it between
+reads. See
+[EVENTS_AND_STATE.md](EVENTS_AND_STATE.md#retention-and-backpressure).
 
 ## Channel and messaging tools
 
@@ -541,9 +569,15 @@ resources are visible only to their caller owner.
 ### `irc://agents/{agent_id}/status`
 
 Contains the same connection/protocol summary as `irc.status`, including
-reconnect state and stable resource links. Resource reads are explicitly
-lossless and therefore include the complete MOTD state regardless of the
-tool's default compact detail.
+reconnect state with its scheduled `next_attempt_at`, the journal's retention
+and eviction accounting under `events`, and stable resource links. Resource
+reads are explicitly lossless and therefore include the complete MOTD state
+regardless of the tool's default compact detail.
+
+This resource is notified on every connection-lifecycle transition, on every
+change to the reconnect schedule, and whenever a journal-pressure record is
+emitted, so a subscriber learns that the relay is degraded or losing events
+without polling.
 
 ### `irc://agents/{agent_id}/protocol`
 
@@ -568,7 +602,9 @@ filtering, or replacing its instructions.
 
 ### `irc://agents/{agent_id}/events`
 
-Contains stream ID, oldest/latest cursors, retained count and byte use, a small
+Contains stream ID, oldest/latest cursors, retained count and byte use, the
+cumulative eviction counters and oversized-rejection count described in
+[EVENTS_AND_STATE.md](EVENTS_AND_STATE.md#retention-and-backpressure), a small
 recent window, and instructions for `irc.events.read`. It is not a substitute
 for cursor consumption.
 

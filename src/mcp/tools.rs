@@ -175,7 +175,7 @@ pub struct StatusOutput {
     pub advertised_capabilities: usize,
     /// Number of active negotiated capabilities.
     pub negotiated_capabilities: usize,
-    /// Current journal bounds.
+    /// Current journal bounds and its eviction accounting.
     pub events: crate::agent::journal::JournalStats,
     /// Stable links for follow-up reads.
     pub resources: ResourceUris,

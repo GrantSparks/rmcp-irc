@@ -68,7 +68,10 @@ use super::{
         addresses_nickname,
     },
     reconnect::ReconnectBackoff,
-    state::{AgentState, ChannelState, ConnectionState, MotdSource, MotdState, MotdStatus},
+    state::{
+        AgentState, ChannelState, ConnectionState, MotdSource, MotdState, MotdStatus,
+        ReconnectState,
+    },
 };
 
 type IrcFramed = Framed<BoxedIrcStream, IrcCodec>;
@@ -501,6 +504,27 @@ fn is_history_batch_kind(kind: &str) -> bool {
         || kind.eq_ignore_ascii_case("history")
 }
 
+/// Render a connection failure for `AgentState.last_error`.
+///
+/// A failure during reconnect never returns to a request, so this string and
+/// the `connection.lifecycle` record carrying it are the only places a caller
+/// can see why the relay is degraded. The `Display` form of a registration
+/// failure drops the nicknames it tried, which is exactly the detail needed to
+/// tell "the server refused our credentials" apart from "every candidate
+/// nickname was taken", so spell them out here.
+fn connection_failure_detail(error: &GatewayError) -> String {
+    match error {
+        GatewayError::Registration {
+            attempted_nicknames,
+            ..
+        } if !attempted_nicknames.is_empty() => format!(
+            "{error} (attempted nicknames: {})",
+            attempted_nicknames.join(", ")
+        ),
+        other => other.to_string(),
+    }
+}
+
 #[derive(Debug)]
 enum DccRuntimeEvent {
     ChatConnected {
@@ -609,7 +633,7 @@ impl AgentActor {
                     self.fail_pending_commands(error.to_string());
                     self.set_connection_state(
                         ConnectionState::Reconnecting,
-                        Some(error.to_string()),
+                        Some(connection_failure_detail(&error)),
                     );
                 }
             }
@@ -634,13 +658,16 @@ impl AgentActor {
                 Ok(Err(error)) => {
                     self.set_connection_state(
                         ConnectionState::Reconnecting,
-                        Some(error.to_string()),
+                        Some(connection_failure_detail(&error)),
                     );
                 }
                 Err(_) => {
                     self.set_connection_state(
                         ConnectionState::Reconnecting,
-                        Some("reconnect registration timed out".into()),
+                        Some(format!(
+                            "reconnect registration timed out after {}ms",
+                            self.config.onboarding.connect_timeout_ms
+                        )),
                     );
                 }
             }
@@ -650,7 +677,10 @@ impl AgentActor {
     }
 
     fn fail_initial(&mut self, error: GatewayError) {
-        self.set_connection_state(ConnectionState::TerminalError, Some(error.to_string()));
+        self.set_connection_state(
+            ConnectionState::TerminalError,
+            Some(connection_failure_detail(&error)),
+        );
         if let Some(ready) = self.ready.take() {
             let _ = ready.send(Err(error));
         }
@@ -727,7 +757,10 @@ impl AgentActor {
             source: Some(source),
             ..MotdState::default()
         };
-        let mut sasl_failure = None;
+        // Keep the server's own explanation next to the numeric: a reconnect
+        // failure is only ever seen through `last_error`, and "904" alone tells
+        // an operator nothing about which credential the server refused.
+        let mut sasl_failure: Option<(u16, Option<String>)> = None;
         while let Some(frame) = framed.next().await {
             let frame =
                 frame.map_err(|source| GatewayError::io("read IRC registration", source))?;
@@ -772,7 +805,7 @@ impl AgentActor {
                         .await?;
                 }
                 CapabilityAction::AuthenticationFailed { numeric } => {
-                    sasl_failure = Some(numeric);
+                    sasl_failure = Some((numeric, message.trailing.clone()));
                     self.write_uncorrelated(
                         &mut framed,
                         OutboundMessage::new("CAP", vec!["END".into()]),
@@ -862,9 +895,15 @@ impl AgentActor {
                 && motd_complete
                 && self.capabilities.is_complete()
             {
-                if let Some(numeric) = sasl_failure {
+                if let Some((numeric, detail)) = sasl_failure {
+                    let message = match detail.as_deref() {
+                        Some(detail) if !detail.is_empty() => format!(
+                            "configured SASL authentication failed with {numeric}: {detail}"
+                        ),
+                        _ => format!("configured SASL authentication failed with {numeric}"),
+                    };
                     return Err(GatewayError::Registration {
-                        message: format!("configured SASL authentication failed with {numeric}"),
+                        message,
                         attempted_nicknames: attempted,
                     });
                 }
@@ -1328,7 +1367,53 @@ impl AgentActor {
                 self.notify_dcc_change(EventClass::DccRejected, &session);
             }
         }
+        self.report_journal_pressure();
         self.flush_event_reads(true);
+    }
+
+    /// Journal a retention-pressure record when eviction has begun discarding
+    /// events, and wake the resources that carry the accounting.
+    ///
+    /// This lives on the housekeeping tick rather than in the journal: a report
+    /// is itself an event, so emitting it from the eviction loop would re-enter
+    /// `push` while the journal is still over budget. Draining it here also
+    /// means the report rate is bounded by the tick and by the journal's own
+    /// rate limit, never by how fast events arrive.
+    fn report_journal_pressure(&mut self) {
+        let now = Timestamp::now();
+        let Some(pressure) = self.journal.take_pressure_report(now) else {
+            return;
+        };
+        tracing::warn!(
+            agent_id = %self.id,
+            evicted_events = pressure.evicted_events,
+            evicted_bytes = pressure.evicted_bytes,
+            evicted_since_previous_report = pressure.evicted_since_previous_report,
+            retained_events = pressure.retained_events,
+            max_events = pressure.max_events,
+            "event journal is discarding records to stay inside its bounds"
+        );
+        let event = NewEvent {
+            agent_id: self.id.clone(),
+            direction: EventDirection::Internal,
+            class: EventClass::JournalPressure,
+            origin: EventOrigin::Gateway,
+            verbosity: EventVerbosity::Semantic,
+            target: None,
+            server_time: None,
+            received_at: now,
+            correlation: EventCorrelation::default(),
+            semantic: Some(EventPayload::Pressure(pressure)),
+            wire: None,
+            mentions_me: false,
+        };
+        if self.journal.push(event).is_ok() {
+            self.notify_journal_append();
+            self.flush_event_reads(false);
+        }
+        // The same counters appear in `status`, so a client watching connection
+        // health learns it is losing events without reading the stream at all.
+        self.notify_resources(&["status"]);
     }
 
     async fn wait_reconnect(&mut self, delay: Duration) -> ReconnectDecision {
@@ -1793,6 +1878,27 @@ impl AgentActor {
         if connection != ConnectionState::Ready {
             state.registered = false;
         }
+        // Degradation is the transition an operator has to be able to find in a
+        // trace without a client attached, so it is logged at a level that
+        // survives a default filter and carries the detail callers see in
+        // `last_error`.
+        if matches!(
+            connection,
+            ConnectionState::Reconnecting | ConnectionState::TerminalError
+        ) {
+            tracing::warn!(
+                agent_id = %self.id,
+                connection_state = ?connection,
+                detail = state.last_error.as_deref().unwrap_or("none"),
+                "IRC connection degraded"
+            );
+        } else {
+            tracing::debug!(
+                agent_id = %self.id,
+                connection_state = ?connection,
+                "IRC connection state changed"
+            );
+        }
         self.state.send_replace(state);
         let event = NewEvent {
             agent_id: self.id.clone(),
@@ -1829,6 +1935,11 @@ impl AgentActor {
         state.motd = motd.clone();
         state.snapshot_at = now;
         state.last_error = None;
+        // A ready connection has no attempt pending. The supervisor resets the
+        // backoff a moment later, but clearing it here is what makes "ready
+        // implies no scheduled attempt" true for every snapshot taken in
+        // between, rather than only for the ones that arrive late enough.
+        state.reconnect = ReconnectState::default();
         self.state.send_replace(state);
         let event = NewEvent {
             agent_id: self.id.clone(),
@@ -1985,12 +2096,34 @@ impl AgentActor {
         Ok(())
     }
 
+    /// Publish the scheduled reconnect attempt, or clear it after recovery.
+    ///
+    /// `next_attempt_at` is the only field that tells a caller *when* the relay
+    /// will try again; `delay_ms` alone leaves it guessing how much of the wait
+    /// has already elapsed since it read the resource. A zero delay means the
+    /// backoff sequence was reset, so both fields clear together.
     fn update_reconnect_state(&mut self, attempt: u32, delay: Duration) {
+        let now = Timestamp::now();
         let mut state = self.state.borrow().clone();
         state.reconnect.attempt = attempt;
         state.reconnect.delay_ms = (!delay.is_zero()).then_some(delay.as_millis() as u64);
-        state.reconnect.next_attempt_at = None;
-        state.snapshot_at = Timestamp::now();
+        state.reconnect.next_attempt_at = (!delay.is_zero()).then(|| {
+            Timestamp::from_datetime(
+                now.as_datetime()
+                    + chrono::Duration::milliseconds(
+                        i64::try_from(delay.as_millis()).unwrap_or(i64::MAX),
+                    ),
+            )
+        });
+        state.snapshot_at = now;
+        let scheduled = state.reconnect.next_attempt_at.map(Timestamp::to_rfc3339);
+        tracing::info!(
+            agent_id = %self.id,
+            attempt,
+            delay_ms = delay.as_millis() as u64,
+            next_attempt_at = scheduled.as_deref().unwrap_or("none"),
+            "reconnect schedule updated"
+        );
         self.state.send_replace(state);
         self.notify_resources(&["status"]);
     }

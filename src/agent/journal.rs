@@ -69,6 +69,9 @@ pub enum EventClass {
     /// Complete server MOTD.
     #[serde(rename = "server.motd")]
     ServerMotd,
+    /// Journal retention pressure: eviction has begun discarding events.
+    #[serde(rename = "journal.pressure")]
+    JournalPressure,
     /// Incoming direct-chat offer.
     #[serde(rename = "dcc.chat.offered")]
     DccChatOffered,
@@ -194,6 +197,8 @@ pub enum EventPayload {
     DccFailure(DccFailure),
     /// A line the framing layer refused.
     MalformedLine(MalformedLine),
+    /// Retention pressure inside the journal itself.
+    Pressure(JournalPressure),
 }
 
 /// One line exchanged over a DCC CHAT session.
@@ -582,6 +587,10 @@ pub struct EventPage {
 }
 
 /// Bounded journal measurements exposed by the event resource.
+///
+/// The eviction counters are cumulative over the life of the stream, so a
+/// caller that samples them twice learns whether the window moved under it
+/// between reads without having to hold a cursor to find out.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct JournalStats {
     /// Current stream identifier.
@@ -594,6 +603,43 @@ pub struct JournalStats {
     pub retained_events: usize,
     /// Approximate serialized bytes retained.
     pub retained_bytes: usize,
+    /// Records eviction has discarded since this stream began.
+    pub evicted_events: u64,
+    /// Approximate serialized bytes eviction has discarded since this stream
+    /// began.
+    pub evicted_bytes: u64,
+    /// When eviction most recently discarded a record, if it ever has.
+    pub last_eviction_at: Option<Timestamp>,
+    /// Records refused outright because one event exceeded the whole byte
+    /// budget. These were never retained, so they are counted apart from
+    /// eviction: no cursor ever addressed them.
+    pub oversized_rejections: u64,
+}
+
+/// Retention pressure observed by one agent's event journal.
+///
+/// This is the early warning that precedes `event_gap`: eviction has already
+/// begun discarding records, so a caller holding an old cursor is on a clock.
+/// A client that sees it should read its events promptly, or narrow its filters
+/// so that fewer records compete for the same budget.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct JournalPressure {
+    /// Records eviction has discarded since this stream began.
+    pub evicted_events: u64,
+    /// Approximate serialized bytes eviction has discarded since this stream
+    /// began.
+    pub evicted_bytes: u64,
+    /// Records discarded since the previous pressure record, so a client never
+    /// has to infer the loss rate from the reporting cadence.
+    pub evicted_since_previous_report: u64,
+    /// Oldest position still retained when the report was taken.
+    pub oldest_available: Option<EventCursor>,
+    /// Records retained when the report was taken.
+    pub retained_events: usize,
+    /// Configured retained-record bound.
+    pub max_events: usize,
+    /// Configured retained-byte bound.
+    pub max_bytes: usize,
 }
 
 /// Failure to retain an event within configured bounds.
@@ -612,6 +658,19 @@ pub enum JournalError {
     Serialization(#[from] serde_json::Error),
 }
 
+/// Shortest interval between two journal-pressure records.
+///
+/// A pressure report is itself a journal event, so an unthrottled one would be
+/// another record competing for the budget it is warning about, and would wake
+/// every subscriber once per evicted event — pressure reporting would amplify
+/// the pressure. The first eviction after a quiet interval is reported
+/// immediately, so the warning stays early; after that a report costs at most
+/// one record every ten seconds, under a tenth of a percent of the default
+/// retained-record budget. Because each report carries the loss accumulated
+/// since the previous one, throttling changes the cadence of the warning and
+/// never the numbers a client reads out of it.
+pub const PRESSURE_REPORT_INTERVAL_MS: i64 = 10_000;
+
 /// Bounded journal with wake-up notifications but no per-reader state.
 #[derive(Debug)]
 pub struct EventJournal {
@@ -621,6 +680,17 @@ pub struct EventJournal {
     max_bytes: usize,
     retained_bytes: usize,
     events: VecDeque<(IrcEvent, usize)>,
+    evicted_events: u64,
+    evicted_bytes: u64,
+    last_eviction_at: Option<Timestamp>,
+    oversized_rejections: u64,
+    /// Records evicted since the last pressure report was taken. Kept separate
+    /// from the cumulative counter so a throttled report still accounts for
+    /// everything lost while it was waiting to be emitted.
+    evicted_since_report: u64,
+    /// When the last pressure report was taken, which is what the rate limit
+    /// measures from.
+    reported_at: Option<Timestamp>,
 }
 
 impl EventJournal {
@@ -636,6 +706,12 @@ impl EventJournal {
             max_bytes,
             retained_bytes: 0,
             events: VecDeque::new(),
+            evicted_events: 0,
+            evicted_bytes: 0,
+            last_eviction_at: None,
+            oversized_rejections: 0,
+            evicted_since_report: 0,
+            reported_at: None,
         }
     }
 
@@ -663,21 +739,75 @@ impl EventJournal {
         let raw_bytes = event.wire.as_ref().map_or(0, |wire| wire.raw_bytes.len());
         let bytes = serde_json::to_vec(&event)?.len().saturating_add(raw_bytes);
         if bytes > self.max_bytes {
+            self.oversized_rejections = self.oversized_rejections.saturating_add(1);
             return Err(JournalError::EventTooLarge {
                 actual: bytes,
                 limit: self.max_bytes,
             });
         }
 
+        let arrived_at = event.received_at;
+        let arrived_class = event.class;
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.retained_bytes = self.retained_bytes.saturating_add(bytes);
         self.events.push_back((event, bytes));
+        let mut evicted = 0_u64;
         while self.events.len() > self.max_events || self.retained_bytes > self.max_bytes {
             if let Some((_, removed_bytes)) = self.events.pop_front() {
                 self.retained_bytes = self.retained_bytes.saturating_sub(removed_bytes);
+                self.evicted_bytes = self.evicted_bytes.saturating_add(removed_bytes as u64);
+                evicted = evicted.saturating_add(1);
             }
         }
+        if evicted > 0 {
+            self.evicted_events = self.evicted_events.saturating_add(evicted);
+            // A pressure record must not count its own eviction toward the next
+            // report. A journal that is full but idle would otherwise warn
+            // forever: each report evicts one record, and that eviction would
+            // justify the following report. The cumulative counters still
+            // include it, so a client diffing them is never misled.
+            if arrived_class != EventClass::JournalPressure {
+                self.evicted_since_report = self.evicted_since_report.saturating_add(evicted);
+            }
+            // Eviction happens because this record arrived, so its receipt time
+            // is when the window moved; taking a second clock reading here
+            // would only disagree with the event that caused it.
+            self.last_eviction_at = Some(arrived_at);
+        }
         Ok(cursor)
+    }
+
+    /// Take a pending retention-pressure report, subject to the rate limit
+    /// documented on [`PRESSURE_REPORT_INTERVAL_MS`].
+    ///
+    /// Eviction happens inside [`Self::push`], but the report is a journal
+    /// record of its own, and pushing it from the eviction loop would re-enter
+    /// `push` while the journal is still over budget. The owning actor drains
+    /// this from its housekeeping tick instead, which also bounds the report
+    /// rate by the tick rather than by how fast events arrive.
+    ///
+    /// Returns `None` when nothing has been evicted since the previous report,
+    /// so a journal that never evicts never reports.
+    pub fn take_pressure_report(&mut self, now: Timestamp) -> Option<JournalPressure> {
+        if self.evicted_since_report == 0 {
+            return None;
+        }
+        if let Some(reported_at) = self.reported_at
+            && now.as_datetime() - reported_at.as_datetime()
+                < chrono::Duration::milliseconds(PRESSURE_REPORT_INTERVAL_MS)
+        {
+            return None;
+        }
+        self.reported_at = Some(now);
+        Some(JournalPressure {
+            evicted_events: self.evicted_events,
+            evicted_bytes: self.evicted_bytes,
+            evicted_since_previous_report: std::mem::take(&mut self.evicted_since_report),
+            oldest_available: self.events.front().map(|(event, _)| event.cursor.clone()),
+            retained_events: self.events.len(),
+            max_events: self.max_events,
+            max_bytes: self.max_bytes,
+        })
     }
 
     /// Read matching events after a caller-owned cursor.
@@ -779,6 +909,10 @@ impl EventJournal {
             latest: self.latest_cursor(),
             retained_events: self.events.len(),
             retained_bytes: self.retained_bytes,
+            evicted_events: self.evicted_events,
+            evicted_bytes: self.evicted_bytes,
+            last_eviction_at: self.last_eviction_at,
+            oversized_rejections: self.oversized_rejections,
         }
     }
 
@@ -997,6 +1131,178 @@ mod tests {
         let page = journal.read(Some(&before_first), 10, &CursorQuery::default());
         assert_eq!(page.status, CursorStatus::EventGap);
         assert_eq!(page.events[0].class, EventClass::MessageChannel);
+    }
+
+    /// Offset a fixture instant, so the rate-limit tests never touch the clock.
+    fn later(base: Timestamp, milliseconds: i64) -> Timestamp {
+        Timestamp::from_datetime(base.as_datetime() + chrono::Duration::milliseconds(milliseconds))
+    }
+
+    #[test]
+    fn eviction_counters_record_exactly_the_events_and_bytes_discarded() {
+        let agent_id = AgentId::new();
+        let mut journal = EventJournal::new(2, 16 * 1024);
+        journal
+            .push(event(&agent_id, EventClass::MessagePrivate))
+            .expect("first");
+        // Sizes are measured rather than assumed: the byte cost of a record
+        // includes its own cursor, so no two are guaranteed to be equal.
+        let first_bytes = journal.stats().retained_bytes;
+        journal
+            .push(event(&agent_id, EventClass::MessageChannel))
+            .expect("second");
+        let second_bytes = journal.stats().retained_bytes - first_bytes;
+        assert_eq!(journal.stats().evicted_events, 0, "nothing dropped yet");
+
+        let evicting = later(
+            "2026-08-16T00:00:00.000Z".parse().expect("fixture instant"),
+            5_000,
+        );
+        journal
+            .push(NewEvent {
+                received_at: evicting,
+                ..event(&agent_id, EventClass::MessageNotice)
+            })
+            .expect("third");
+        let stats = journal.stats();
+        assert_eq!(stats.evicted_events, 1);
+        assert_eq!(stats.evicted_bytes, first_bytes as u64);
+        assert_eq!(stats.last_eviction_at, Some(evicting));
+        assert_eq!(stats.retained_events, 2);
+        assert_eq!(stats.oversized_rejections, 0);
+
+        journal
+            .push(event(&agent_id, EventClass::MessageNotice))
+            .expect("fourth");
+        let stats = journal.stats();
+        assert_eq!(stats.evicted_events, 2);
+        assert_eq!(stats.evicted_bytes, (first_bytes + second_bytes) as u64);
+    }
+
+    #[test]
+    fn an_oversized_event_is_counted_apart_from_eviction() {
+        let agent_id = AgentId::new();
+        // Smaller than any serialized record, so every push is refused outright.
+        let mut journal = EventJournal::new(4, 32);
+        for _ in 0..2 {
+            assert!(matches!(
+                journal.push(event(&agent_id, EventClass::MessageChannel)),
+                Err(JournalError::EventTooLarge { .. })
+            ));
+        }
+
+        let stats = journal.stats();
+        assert_eq!(stats.oversized_rejections, 2);
+        // A refused record was never retained, so no cursor addressed it and
+        // nothing was evicted to make room for it.
+        assert_eq!(stats.evicted_events, 0);
+        assert_eq!(stats.evicted_bytes, 0);
+        assert!(stats.last_eviction_at.is_none());
+        assert_eq!(stats.retained_events, 0);
+    }
+
+    #[test]
+    fn a_journal_that_never_evicts_reports_no_pressure() {
+        let agent_id = AgentId::new();
+        let mut journal = EventJournal::new(8, 1_000_000);
+        let now: Timestamp = "2026-08-16T00:00:00.000Z".parse().expect("fixture instant");
+        for _ in 0..4 {
+            journal
+                .push(event(&agent_id, EventClass::MessageChannel))
+                .expect("push");
+        }
+
+        assert!(journal.take_pressure_report(now).is_none());
+        let stats = journal.stats();
+        assert_eq!(stats.evicted_events, 0);
+        assert_eq!(stats.evicted_bytes, 0);
+        assert_eq!(stats.oversized_rejections, 0);
+        assert!(stats.last_eviction_at.is_none());
+    }
+
+    #[test]
+    fn sustained_eviction_reports_pressure_at_most_once_per_interval() {
+        let agent_id = AgentId::new();
+        let mut journal = EventJournal::new(2, 16 * 1024);
+        let start: Timestamp = "2026-08-16T00:00:00.000Z".parse().expect("fixture instant");
+        for _ in 0..4 {
+            journal
+                .push(event(&agent_id, EventClass::MessageChannel))
+                .expect("push");
+        }
+
+        let first = journal
+            .take_pressure_report(start)
+            .expect("the first eviction after a quiet interval reports immediately");
+        assert_eq!(first.evicted_events, 2);
+        assert_eq!(first.evicted_since_previous_report, 2);
+        assert_eq!(first.retained_events, 2);
+        assert_eq!(first.max_events, 2);
+        assert_eq!(
+            first
+                .oldest_available
+                .as_ref()
+                .map(|cursor| cursor.sequence),
+            Some(3)
+        );
+
+        assert!(
+            journal.take_pressure_report(later(start, 1)).is_none(),
+            "a second report inside the interval would amplify the pressure it reports"
+        );
+        for _ in 0..3 {
+            journal
+                .push(event(&agent_id, EventClass::MessageChannel))
+                .expect("push");
+        }
+        assert!(
+            journal
+                .take_pressure_report(later(start, PRESSURE_REPORT_INTERVAL_MS - 1))
+                .is_none(),
+            "sustained eviction must not shorten the interval"
+        );
+
+        let second = journal
+            .take_pressure_report(later(start, PRESSURE_REPORT_INTERVAL_MS))
+            .expect("the interval elapsed with events still being discarded");
+        assert_eq!(
+            second.evicted_since_previous_report, 3,
+            "a throttled report still accounts for everything lost while it waited"
+        );
+        assert_eq!(second.evicted_events, 5);
+    }
+
+    #[test]
+    fn a_pressure_record_never_reports_its_own_eviction() {
+        let agent_id = AgentId::new();
+        let mut journal = EventJournal::new(2, 16 * 1024);
+        let start: Timestamp = "2026-08-16T00:00:00.000Z".parse().expect("fixture instant");
+        for _ in 0..3 {
+            journal
+                .push(event(&agent_id, EventClass::MessageChannel))
+                .expect("push");
+        }
+        journal
+            .take_pressure_report(start)
+            .expect("eviction began, so the first report fires");
+
+        // The report itself is journaled, and the journal is full, so writing it
+        // evicts a record. Counting that would make a full but idle journal warn
+        // forever.
+        journal
+            .push(event(&agent_id, EventClass::JournalPressure))
+            .expect("pressure record");
+        assert!(
+            journal
+                .take_pressure_report(later(start, PRESSURE_REPORT_INTERVAL_MS))
+                .is_none(),
+            "pressure reporting must not sustain itself once traffic stops"
+        );
+        assert_eq!(
+            journal.stats().evicted_events,
+            2,
+            "the cumulative counters stay exact even though the report is not requeued"
+        );
     }
 
     #[test]
