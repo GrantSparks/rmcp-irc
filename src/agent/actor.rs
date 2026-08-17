@@ -3208,12 +3208,15 @@ mod tests {
         let root = parent.path().join("downloads");
         let nested = root.join("nested");
         tokio::fs::create_dir_all(&nested).await.expect("nested");
+        let canonical_nested = tokio::fs::canonicalize(&nested)
+            .await
+            .expect("canonical nested directory");
 
         assert_eq!(
             confined_dcc_destination(&root, std::path::Path::new("nested/report.txt"))
                 .await
                 .expect("inside root"),
-            nested.join("report.txt")
+            canonical_nested.join("report.txt")
         );
         assert!(
             confined_dcc_destination(&root, std::path::Path::new("../escape.txt"))
