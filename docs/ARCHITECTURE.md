@@ -127,6 +127,47 @@ current answer use `irc.query`.
 See [EVENTS_AND_STATE.md](EVENTS_AND_STATE.md) for the event envelope, cursor
 rules, and reduced state.
 
+## Async delivery and model attention
+
+MCP `2026-07-28` delivers asynchronous changes only inside a
+client-opened `subscriptions/listen` response stream. A client keeps one such
+stream and merges every required list-change category and resource URI into its
+filter; creating an IRC watch does not create a second listener. A matching
+resource update wakes the host application, not a language model.
+
+The delivery mechanisms remain deliberately separate:
+
+| Mechanism | Carries | When it can act |
+| --- | --- | --- |
+| Consolidated `subscriptions/listen` | Resource/list changes, and task IDs when the Tasks extension and server implementation support them | Wakes the host while the stream is open; the host decides whether to start a model turn. |
+| Ordinary successful-result `activity` hint | Bounded unread counts for registered watches | Reaches a model already making a tool call; cannot wake an idle one. |
+| Top-level MRTR `input_required` | Information needed to finish the active tool, prompt, or resource request | Returned from that request and answered by retrying it. |
+| Task `input_required` | Information a particular long-running task later needs | Observed through task polling/status notification and answered with `tasks/update`. |
+| At-most-60-second attention check | Compact selected IRC events and a caller-owned checkpoint | Portable fallback only when the host cannot resume the model from a watch notification. |
+
+`irc.attention.open` registers one immutable compound watch for direct or
+addressed conversation, account-identified human messages, full inbound traffic
+in selected task targets, and sparse actionable lifecycle signals. It returns
+both the filter addition for the consolidated listener and a portable fallback
+prompt. The returned `modelResumeResource` identifies the filtered watch update
+that warrants a model turn; other notifications in the same host stream can
+update cache, UI, or resynchronization state without invoking a model. A capable
+host can resume the model only on that signal and therefore spends no model
+tokens while IRC is quiet. Otherwise Claude or Codex
+must run the fallback in the same conversation immediately and at least every
+60 seconds, using nonblocking `irc.attention.check` calls and a caller-owned
+checkpoint. The check explicitly aligns the separate activity-hint anchor after
+each page, so already handled activity does not remain advertised on later tool
+results. Quiet scheduled model turns still consume tokens.
+
+Top-level Multi Round-Trip Requests are complementary: they may request more
+input while the server is already processing a client request, but cannot
+originate from an IRC event or wake an idle host/model. Task `input_required` is
+a distinct later-input state for a particular long-running request, not a
+general notification bus. Scheduled attention checks are ordinary stateless MCP
+requests and therefore carry the complete required per-request metadata and
+caller credentials every time.
+
 ## Bounds and concurrency
 
 The process and each actor enforce configured bounds for:

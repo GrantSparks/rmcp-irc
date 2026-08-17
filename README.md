@@ -20,6 +20,11 @@ connection, state snapshot, and bounded event stream.
 - Targeted watch resources with subscription wake-ups and wholly caller-owned
   cursors: reading a watch never consumes anything, so host-initiated re-reads
   are harmless. Bounded `irc.events.read` long polling remains the fallback.
+- Compound `irc.attention.open` and token-minimized `irc.attention.check` tools
+  for direct/addressed messages, account-identified humans, and complete task
+  channel traffic, plus sparse connection/MOTD/protocol/retention/DCC signals.
+  A drained attention checkpoint advances past irrelevant traffic without
+  changing general event-cursor semantics.
 - Stable typed tools for common IRC operations, including negotiated reaction,
   redaction, read-marker, and typing support. Structured `irc.execute` covers
   other commands; no tool accepts raw IRC lines.
@@ -31,10 +36,10 @@ connection, state snapshot, and bounded event stream.
 - Bounded unread activity hints piggybacked on successful results, so a host that
   never schedules a turn on a notification still learns what arrived: counts per
   watched target, measured against a caller-owned anchor that only an explicit
-  `irc.events.read` moves. A hint is a mirror, never a read — it advances no
-  cursor and consumes no watch.
-- Four reusable MCP prompts for connecting, watching mentions, joining with
-  context, and summarizing/responding.
+  event or attention read moves. A hint is a mirror, never a read — it advances
+  no cursor and consumes no watch.
+- Five reusable MCP prompts for connecting, maintaining model attention,
+  watching mentions, joining with context, and summarizing/responding.
 - Lossless inbound and outbound wire events, including unknown extensions and
   invalid UTF-8 represented as base64.
 - Correlated command replies, caller-owned event cursors, and explicit stream
@@ -173,7 +178,10 @@ path reported by `command -v irc-mcp`. For an existing server, append
 
 After MCP initialization, call `irc.connect`. The result includes the accepted
 nickname, the server's MOTD, the agent ID, and links to the agent's resources.
-Read and follow the MOTD before participating.
+Read and follow the MOTD before participating. Before the foreground turn ends,
+call `irc.attention.open`; its result tells the host how to merge the watch and
+the agent's lifecycle resources into one `subscriptions/listen` stream and
+provides the provider-neutral one-minute model fallback.
 
 ### Streamable HTTP
 
@@ -207,17 +215,28 @@ does this for its `irc` network alias. HTTP responses are marked
 | Identity | `irc.connect`, `irc.disconnect`, `irc.status` |
 | Channels and messages | `irc.join`, `irc.part`, `irc.send`, `irc.history`, typed topic/reaction/redaction/read/typing tools |
 | Queries and commands | `irc.query`, `irc.execute` |
-| Events | `irc.watch.create`, `irc.watch.close`, `irc.events.read` |
+| Events | `irc.attention.open`, `irc.attention.check`, `irc.watch.create`, `irc.watch.close`, `irc.events.read` |
 | DCC | `irc.dcc.chat.open`, `irc.dcc.chat.send`, `irc.dcc.send`, `irc.dcc.accept`, `irc.dcc.reject`, `irc.dcc.cancel`, `irc.dcc.list`; SEND/accept run as MCP tasks for clients declaring the tasks extension |
 
 The stable typed semantic surface additionally includes WHOIS, NAMES, LIST,
-HELP, topic, nickname, away, invite, kick, monitor, and mode tools. Four
-user-selectable MCP prompts guide connect, mention-watch, join, and
-summarize/respond workflows. Negotiated IRCv3 tools cover reactions, message
+HELP, topic, nickname, away, invite, kick, monitor, and mode tools. Five
+user-selectable MCP prompts guide connect, ongoing attention, mention-watch,
+join, and summarize/respond workflows. Negotiated IRCv3 tools cover reactions, message
 redaction, synchronized read markers, and privacy-sensitive typing indicators
 without implying that a resource notification can force or schedule a model
 turn: notifications wake the host application, and this protocol version has no
 server-initiated sampling with which to do more.
+
+For MCP 2026-07-28, a client opens one consolidated
+`subscriptions/listen` stream and merges every list-change category and stable
+resource URI it needs into that filter. `irc.attention.open` contributes its
+filtered watch URI plus status, MOTD, protocol, reduced-state, and DCC resource
+URIs. The stream multiplexes all host notifications; the returned filtered
+watch URI is the model-resume trigger, while other URIs can refresh cache or UI
+without invoking a model. Multi Round-Trip Requests are only for input required
+during an already active request and are not an event channel. Task
+`input_required` is likewise scoped to a particular long-running operation;
+neither mechanism should be repurposed for ambient IRC activity.
 
 Resources are the primary context plane: per-agent URIs expose connection
 status, protocol discovery, MOTD, reduced state, a compact inbox and
@@ -248,11 +267,18 @@ and monotonic sequence. Callers maintain their own cursors:
   ordered delivery.
 
 Clients that do not expose MCP resource subscriptions cannot receive those
-wake-up signals. They must keep an `irc.events.read` long poll active, passing
-the previous `next_cursor` into the next call, to remain responsive. Every
-successful tool result also carries a bounded activity hint for the agent it
-names, so even a client that only ever calls tools learns that a read is worth
-making; the hint reports and never consumes.
+wake-up signals. A direct non-model host can keep an `irc.events.read` long poll
+active without spending model tokens. Claude/Codex hosts that cannot resume a
+model from a notification can instead schedule the ordinary prompt returned by
+`irc.attention.open` immediately and at least every 60 seconds, using
+`irc.attention.check` with `wait_ms: 0` and `set_activity_anchor: true`. Every
+scheduled quiet turn still consumes model tokens; only the host-side
+notification/long-poll bridge has zero idle model cost. Ordinary successful
+tool results also carry a bounded activity hint for the agent they name, so a
+model that is already working learns opportunistically that a read is
+worthwhile; `irc.attention.check` omits the redundant hint to keep its recurring
+quiet path small. A hint reports and never consumes, but cannot wake an idle
+model by itself.
 
 State resources are best-effort snapshots. Use `irc.query` when a current
 server response is required. See [events and state](docs/EVENTS_AND_STATE.md).

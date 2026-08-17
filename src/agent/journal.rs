@@ -18,7 +18,7 @@ use crate::{
         semantic::{SemanticClass, SemanticEvent, SemanticProjection, Source},
         wire::WireMessage,
     },
-    mcp::conversation::CompactEvent,
+    mcp::{conversation::CompactEvent, watch::AttentionSelection},
     time::Timestamp,
 };
 
@@ -415,6 +415,10 @@ pub struct CursorQuery {
     pub case_mapping: CaseMapping,
     /// Event classes to keep. Empty means every class.
     pub classes: BTreeSet<EventClass>,
+    /// Optional compound selection used by a model-attention watch. It is an
+    /// OR predicate inside the ordinary direction/class bounds rather than a
+    /// target or mention filter of its own.
+    pub attention: Option<AttentionSelection>,
     /// Keep only records [`CompactEvent`] can project, so a read that returns
     /// compact events advances only over events it actually returned.
     pub conversational_only: bool,
@@ -446,6 +450,13 @@ impl CursorQuery {
             }
         }
         if !self.filter.matches(event) {
+            return false;
+        }
+        if self
+            .attention
+            .as_ref()
+            .is_some_and(|attention| !attention.matches(event, self.case_mapping))
+        {
             return false;
         }
         // Last, because it is the only test that has to build a projection.

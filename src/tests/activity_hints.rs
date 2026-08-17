@@ -311,6 +311,70 @@ async fn the_anchor_moves_only_for_a_read_that_asked_for_it() {
     );
 }
 
+/// The compact scheduler read can acknowledge the same courtesy hint without
+/// consuming its caller-owned attention cursor. This keeps the two merged
+/// delivery features from advertising a page forever after it was handled.
+#[tokio::test]
+async fn an_attention_check_can_align_the_hint_anchor_without_consuming_delivery() {
+    let fixture = Fixture::start().await;
+    let opened = fixture
+        .call("irc.attention.open", json!({"agent_id": fixture.agent}))
+        .await;
+    let attention = &opened["structuredContent"]["result"];
+    let watch_id = attention["watch"]["watch_id"].clone();
+    let initial_cursor = attention["initial_cursor"].clone();
+
+    fixture.peer_says("Ariadne", "attention please").await;
+    assert_eq!(fixture.hint().await["total"], json!(1));
+
+    let checked = fixture
+        .call(
+            "irc.attention.check",
+            json!({
+                "agent_id": fixture.agent,
+                "watch_id": watch_id,
+                "cursor": initial_cursor,
+                "wait_ms": 0,
+                "set_activity_anchor": true,
+            }),
+        )
+        .await;
+    let page = &checked["structuredContent"]["result"];
+    assert_eq!(page["state"], "events", "{checked}");
+    assert_eq!(
+        page["events"].as_array().map(Vec::len),
+        Some(1),
+        "{checked}"
+    );
+    assert!(
+        checked["structuredContent"]["activity"].is_null(),
+        "the recurring check is already an activity read and carries no redundant hint: {checked}"
+    );
+    let later_hint = fixture.hint().await;
+    assert_eq!(
+        later_hint["anchor"], page["resume_cursor"],
+        "the next ordinary result sees the explicit acknowledgement"
+    );
+    assert_eq!(later_hint["total"], 0);
+
+    // The old cursor still returns the same page: only the hint anchor moved.
+    let retried = fixture
+        .call(
+            "irc.attention.check",
+            json!({
+                "agent_id": fixture.agent,
+                "watch_id": watch_id,
+                "cursor": initial_cursor,
+                "wait_ms": 0,
+            }),
+        )
+        .await;
+    assert_eq!(
+        retried["structuredContent"]["result"]["events"], page["events"],
+        "acknowledging a hint never consumes the attention window"
+    );
+}
+
 /// Counts stop at the published cap with a marker, and the total keeps what the
 /// map dropped.
 #[tokio::test]

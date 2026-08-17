@@ -295,6 +295,32 @@ async fn every_tool_result_conforms_to_the_schema_that_tool_declared() {
         .expect("a watch handle")
         .to_owned();
 
+    let attention = call(
+        &router,
+        "irc.attention.open",
+        json!({"agent_id": agent, "full_traffic_targets": ["#agents"]}),
+    )
+    .await;
+    check("irc.attention.open", &attention);
+    let attention_watch = attention["structuredContent"]["result"]["watch"]["watch_id"]
+        .as_str()
+        .expect("an attention watch handle")
+        .to_owned();
+    let attention_cursor = attention["structuredContent"]["result"]["initial_cursor"].clone();
+    let attention_check = call(
+        &router,
+        "irc.attention.check",
+        json!({
+            "agent_id": agent,
+            "watch_id": attention_watch,
+            "cursor": attention_cursor,
+            "wait_ms": 0,
+            "set_activity_anchor": true,
+        }),
+    )
+    .await;
+    check("irc.attention.check", &attention_check);
+
     // An offered incoming transfer, so acceptance has something real to act on.
     // A peer that listens and says nothing keeps the session non-terminal for
     // as long as this test needs it.

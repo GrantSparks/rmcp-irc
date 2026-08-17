@@ -1,6 +1,7 @@
 //! Stable MCP service, tool schemas, and resource URI templates.
 
 pub mod activity;
+pub mod attention;
 pub mod authorization;
 pub mod confirm_action;
 pub mod connect_nickname;

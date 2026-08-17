@@ -105,9 +105,9 @@ struct OwnedAgent {
     /// How this caller asked for its hints, fixed at registration.
     activity: ActivityPreference,
     /// The position hint counts are measured from. Born as the stream's
-    /// position at registration and moved by exactly one thing: an
-    /// `irc.events.read` that passed `set_activity_anchor`. It is not a
-    /// delivery cursor and nothing reads through it.
+    /// position at registration and moved only by an explicit
+    /// `set_activity_anchor` on an event or attention read. It is not a delivery
+    /// cursor and nothing reads through it.
     activity_anchor: EventCursor,
 }
 
@@ -413,10 +413,11 @@ impl Gateway {
 
     /// Record where this caller says it has read to.
     ///
-    /// The only writer of the anchor in the whole gateway. Everything else that
-    /// looks like progress — a tool result, a resource read, a notification, a
-    /// watch window — leaves it exactly where the caller put it, which is what
-    /// makes two identical calls produce two identical hints.
+    /// The only writer of the anchor in the whole gateway. Both model-facing
+    /// read tools call it only when their explicit flag asks them to. Everything
+    /// else that looks like progress — an ordinary tool result, a resource read,
+    /// a notification, a watch window — leaves it exactly where the caller put
+    /// it, which is what makes two identical calls produce two identical hints.
     pub async fn set_activity_anchor(&self, agent_id: &AgentId, cursor: EventCursor) {
         if let Some(agent) = self.agents.write().await.get_mut(agent_id) {
             agent.activity_anchor = cursor;
@@ -515,13 +516,49 @@ impl Gateway {
             .await
     }
 
+    /// Read one compound attention watch and advance only the returned journal
+    /// page; the MCP projection decides whether a fully drained page may adopt
+    /// the stream high-water mark as its next checkpoint.
+    ///
+    /// Unlike the general watch path, every selected record must have a compact
+    /// attention projection: conversation or a sparse actionable lifecycle
+    /// summary. This keeps a scheduled quiet check small and ensures its
+    /// checkpoint never advances over a selected event the model result omitted.
+    pub async fn read_attention_events(
+        &self,
+        agent_id: &AgentId,
+        watch_id: &WatchId,
+        cursor: EventCursor,
+        limit: usize,
+        wait: Duration,
+    ) -> Result<EventPage> {
+        let watch = self.touch_watch(watch_id)?;
+        if watch.agent_id != *agent_id {
+            return Err(GatewayError::InvalidMessage(format!(
+                "watch {watch_id} selects from agent {} rather than {agent_id}",
+                watch.agent_id
+            )));
+        }
+        if watch.filter.attention.is_none() {
+            return Err(GatewayError::InvalidMessage(format!(
+                "watch {watch_id} is a general watch; create model attention with \
+                 irc.attention.open"
+            )));
+        }
+        let handle = self.resolve(&watch.agent_id).await?;
+        let case_mapping = case_mapping_of(&handle.snapshot().await?);
+        let query = watch.filter.cursor_query(case_mapping);
+        handle.read_events(Some(cursor), limit, wait, query).await
+    }
+
     /// Read one positioned, compact window of what a watch selects.
     ///
     /// The position arrives in the resource URI, so the read is idempotent: the
-    /// same URI always answers with the same window. Records with no
-    /// conversational form are excluded by the selection rather than dropped
-    /// after it, which is what keeps the returned `next_cursor` a position over
-    /// events the caller actually received.
+    /// same URI always answers with the same window. Ordinary watches exclude
+    /// records with no conversational form during selection. Attention watches
+    /// admit only conversation plus lifecycle classes with compact attention
+    /// projections. In both cases, `next_cursor` advances over events the caller
+    /// actually received.
     pub async fn read_watch_window(
         &self,
         watch_id: &WatchId,
@@ -531,7 +568,7 @@ impl Gateway {
         let handle = self.resolve(&watch.agent_id).await?;
         let snapshot = handle.snapshot().await?;
         let mut query = watch.filter.cursor_query(case_mapping_of(&snapshot));
-        query.conversational_only = true;
+        query.conversational_only = watch.filter.attention.is_none();
         let page = handle
             .read_events(
                 Some(cursor.clone()),

@@ -306,6 +306,24 @@ async fn a_complete_request_reaches_the_tool_surface() {
         status["outputSchema"]["oneOf"][1]["properties"]["ok"]["const"], false,
         "{status}"
     );
+    let attention_open = tools
+        .iter()
+        .find(|tool| tool["name"] == "irc.attention.open")
+        .unwrap_or_else(|| panic!("irc.attention.open is listed: {body}"));
+    assert!(
+        attention_open["inputSchema"]["properties"]["full_traffic_targets"].is_object(),
+        "the compound target policy is part of the strict 2026 tool schema: {attention_open}"
+    );
+    let attention_check = tools
+        .iter()
+        .find(|tool| tool["name"] == "irc.attention.check")
+        .unwrap_or_else(|| panic!("irc.attention.check is listed: {body}"));
+    assert!(
+        attention_check["outputSchema"]["oneOf"][0]["properties"]["result"]["properties"]
+            ["resume_cursor"]
+            .is_object(),
+        "the attention checkpoint is part of the strict 2026 tool schema: {attention_check}"
+    );
 }
 
 #[tokio::test]
@@ -357,6 +375,46 @@ async fn a_request_without_the_required_metadata_is_rejected() {
             .as_str()
             .is_some_and(|message| message.contains("clientCapabilities")),
         "{body}"
+    );
+}
+
+#[tokio::test]
+async fn scheduled_attention_checks_are_ordinary_strict_stateless_requests() {
+    let router = router(CallerPolicy::Local);
+    let arguments = serde_json::json!({
+        "agent_id": crate::agent::AgentId::new().as_str(),
+        "watch_id": crate::mcp::watch::WatchId::new(),
+        "cursor": { "stream_id": "scheduled-check", "sequence": 0 },
+        "wait_ms": 0,
+    });
+
+    let (missing_status, missing) = send(
+        &router,
+        Envelope::tool_call("irc.attention.check", arguments.clone()).with_meta(None),
+    )
+    .await;
+    assert_eq!(
+        missing_status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "{missing}"
+    );
+    assert_eq!(missing["error"]["code"], -32602, "{missing}");
+
+    let (complete_status, complete) = send(
+        &router,
+        Envelope::tool_call("irc.attention.check", arguments),
+    )
+    .await;
+    assert_eq!(
+        complete_status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "{complete}"
+    );
+    assert!(
+        complete["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unknown or expired handle")),
+        "complete metadata must reach the ordinary per-request ownership gate: {complete}"
     );
 }
 
@@ -1549,10 +1607,10 @@ async fn offered(
 
 #[tokio::test]
 async fn an_accept_that_still_needs_input_creates_no_task_until_it_is_answered() {
-    // The tasks extension resolves input exchanges before a task handle is
-    // returned. Getting this wrong is not cosmetic: the handle arrives after
-    // the originating stream closed, so a question discovered inside the task
-    // has nowhere to be asked and the caller holds a task that cannot succeed.
+    // The tasks extension recommends resolving pre-creation MRTR before a task
+    // handle is returned. A task can later ask through tasks/get/tasks/update,
+    // but this destination decides what transfer is being created and belongs
+    // to the original call.
     let (_server, _scratch, router, agent_id, dcc_session_id) = offered(CallerPolicy::Local).await;
     let accept = |meta: serde_json::Value| {
         Envelope::tool_call(

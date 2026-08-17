@@ -15,7 +15,9 @@
 //! * `irc.events.read` with `watch_id` and the caller's cursor, which applies
 //!   this selection to the lossless journal and can long poll;
 //! * `irc://watches/{id}/events/after/{stream_id}/{sequence}`, which carries the
-//!   position in the path and answers with the compact conversational window.
+//!   position in the path and answers with a compact selected window. Ordinary
+//!   watches select conversational records; attention watches can also select
+//!   sparse actionable lifecycle summaries.
 //!
 //! Both are idempotent: the same position always returns the same window, and
 //! the cursor they hand back advances only over events they actually returned.
@@ -41,7 +43,7 @@ use crate::{
     },
     error::{GatewayError, Result},
     irc::isupport::CaseMapping,
-    mcp::{authorization::OwnerId, conversation::CompactEvent},
+    mcp::{attention::AttentionEvent, authorization::OwnerId, conversation::source_account},
     time::Timestamp,
 };
 
@@ -116,6 +118,81 @@ pub struct WatchFilter {
     /// messages.
     #[serde(default)]
     pub inbound_only: bool,
+    /// Compound model-attention selection. Ordinary watches omit this; an
+    /// `irc.attention.open` watch uses it to combine direct/addressed traffic,
+    /// account-identified human messages, and complete traffic in selected
+    /// task channels with sparse actionable lifecycle signals, without
+    /// maintaining several overlapping watches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<AttentionSelection>,
+}
+
+/// The compound portion of a model-attention watch.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+pub struct AttentionSelection {
+    /// Channels or nicknames whose inbound conversational traffic is all
+    /// relevant, even when it neither mentions the agent nor carries an
+    /// authenticated account.
+    #[serde(default)]
+    pub full_traffic_targets: BTreeSet<String>,
+}
+
+/// Low-volume operational classes that need model attention even when they
+/// are not conversation. This single list is shared by selection, projection
+/// invariants, and tests so a newly selected class cannot be silently dropped.
+pub const SPARSE_ATTENTION_CLASSES: &[EventClass] = &[
+    EventClass::ConnectionLifecycle,
+    EventClass::ServerMotd,
+    EventClass::ProtocolCompatibility,
+    EventClass::ChannelState,
+    EventClass::JournalPressure,
+    EventClass::DccChatOffered,
+    EventClass::DccTransferOffered,
+    EventClass::DccConnected,
+    EventClass::DccChatClosed,
+    EventClass::DccTransferCompleted,
+    EventClass::DccRejected,
+    EventClass::DccCancelled,
+    EventClass::DccFailed,
+];
+
+impl AttentionSelection {
+    /// Whether one event requires model attention.
+    pub fn matches(&self, event: &IrcEvent, case_mapping: CaseMapping) -> bool {
+        // Sparse lifecycle signals are relevant even when gateway-internal. A
+        // scheduled fallback that cannot be woken by the listen stream still
+        // needs to observe them on its next check.
+        if SPARSE_ATTENTION_CLASSES.contains(&event.class) {
+            return true;
+        }
+        if !matches!(
+            event.class,
+            EventClass::MessageChannel
+                | EventClass::MessagePrivate
+                | EventClass::MessageAction
+                | EventClass::MessageNotice
+                | EventClass::DccChatMessage
+        ) {
+            return false;
+        }
+        if event.direction != EventDirection::Inbound {
+            return false;
+        }
+        if event.class == EventClass::DccChatMessage
+            || event.class == EventClass::MessagePrivate
+            || event.mentions_me
+            || source_account(event).is_some()
+        {
+            return true;
+        }
+        let Some(target) = event.target.as_ref() else {
+            return false;
+        };
+        let folded = case_mapping.fold(target);
+        self.full_traffic_targets
+            .iter()
+            .any(|wanted| case_mapping.fold(wanted) == folded)
+    }
 }
 
 impl WatchFilter {
@@ -125,13 +202,16 @@ impl WatchFilter {
     /// watch created for `#Control` still matches traffic the server reports as
     /// `#control`.
     pub fn matches(&self, event: &IrcEvent, case_mapping: CaseMapping) -> bool {
-        if self.mentions_only && !event.mentions_me {
-            return false;
-        }
         if self.inbound_only && event.direction != EventDirection::Inbound {
             return false;
         }
         if !self.classes.is_empty() && !self.classes.contains(&event.class) {
+            return false;
+        }
+        if let Some(attention) = &self.attention {
+            return attention.matches(event, case_mapping);
+        }
+        if self.mentions_only && !event.mentions_me {
             return false;
         }
         if self.targets.is_empty() {
@@ -158,16 +238,20 @@ impl WatchFilter {
         CursorQuery {
             filter: EventFilter {
                 direction: self.inbound_only.then_some(EventDirection::Inbound),
-                mentions_me: self.mentions_only.then_some(true),
+                mentions_me: (self.attention.is_none() && self.mentions_only).then_some(true),
                 ..EventFilter::default()
             },
-            folded_targets: self
-                .targets
-                .iter()
-                .map(|target| case_mapping.fold(target))
-                .collect(),
+            folded_targets: if self.attention.is_some() {
+                BTreeSet::new()
+            } else {
+                self.targets
+                    .iter()
+                    .map(|target| case_mapping.fold(target))
+                    .collect()
+            },
             case_mapping,
             classes: self.classes.clone(),
+            attention: self.attention.clone(),
             conversational_only: false,
         }
     }
@@ -301,10 +385,10 @@ pub struct WatchEventsResource {
     pub oldest_available: Option<EventCursor>,
     /// Newest position assigned in this stream.
     pub latest: EventCursor,
-    /// Selected events, compact and oldest first. Records with no
-    /// conversational form are not part of this window's selection at all; read
-    /// them losslessly with `irc.events.read` and this `watch_id`.
-    pub events: Vec<CompactEvent>,
+    /// Selected events, compact and oldest first. Ordinary watches exclude
+    /// records with no conversational form. Attention watches additionally
+    /// project the sparse lifecycle classes in their compound selection.
+    pub events: Vec<AttentionEvent>,
     /// Position to read from next. It advances only over `events`, so re-reading
     /// `requested_cursor` returns this same window and a lost response costs
     /// nothing.
@@ -332,12 +416,13 @@ impl WatchEventsResource {
             status: page.status,
             oldest_available: page.oldest_available,
             latest: page.latest,
-            // Every event the selection returned projects, because
-            // projectability is part of that selection.
+            // Every event the selection returned projects: ordinary watch
+            // windows preselect conversational records, while attention
+            // watches select only records with an AttentionEvent projection.
             events: page
                 .events
                 .iter()
-                .filter_map(CompactEvent::project)
+                .filter_map(AttentionEvent::project)
                 .collect(),
             next_cursor: page.next_cursor,
             has_more: page.has_more,
@@ -347,13 +432,15 @@ impl WatchEventsResource {
 
 /// The single delivery loop a caller should implement, published from the
 /// descriptor resource and from `irc.watch.create` so both say the same thing.
-pub const WATCH_INSTRUCTIONS: &str = "Subscribe with subscriptions/listen, naming this watch's URI in \
-     resourceSubscriptions. On each notification, read irc.events.read with this watch_id and the \
+pub const WATCH_INSTRUCTIONS: &str = "Merge this watch's URI into resourceSubscriptions on the \
+     client's one subscriptions/listen stream. On each notification, read irc.events.read with this watch_id and the \
      cursor you last persisted, or fetch \
      irc://watches/{watch_id}/events/after/{stream_id}/{sequence} for the compact window. Persist \
      the next_cursor each read returns; nothing on the server moves, so re-reading a cursor is \
      always safe. Keep reading while has_more is true. Without subscriptions, call irc.events.read \
-     with this watch_id and a positive wait_ms. Release the handle with irc.watch.close.";
+     with this watch_id and a positive wait_ms. Notifications wake the host, not a model; ongoing \
+     model responsiveness should use irc.attention.open and its one-minute scheduler fallback. \
+     Release the handle with irc.watch.close.";
 
 /// Build the stable resource URI for a watch handle.
 pub fn watch_uri(watch_id: &WatchId) -> String {
@@ -478,6 +565,7 @@ impl WatchCreateInput {
             classes: self.classes.clone(),
             mentions_only: self.mentions_only,
             inbound_only: self.inbound_only,
+            attention: None,
         }
     }
 }
@@ -656,7 +744,13 @@ impl WatchRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::journal::{EventCorrelation, EventOrigin, EventVerbosity};
+    use crate::{
+        agent::journal::{EventCorrelation, EventOrigin, EventPayload, EventVerbosity},
+        irc::{
+            semantic::{SemanticEvent, SemanticProjection, Source},
+            target::ChannelName,
+        },
+    };
 
     fn event(target: Option<&str>, class: EventClass, mentions_me: bool) -> IrcEvent {
         IrcEvent {
@@ -676,6 +770,29 @@ mod tests {
             semantic: None,
             wire: None,
             mentions_me,
+        }
+    }
+
+    fn message(
+        target: &str,
+        account: Option<&str>,
+        mentions_me: bool,
+        direction: EventDirection,
+    ) -> IrcEvent {
+        let semantic = SemanticEvent::MessageChannel {
+            source: Source {
+                name: "speaker".into(),
+                user: None,
+                host: None,
+                account: account.map(str::to_owned),
+            },
+            channel: ChannelName::new(target.to_owned()).expect("channel"),
+            text: "hello".into(),
+        };
+        IrcEvent {
+            direction,
+            semantic: Some(EventPayload::Irc(SemanticProjection::from(semantic))),
+            ..event(Some(target), EventClass::MessageChannel, mentions_me)
         }
     }
 
@@ -730,6 +847,32 @@ mod tests {
             &event(Some("#control"), EventClass::MessageChannel, false),
             CaseMapping::default()
         ));
+    }
+
+    #[test]
+    fn attention_is_one_compound_non_overlapping_selection() {
+        let mapping = CaseMapping::default();
+        let filter = WatchFilter {
+            inbound_only: true,
+            attention: Some(AttentionSelection {
+                full_traffic_targets: BTreeSet::from(["#Project".into()]),
+            }),
+            ..WatchFilter::default()
+        };
+        let project = message("#project", None, false, EventDirection::Inbound);
+        let human = message("#control", Some("grant"), false, EventDirection::Inbound);
+        let mention = message("#control", None, true, EventDirection::Inbound);
+        let background = message("#control", None, false, EventDirection::Inbound);
+        let own_echo = message("#project", None, false, EventDirection::Outbound);
+
+        for selected in [&project, &human, &mention] {
+            assert!(filter.matches(selected, mapping));
+            assert!(filter.cursor_query(mapping).selects(selected));
+        }
+        for ignored in [&background, &own_echo] {
+            assert!(!filter.matches(ignored, mapping));
+            assert!(!filter.cursor_query(mapping).selects(ignored));
+        }
     }
 
     fn registry() -> WatchRegistry {

@@ -36,6 +36,11 @@ pub struct CompactEvent {
     pub target: Option<String>,
     /// Case-preserved nickname that produced it, when one is known.
     pub source: Option<String>,
+    /// Registered IRC account reported by `account-tag`, when present. On the
+    /// configured collaboration network an account identifies a human; a
+    /// missing value remains unknown rather than proving the sender is an
+    /// agent.
+    pub source_account: Option<String>,
     /// Conversational text, when the event carries any.
     pub text: Option<String>,
     /// Whether the event is addressed to the owning agent.
@@ -53,11 +58,14 @@ impl CompactEvent {
     /// negotiation, and malformed-line records are all genuinely useful, but they
     /// belong to the wire resource, not to the conversation.
     pub fn project(event: &IrcEvent) -> Option<Self> {
-        let (source, text, summary) = match event.semantic.as_ref()? {
+        let (source, source_account, text, summary) = match event.semantic.as_ref()? {
             EventPayload::Irc(projection) => conversational_parts(&projection.event)?,
-            EventPayload::DccChatMessage(message) => {
-                (None, Some(message.text.clone()), Some("direct chat".into()))
-            }
+            EventPayload::DccChatMessage(message) => (
+                None,
+                None,
+                Some(message.text.clone()),
+                Some("direct chat".into()),
+            ),
             // Everything else is protocol or gateway bookkeeping.
             _ => return None,
         };
@@ -68,6 +76,7 @@ impl CompactEvent {
             direction: event.direction,
             target: event.target.clone(),
             source,
+            source_account,
             text,
             mentions_me: event.mentions_me,
             summary,
@@ -77,23 +86,33 @@ impl CompactEvent {
 
 /// Split one semantic event into its speaker, its text, and a summary of what
 /// it did, or `None` when it is not conversational at all.
-fn conversational_parts(
-    event: &SemanticEvent,
-) -> Option<(Option<String>, Option<String>, Option<String>)> {
+type ConversationalParts = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn conversational_parts(event: &SemanticEvent) -> Option<ConversationalParts> {
     let named = |source: &Source| Some(source.name.clone());
+    let account = |source: &Source| source.account.clone();
     Some(match event {
         SemanticEvent::MessageChannel { source, text, .. }
         | SemanticEvent::MessagePrivate { source, text, .. } => {
-            (named(source), Some(text.clone()), None)
+            (named(source), account(source), Some(text.clone()), None)
         }
         SemanticEvent::MessageAction { source, text, .. } => (
             named(source),
+            account(source),
             Some(text.clone()),
             Some(format!("{} {text}", source.name)),
         ),
-        SemanticEvent::MessageNotice { source, text, .. } => {
-            (named(source), Some(text.clone()), Some("notice".into()))
-        }
+        SemanticEvent::MessageNotice { source, text, .. } => (
+            named(source),
+            account(source),
+            Some(text.clone()),
+            Some("notice".into()),
+        ),
         SemanticEvent::Membership {
             source,
             subject,
@@ -108,12 +127,14 @@ fn conversational_parts(
                 .unwrap_or_default();
             (
                 named(source),
+                account(source),
                 None,
                 Some(format!("{who} {}{reason}", membership_verb(change))),
             )
         }
         SemanticEvent::Presence { source, change } => (
             named(source),
+            account(source),
             None,
             Some(format!("{} {}", source.name, presence_verb(change))),
         ),
@@ -128,12 +149,32 @@ fn conversational_parts(
                 (None, Some(modes)) => format!("{} set mode {}", source.name, modes.join(" ")),
                 (None, None) => return None,
             };
-            (named(source), topic.clone(), Some(summary))
+            (named(source), account(source), topic.clone(), Some(summary))
         }
         // Tag-only messages, CTCP, numerics, MOTD, capability and lifecycle
         // records carry no conversational content of their own.
         _ => return None,
     })
+}
+
+/// Account attached to a conversational IRC message, when `account-tag`
+/// supplied one.
+///
+/// This is deliberately only positive evidence. A missing tag may mean the
+/// sender is an unregistered agent, but it can also mean the capability was
+/// not active or the event came from older history.
+pub fn source_account(event: &IrcEvent) -> Option<&str> {
+    let EventPayload::Irc(projection) = event.semantic.as_ref()? else {
+        return None;
+    };
+    let source = match &projection.event {
+        SemanticEvent::MessageChannel { source, .. }
+        | SemanticEvent::MessagePrivate { source, .. }
+        | SemanticEvent::MessageAction { source, .. }
+        | SemanticEvent::MessageNotice { source, .. } => source,
+        _ => return None,
+    };
+    source.account.as_deref()
 }
 
 fn membership_verb(change: &crate::irc::semantic::MembershipChange) -> &'static str {

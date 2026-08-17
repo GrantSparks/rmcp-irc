@@ -28,6 +28,7 @@ use crate::{
         wire::{OutboundMessage, WireMessage},
     },
     mcp::{
+        attention::{AttentionCheckOutput, AttentionCheckState, AttentionOpenInput},
         authorization::OwnerId,
         dcc_accept::DESTINATION_INPUT,
         request_profile::RequestProfile,
@@ -1021,6 +1022,68 @@ async fn a_watch_descriptor_read_is_pure_and_its_events_are_caller_positioned() 
             .is_err(),
         "a closed watch must not keep serving windows"
     );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+/// A model-attention read has a selection-specific scan checkpoint. General
+/// watch cursors intentionally remain on their last match, but a drained
+/// attention selection can move through unrelated traffic without losing
+/// anything it could ever select.
+#[tokio::test]
+async fn a_quiet_attention_check_catches_up_to_the_journal_head() {
+    let fake = FakeErgo::spawn().await;
+    let gateway = Gateway::new(fake.config());
+    let connected = gateway
+        .connect(connect_request("Hestia"))
+        .await
+        .expect("connect");
+    let input = AttentionOpenInput {
+        agent_id: connected.agent_id.clone(),
+        full_traffic_targets: BTreeSet::new(),
+    };
+    let created = gateway
+        .create_watch(&connected.agent_id, input.filter())
+        .await
+        .expect("open attention");
+
+    // These are our own echoed messages and protocol replies, so the inbound
+    // attention policy must ignore them while the underlying journal advances.
+    for text in ["one", "two", "three"] {
+        gateway
+            .execute(
+                &connected.agent_id,
+                OutboundMessage::new("PRIVMSG", vec!["#background".into()]).with_trailing(text),
+                CompletionMode::Auto,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("send background traffic");
+    }
+
+    let page = gateway
+        .read_attention_events(
+            &connected.agent_id,
+            &created.watch.watch_id,
+            created.latest_cursor.clone(),
+            100,
+            Duration::ZERO,
+        )
+        .await
+        .expect("attention check");
+    assert!(page.events.is_empty());
+    assert!(page.latest.sequence > created.latest_cursor.sequence);
+    assert_eq!(
+        page.next_cursor, created.latest_cursor,
+        "the underlying general journal page keeps its compatibility cursor"
+    );
+
+    let output = AttentionCheckOutput::from_page(page);
+    assert_eq!(output.state, AttentionCheckState::Quiet);
+    assert!(output.resume_cursor.sequence > created.latest_cursor.sequence);
 
     gateway
         .disconnect(&connected.agent_id, None)

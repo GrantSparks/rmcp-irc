@@ -3,8 +3,9 @@
 This document is the normative asynchronous-delivery and state-reduction
 contract. IRC is a long-lived event protocol; MCP resource notifications only
 signal that something changed. Ordered delivery therefore comes from explicit
-positions over each agent's bounded in-memory journal — held by a watch on the
-caller's behalf, or by the caller itself through `irc.events.read`.
+positions over each agent's bounded in-memory journal. Watches hold immutable
+selections, never positions; callers own every ordinary cursor, including those
+used through `irc.events.read`.
 
 ## Event production rule
 
@@ -196,8 +197,12 @@ unchanged; `next_cursor` from an explicit read remains the only position worth
 persisting.
 
 The one position a hint owns is its own `anchor`, which is likewise never moved
-implicitly: only an `irc.events.read` passing `set_activity_anchor: true` records
-its `next_cursor` there. Shape, bounds, and suppression are in
+implicitly: an `irc.events.read` passing `set_activity_anchor: true` records its
+`next_cursor` there, and an `irc.attention.check` passing the same flag records
+its attention-specific `resume_cursor`. The scheduler recipe uses the latter so
+a handled attention page is not repeatedly advertised on subsequent successful
+tool results. Neither action moves a watch or delivery cursor. Shape, bounds,
+and suppression are in
 [MCP_API.md](MCP_API.md#activity-hints).
 
 ## Retention and backpressure
@@ -263,6 +268,10 @@ A client that sees `journal.pressure`, a rising `evicted_events`, or a recent
   filter excluded and is the first to reach `event_gap`. Under pressure, keep the
   narrow selection on the watch or subscription that decides *when* to read, and
   read the event stream itself widely so the stored position stays near the head;
+- use `irc.attention.check` for model attention rather than a general filtered
+  read. Once its immutable compound selection is drained, its
+  `resume_cursor` advances through every inspected non-match to the journal
+  high-water mark;
 - raise `limits.event_count` / `limits.event_bytes` if the traffic genuinely
   needs a longer window.
 
@@ -345,6 +354,58 @@ their owning `command_id`; they never share a cursor-only projection window.
 not carry a durable event position and is not an alternative event transport.
 Clients respond by reading the indicated resource.
 
+Under MCP 2026-07-28 these notifications exist only inside a
+client-opened `subscriptions/listen` response stream. One client should keep one
+consolidated stream whose filter merges every list-change category and stable
+resource URI it needs under `params.notifications`. The listen request carries
+the complete strict per-request metadata and caller credentials. Creating an
+attention watch adds its watch URI and the agent's lifecycle resources to that
+filter; if the stream is already open, the client reopens it with the merged
+filter. A dropped stream is reopened and the resources are reread because
+notifications themselves have no replay.
+
+The stream is a host-level multiplexer, not a demand for a model turn on every
+notification. `irc.attention.open` identifies its filtered watch URI as
+`modelResumeResource`; a direct host uses that URI to resume the model. Other
+resource and list notifications may only refresh host cache, UI, or
+resynchronization state.
+
+Top-level Multi Round-Trip Requests do not replace this channel. MRTR can return
+an `input_required` result only from an already active request, after which the
+client retries that same operation. A task has a distinct later-input mechanism
+through `tasks/get`/`tasks/update` and may publish task status on a listen stream
+when both server and client support `taskIds`; that state remains scoped to the
+one operation the task augments. Neither form is an ambient IRC event channel.
+
+### Model attention
+
+`irc.attention.open` creates one compound selection for inbound direct/private
+messages, nickname mentions, account-identified human messages, and all inbound
+conversation in caller-selected task targets. It also selects sparse
+connection, MOTD, protocol, topic, journal-pressure, and actionable DCC
+lifecycle events, including gateway-internal ones. The compact attention event
+projection retains `source_account`; a present account is positive human
+evidence under the network MOTD, while a missing account remains unknown.
+
+`irc.attention.check` is separate from general watch consumption. A page with
+more selected events resumes at the last returned match. A fully drained page,
+including the ordinary quiet page, resumes at the read's journal high-water
+mark because the selection cannot change. The caller adopts that position only
+after handling returned events. This makes retries at-least-once and prevents
+unrelated traffic from aging a quiet attention cursor into a gap.
+
+A direct host bridge consumes the listen stream and resumes a model only on a
+matching watch update; that spends no model tokens while quiet. Where Claude or
+Codex cannot be resumed by a notification, the same conversation runs the
+ordinary prompt returned by `irc.attention.open` immediately and at least every
+60 seconds, calling `irc.attention.check` with `wait_ms: 0` and
+`set_activity_anchor: true`. A scheduled quiet turn still consumes model tokens
+and must not be described as token-free. The check omits a redundant `activity`
+hint because its own result is the authoritative selected read. While a model is
+already running, bounded activity hints on other successful tool results provide
+an opportunistic signal without another round trip; they cannot start the turn
+themselves.
+
 ### Watches
 
 A watch is the intended way to consume events. `irc.watch.create` registers a
@@ -368,9 +429,10 @@ lost. Positions are therefore wholly caller-owned:
   to the lossless journal and can long poll; `watch_id` is mutually exclusive
   with the single-value filters, which a watch already subsumes;
 - `irc://watches/{watch_id}/events/after/{stream_id}/{sequence}` carries the
-  position in the path and returns the compact conversational window; records
-  with no conversational form are excluded from that selection rather than
-  dropped after it, so the cursor never advances over something not returned;
+  position in the path and returns a compact selected window; ordinary watches
+  exclude records with no conversational form, while compound attention
+  watches also project their sparse lifecycle classes into short summaries, so
+  the cursor never advances over something not returned;
 - both paths report `status`, which is `current` unless records were lost, in
   which case the reader is told explicitly rather than silently restarted, and
   recovery is an ordinary read from the `next_cursor` the report handed back;
@@ -391,8 +453,9 @@ uses the same caller-owned cursor contract, with or without a `watch_id`.
 ### What realtime delivery does and does not mean
 
 The gateway can deliver a notification to a capable MCP **host** as soon as
-something happens. Resource notifications and `subscriptions/listen` wake the
-host application; they cannot force or schedule a model turn. MCP `2026-07-28`
+something happens on the client-opened `subscriptions/listen` stream. Resource
+notifications wake the host application; they cannot force or schedule a model
+turn. MCP `2026-07-28`
 has no server-initiated sampling — Sampling is deprecated by SEP-2577 and
 server-to-client requests were replaced by Multi Round-Trip Requests, whose
 input requests exist only while the server is processing an active client

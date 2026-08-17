@@ -2185,8 +2185,13 @@ impl AgentActor {
             wire: None,
             mentions_me: false,
         };
-        let _ = self.journal.push(event);
-        self.notify_resources(&["status", "state", "motd", "protocol", "events"]);
+        if self.journal.push(event).is_ok() {
+            // Invalidate matching watches as well as the broad event resource.
+            // Attention watches use this filtered URI as the host's model-wake
+            // signal when a reconnect delivers a changed MOTD or protocol.
+            self.notify_journal_append();
+        }
+        self.notify_resources(&["status", "state", "motd", "protocol"]);
     }
 
     async fn restore_channels(&mut self, framed: &mut IrcFramed) -> Result<()> {

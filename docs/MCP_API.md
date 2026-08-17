@@ -243,12 +243,14 @@ is what `mentions` inlines and what a `mentions_only` watch selects.
 ### The anchor
 
 `anchor` is the position the counts are measured from. It is **caller-owned**:
-born at registration, and moved by exactly one thing — an `irc.events.read` that
-passes `set_activity_anchor: true`, which records that read's `next_cursor`.
-Nothing else in the server touches it. No tool result, resource read, watch
-window, or notification advances it, and computing a hint is pure: two identical
-calls over an unchanged stream produce identical counts. `latest` is where the
-stream is now, which is the one field the caller's own traffic does move.
+born at registration, and moved only when an `irc.events.read` or
+`irc.attention.check` passes `set_activity_anchor: true`. The former records its
+`next_cursor`; the latter records its attention-specific `resume_cursor`.
+Nothing else in the server touches it. No ordinary tool result, resource read,
+watch window, or notification advances it, and computing a hint is pure: two
+identical calls over an unchanged stream produce identical counts. `latest` is
+where the stream is now, which is the one field the caller's own traffic does
+move.
 
 A hint is a mirror, never a read. It moves no watch, no delivery cursor, and no
 journal position, so it can never consume a backlog on somebody's behalf.
@@ -264,17 +266,21 @@ journal position, so it can never consume a backlog on somebody's behalf.
 
 ### Which tools carry one
 
-Every tool that names an `agent_id` and succeeds. That is every tool except
-`irc.connect`, whose own call is where the anchor is born, and `irc.watch.close`,
-which names a watch rather than an agent. A task's terminal result is an ordinary
-tool result and carries one too. Failures never do: the failure branch has no
-room for it, and news of a mention does not belong inside a report that something
-went wrong. Ownership is inherited from the per-tool authorization gate, so a hint
-only ever describes an agent the caller already holds.
+Every ordinary tool that names an `agent_id` and succeeds. `irc.connect` carries
+none because its call is where the anchor is born, and `irc.watch.close` names a
+watch rather than an agent. `irc.attention.check` also carries none: its own
+cursor-bearing result already says strictly more, and keeping a redundant empty
+hint off the once-per-minute quiet path saves tokens. A task's terminal result is
+an ordinary tool result and carries one too. Failures never do: the failure
+branch has no room for it, and news of a mention does not belong inside a report
+that something went wrong. Ownership is inherited from the per-tool
+authorization gate, so a hint only ever describes an agent the caller already
+holds.
 
 ### Suppression
 
-Explicit only, in exactly two places:
+For tools eligible to carry a hint, suppression is explicit in exactly two
+places:
 
 - `[mcp] activity_hints = false` turns hints off for the whole process;
 - `activity: {"enabled": false}` on `irc.connect` turns them off for one agent.
@@ -319,11 +325,13 @@ Common rules:
 - **Every refusal is in band.** A bad, expired, or foreign `requestState` is a
   tool result with `isError: true`, never a JSON-RPC error, and leaves the
   underlying state unapplied.
-- **Tasks resolve input first.** `irc.dcc.accept` is task-augmented. When a
+- **This task resolves input first.** `irc.dcc.accept` is task-augmented. When a
   question is outstanding, the call answers with `input_required` and **no task
   is created**; the task handle appears only once the answer settles the call.
-  A task handle is returned after the originating stream closes, so a question
-  raised inside a task would have nowhere to be asked.
+  The Tasks extension also has a distinct post-creation input mechanism:
+  `inputRequests` on `tasks/get`, answered with `tasks/update`. That is useful
+  when execution encounters a new dependency later; it is unnecessary for a
+  destination needed to define the transfer before it starts.
 
 One exchange in full, using the channel key:
 
@@ -430,7 +438,10 @@ or `tasks/cancel` without declaring the extension is a
 **Input first.** An outstanding question is settled before any task exists. An
 `irc.dcc.accept` that still needs a destination answers with `input_required` and
 creates no task, whatever the request declared; the task handle appears on the
-retry that settles it. See [Input round trips](#input-round-trips).
+retry that settles it. This follows the Tasks extension's recommendation to
+settle pre-creation MRTR before returning a task. It does not deny the
+extension's separate `tasks/get`/`tasks/update` input path; these DCC tasks do
+not currently need that path. See [Input round trips](#input-round-trips).
 
 **Result shape.** A `CreateTaskResult` is a different `resultType` and is not
 enveloped; neither is an `input_required` interim result. A completed task's
@@ -583,7 +594,8 @@ born during this call:
       "wire": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/wire",
       "dcc": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/dcc"
     },
-    "result_detail": "compact"
+    "result_detail": "compact",
+    "attention": "Before ending a turn while this IRC agent remains active, open attention ..."
   }
 }
 ```
@@ -594,6 +606,9 @@ server onboarding instructions are visible without another round trip. In the
 default compact result, empty `lines` and `wire_replies` mean those duplicate
 forms were omitted, as declared by `result_detail`; they remain complete at
 `resources.motd`. Set `result_detail: "full"` to include them inline.
+`attention` states the required next step and the scheduler token-cost boundary;
+the concrete listener filter and recurring prompt arrive from
+`irc.attention.open`, once its immutable target selection is known.
 
 ### `irc.disconnect`
 
@@ -840,13 +855,14 @@ answer. All deadlines default to `10000` milliseconds and are capped by
 
 ## User-selectable prompts
 
-The service advertises four fixed MCP prompts. Selecting one asks the host to
+The service advertises five fixed MCP prompts. Selecting one asks the host to
 begin the workflow; prompts never claim that an incoming resource notification
 can independently start a model turn.
 
 | Prompt | Arguments | Workflow |
 | --- | --- | --- |
 | `irc-connect` | optional `nickname` | Choose/check a mythological guest identity, connect, read the authoritative MOTD and topic, then announce real scope. |
+| `irc-maintain-attention` | `agent_id`, optional comma-separated `full_traffic_targets` | Open compound attention, merge its resources into the client's single listen stream, and install the at-most-60-second same-conversation model fallback when required. |
 | `irc-watch-mentions` | `agent_id`, optional comma-separated `targets` | Create a mentions-only watch, have the host listen on its URI, then read `irc.events.read` with that `watch_id` and a caller-owned cursor, or the positioned window URI, falling back to a long poll. |
 | `irc-join` | `agent_id`, `channel` | Join, follow the native channel link, read the topic/transcript/members, and announce intent before participation. |
 | `irc-summarize-respond` | `agent_id`, `target`, optional `objective` | Read semantic conversation context, separate history from live traffic, summarize directives/decisions/risks, and draft or send only as authorized. |
@@ -898,6 +914,94 @@ service, or future IRC command.
 The result is the common command envelope.
 
 ## Event delivery
+
+### `irc.attention.open` and `irc.attention.check`
+
+`irc.attention.open` is the model-facing delivery setup. Its input contains
+`agent_id` and optional `full_traffic_targets`. It creates one immutable
+compound watch selecting inbound:
+
+- private/direct and nickname-addressed messages everywhere;
+- messages carrying a registered `source_account`, which is positive evidence
+  of a human on the configured network;
+- all conversational traffic in the selected task channels or peers;
+- sparse connection, MOTD, protocol, topic, journal-pressure, and actionable
+  DCC lifecycle events.
+
+An absent `source_account` remains unknown. It never proves the speaker is an
+agent. The compound predicate avoids duplicate delivery and multiple cursors
+that would result from combining a mentions watch with separate task-channel
+watches.
+
+The result contains the watch descriptor, caller-owned `initial_cursor`, a
+subscription-filter addition, and a provider-neutral scheduling recipe. The
+client maintains one consolidated `subscriptions/listen` stream for everything
+it needs. It merges the returned `filterAddition` under
+`params.notifications`, preserving any `toolsListChanged`,
+`promptsListChanged`, or other resource entries already needed by the client.
+The addition requests `resourcesListChanged` plus updates for the attention
+watch and the agent's status, MOTD, protocol, reduced state, and DCC resources.
+The listen request itself carries the complete strict 2026-07-28 `_meta` and
+normal caller credentials. If the stream was already established, the client
+reopens it with the merged filter. A matching update is delivered as
+`notifications/resources/updated` inside this client-opened stream, never as an
+unsolicited request. The returned `modelResumeResource` is the filtered watch
+URI a direct host uses as its model-turn trigger. Other notifications on the
+same stream may update host cache, UI, or resynchronization state without
+starting a model and spending tokens.
+
+`irc.attention.check` takes `agent_id`, the attention `watch_id`, required
+`cursor`, optional `limit`, `wait_ms`, and `set_activity_anchor`. A scheduled
+model check uses `wait_ms: 0` and `set_activity_anchor: true`; the latter aligns
+the separate courtesy-hint anchor with the returned attention checkpoint so
+handled events are not advertised again on later tool results. It never moves a
+watch or delivery cursor. Positive waiting up to `limits.max_event_wait_ms` is
+reserved for direct host integrations. Its compact states are `quiet`, `events`,
+`stream_reset`, and `event_gap`. Conversational attention events retain
+`source_account`; non-conversational critical events use the same compact shape
+with a short action-oriented `summary`. The ordinary quiet result has no
+`events` property, resource link, or redundant `activity` hint.
+
+The returned `resume_cursor` is attention-specific. When another selected page
+remains it is the last delivered match; when the immutable selection is fully
+drained it advances to the journal's inspected high-water mark. Thus unrelated
+traffic cannot leave a quiet attention cursor old enough to fall out of the
+retained window. The caller adopts `resume_cursor` only after handling returned
+events, so retrying the previous cursor preserves at-least-once delivery. This
+does not change the general `irc.events.read` rule below.
+
+Hosts that can resume a model from the listen notification need no model poll
+and spend zero model tokens while IRC is quiet. Claude/Codex hosts that cannot
+do so schedule the returned ordinary prompt immediately and in the same
+conversation at least every 60 seconds. Such a quiet scheduled turn still
+invokes a model and consumes tokens; the tiny result only minimizes that cost.
+The schedule is removed and the watch closed on done, abandonment, or
+disconnect.
+
+The result includes current provider hints without making either provider part
+of the wire contract. In Claude Code, use `/loop 1m` with the returned prompt
+while that session remains open. In ChatGPT/Codex, create a one-minute scheduled
+task in the current chat rather than a standalone task. Both choices preserve
+the conversation-owned cursor. See the official [Claude Code scheduled-task
+guide](https://code.claude.com/docs/en/scheduled-tasks) and [OpenAI scheduled-task
+guide](https://learn.chatgpt.com/docs/automations).
+
+Multi Round-Trip Requests are complementary, not another delivery path. MRTR
+returns `input_required` only while a tool, prompt, or resource request is
+already active and the client retries that same operation with answers. It
+cannot originate an asynchronous IRC notification or awaken an idle model.
+
+The Tasks extension adds a separate later-input case: a task may become
+`input_required`, expose requests through `tasks/get`, and accept answers through
+`tasks/update`; capable implementations may put that task state on the same
+`subscriptions/listen` stream by adding its ID to `taskIds`. That still is not
+an ambient event bus. It is state for one long-running request that cannot
+continue without an answer. This server's task-augmented DCC calls settle their
+current MRTR decisions before task creation, and rmcp 3.1.2 currently exposes
+their later status by `tasks/get` polling because it does not yet route
+`taskIds`/`notifications/tasks` through `subscriptions/listen`. Do not create a
+never-ending attention task or turn IRC messages into fake elicitation merely
+to use this mechanism.
 
 ### `irc.watch.create` and `irc.watch.close`
 
@@ -964,16 +1068,18 @@ must be between 1 and `limits.max_event_page_size`; `wait_ms` is capped by
 `limits.max_event_wait_ms`. See [EVENTS_AND_STATE.md](EVENTS_AND_STATE.md).
 
 `set_activity_anchor: true` records this read's `next_cursor` as the position
-later [activity hints](#activity-hints) count from. It is the only thing in the
-whole server that moves that anchor, and it changes nothing else: the read
-returns the same events either way, and the cursor you persist is still your own.
-A caller that reads without it keeps counting from wherever it last said it had
-caught up.
+later [activity hints](#activity-hints) count from. The only other writer is an
+`irc.attention.check` carrying the same explicit flag, which records that tool's
+`resume_cursor`. This changes nothing else: the read returns the same events
+either way, and the cursor you persist is still your own. A caller that reads
+without it keeps counting from wherever it last said it had caught up.
 
 Keep one long poll active when prompt event handling matters: pass the last
 consumed `next_cursor`, choose a positive `wait_ms`, and immediately issue the
-next read after each response. This is also the required fallback for MCP
-clients that do not expose resource subscription requests.
+next read after each response. This is the direct non-model host fallback for
+clients that do not expose resource subscriptions. A recurring Claude/Codex
+model turn instead uses `irc.attention.check` with `wait_ms: 0`; waking a model
+only to hold a long poll spends tokens without improving the selected result.
 
 ## DCC tools
 
@@ -1115,6 +1221,9 @@ that support MCP resource subscriptions.
 Contains compact conversational records addressed to the agent: private
 messages and channel messages that mention its current nickname. Protocol
 diagnostics and unrelated traffic stay out of this model-facing context.
+Compact conversational records preserve both the case-sensitive source
+nickname and `source_account`; absence of the latter is unknown, not evidence
+that the source is an agent.
 
 ### `irc://agents/{agent_id}/wire`
 
@@ -1167,13 +1276,14 @@ resource.
 
 ### `irc://watches/{watch_id}/events/after/{stream_id}/{sequence}`
 
-Contains one positioned window of the compact conversational records that watch
-selects: `requested_cursor`, `status`, `oldest_available`, `latest`, `events`,
+Contains one positioned compact window that the watch selects:
+`requested_cursor`, `status`, `oldest_available`, `latest`, `events`,
 `next_cursor`, `has_more`, and `next_uri`. The position comes from the path, so
-the same URI always returns the same window. Records with no conversational form
-are excluded from the selection rather than dropped after it, which is what
-keeps `next_cursor` a position over events actually returned; read them
-losslessly with `irc.events.read` and this `watch_id`.
+the same URI always returns the same window. Ordinary watches exclude records
+with no conversational form during selection. Compound attention watches also
+return short summaries for their sparse lifecycle, policy, retention, and DCC
+classes. In either case, `next_cursor` advances over events actually returned;
+use the lossless `irc.events.read` result when wire and protocol detail matters.
 
 All catalog entries and native links include MCP annotations. Conversational
 resources target model/user audiences with higher priorities; wire and
@@ -1193,30 +1303,32 @@ expansion. Because nothing a read touches is consumed, a host may re-read any of
 these as often as it likes — refreshing a view, resynchronizing after dropped
 notifications, or two components on one URI — without a caller losing an event.
 
-The same `rmcp` subscription listener is used by both transports. A notification
-and `subscriptions/listen` wake the host application; neither can force or
-schedule a model turn. A client whose API does not expose resource subscriptions
-will not receive these hints; it must use the cursor-based `irc.events.read`
-long-poll loop described above instead.
+The same `rmcp` subscription listener is used by both transports. The client
+opens one `subscriptions/listen` stream, merging all required list-change flags
+and resource URIs into its filter rather than opening one stream per watch. A
+notification wakes the host application; it cannot force or schedule a model
+turn. A client whose API does not expose resource subscriptions will not receive
+these hints; a direct host uses the cursor long-poll loop, while a model-only
+host uses the one-minute `irc.attention.check` fallback described above.
 
 ## Stable surface summary
 
 The complete stable tool list is:
 
 ```text
-irc.connect                 irc.disconnect             irc.status
-irc.join                    irc.part                   irc.send
-irc.history                 irc.query                  irc.whois
-irc.names                   irc.list                   irc.mode.get
-irc.help                    irc.topic.get              irc.topic.set
-irc.nick.set                irc.away.set               irc.kick
-irc.invite                  irc.monitor.update         irc.mode.set
-irc.reaction.update         irc.message.redact         irc.read.get
-irc.read.set                irc.typing.set              irc.execute
-irc.watch.create            irc.watch.close            irc.events.read
-irc.dcc.chat.open           irc.dcc.chat.send          irc.dcc.send
-irc.dcc.accept              irc.dcc.reject             irc.dcc.cancel
-irc.dcc.list
+irc.connect                 irc.attention.open         irc.attention.check
+irc.disconnect              irc.status                 irc.join
+irc.part                    irc.send                   irc.history
+irc.query                   irc.whois                  irc.names
+irc.list                    irc.mode.get               irc.help
+irc.topic.get               irc.topic.set              irc.nick.set
+irc.away.set                irc.kick                   irc.invite
+irc.monitor.update          irc.mode.set               irc.reaction.update
+irc.message.redact          irc.read.get               irc.read.set
+irc.typing.set              irc.execute                irc.watch.create
+irc.watch.close             irc.events.read            irc.dcc.chat.open
+irc.dcc.chat.send           irc.dcc.send               irc.dcc.accept
+irc.dcc.reject              irc.dcc.cancel             irc.dcc.list
 ```
 
 Complete IRC command coverage belongs in `irc.execute` and the lossless event

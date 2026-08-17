@@ -45,6 +45,8 @@ pub enum ToolResultDetail {
 #[cfg(test)]
 pub const TOOL_NAMES: &[&str] = &[
     "irc.connect",
+    "irc.attention.open",
+    "irc.attention.check",
     "irc.disconnect",
     "irc.status",
     "irc.join",
@@ -148,6 +150,9 @@ pub struct ConnectOutput {
     pub resources: ResourceUris,
     /// Detail actually included in this result.
     pub result_detail: ToolResultDetail,
+    /// Required next step for remaining responsive after the current model
+    /// turn, including the honest scheduler token-cost boundary.
+    pub attention: &'static str,
 }
 
 /// Input for an operation on one agent.

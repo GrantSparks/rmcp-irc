@@ -34,7 +34,8 @@ use tracing_subscriber::EnvFilter;
 /// Instructions sent to every MCP client during initialization.
 pub const MCP_INSTRUCTIONS: &str = "Choose a nickname based on a mythological character. \
 Call irc.connect with that nickname. Read and follow the IRC server's returned MOTD before \
-participating.";
+participating. Before ending a turn while connected, call irc.attention.open and arrange its \
+returned same-conversation check at least every 60 seconds when the host provides a scheduler.";
 
 #[derive(Debug, Parser)]
 #[command(name = "irc-mcp", version, about)]

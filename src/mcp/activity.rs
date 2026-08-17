@@ -11,11 +11,12 @@
 //!
 //! **It is a mirror, never a read.** Computing a hint moves nothing. No watch,
 //! no delivery cursor, and no journal position changes, so a hint can be
-//! attached to every result without a caller ever losing an event to one. The
+//! attached to ordinary successful results without a caller ever losing an event to one. The
 //! counts are relative to an anchor the caller owns and only the caller moves,
-//! by passing `set_activity_anchor` to `irc.events.read`. Nothing else — no
-//! tool result, no resource read, no notification — advances it. Two identical
-//! calls over an unchanged stream therefore produce byte-identical hints.
+//! by passing `set_activity_anchor` to `irc.events.read` or
+//! `irc.attention.check`. Nothing else — no ordinary tool result, resource read,
+//! or notification — advances it. Two identical calls over an unchanged stream
+//! therefore produce byte-identical hints.
 //!
 //! **It is bounded by construction.** At most [`TARGET_CAP`] targets appear,
 //! chosen by count and then by name so the choice is deterministic, with
@@ -126,8 +127,9 @@ pub struct ActivityHint {
     /// `irc.watch.create` to make the counts meaningful.
     pub watches: usize,
     /// Position the counts are relative to. Owned by the caller: it starts at
-    /// registration and moves only when an `irc.events.read` passes
-    /// `set_activity_anchor`. Nothing else on the server touches it.
+    /// registration and moves only when an `irc.events.read` or
+    /// `irc.attention.check` passes `set_activity_anchor`. Nothing else on the
+    /// server touches it.
     pub anchor: EventCursor,
     /// Newest position assigned in this agent's stream, so a caller can tell an
     /// unchanged stream from a stream it has already read.

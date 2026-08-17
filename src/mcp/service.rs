@@ -50,6 +50,10 @@ use crate::{
         wire::{OutboundMessage, Tag},
     },
     mcp::{
+        attention::{
+            ATTENTION_ONBOARDING, AttentionCheckInput, AttentionCheckOutput, AttentionCheckState,
+            AttentionOpenInput, AttentionOpenOutput, AttentionSchedule, AttentionSubscription,
+        },
         authorization::{CallerPolicy, OwnerId},
         confirm_action, connect_nickname, dcc_accept,
         envelope::{self, ToolFailure, envelope_schema},
@@ -97,6 +101,7 @@ const RESOURCE_PAGE_SIZE: usize = 60;
 #[cfg(test)]
 const PROMPT_NAMES: &[&str] = &[
     "irc-connect",
+    "irc-maintain-attention",
     "irc-watch-mentions",
     "irc-join",
     "irc-summarize-respond",
@@ -188,6 +193,14 @@ struct WatchMentionsPromptInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct MaintainAttentionPromptInput {
+    /// Opaque handle returned by `irc.connect`.
+    agent_id: String,
+    /// Optional comma-separated task channels that require complete traffic.
+    full_traffic_targets: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct JoinPromptInput {
     /// Opaque handle returned by `irc.connect`.
     agent_id: String,
@@ -236,6 +249,28 @@ impl IrcMcpService {
         )]
     }
 
+    /// Maintain model responsiveness after the foreground turn ends.
+    #[prompt(
+        name = "irc-maintain-attention",
+        description = "Open compound IRC attention, merge it into the client's listen stream, and arrange the one-minute model fallback."
+    )]
+    async fn prompt_maintain_attention(
+        &self,
+        Parameters(input): Parameters<MaintainAttentionPromptInput>,
+    ) -> Vec<PromptMessage> {
+        let targets = input.full_traffic_targets.map_or_else(
+            || "Use no full-traffic targets yet; direct/addressed and account-identified human messages still qualify.".into(),
+            |targets| format!("Pass these comma-separated task channels as full_traffic_targets: {targets}."),
+        );
+        vec![PromptMessage::new_text(
+            Role::User,
+            format!(
+                "For IRC agent `{}`, call `irc.attention.open`. {targets} Have the client merge the returned filterAddition under params.notifications in its one existing `subscriptions/listen` request and open or reopen that stream with complete request metadata; matching `notifications/resources/updated` are the asynchronous host notification path. Then, unless the host directly resumes the model from those matching notifications, run the returned ordinary scheduler prompt immediately and in this same conversation with no interval longer than 60 seconds. A scheduled quiet check still consumes model tokens, so do not describe it as a zero-token path. Persist `resume_cursor` only after handling returned events, drain immediately while `has_more` is true, and cancel the recurring task, close the watch, and disconnect when the work ends. Successful tool results may also report bounded activity while the model is already running, but cannot wake it. Do not use top-level MRTR or a task's input_required state as an ambient event channel: both request input needed to continue a specific operation.",
+                input.agent_id,
+            ),
+        )]
+    }
+
     /// Create and consume a mentions-only live watch.
     #[prompt(
         name = "irc-watch-mentions",
@@ -255,8 +290,8 @@ impl IrcMcpService {
                 "For IRC agent `{}`, set up mention delivery in this order. 1. Call \
                  `irc.watch.create` with `mentions_only: true`. {targets} Keep the returned \
                  `watch_id` and `latest_cursor`, and attach the native watch resource link. 2. Ask \
-                 the host to call `subscriptions/listen` with that watch URI in \
-                 `resourceSubscriptions`; the notification is filtered by the watch, so it means \
+                 the host to merge that watch URI into the `resourceSubscriptions` of its one \
+                 consolidated `subscriptions/listen` stream; the notification is filtered by the watch, so it means \
                  there is something here for you. 3. On each update, call `irc.events.read` with \
                  that `watch_id` and the cursor you last persisted — or read \
                  `irc://watches/{{watch_id}}/events/after/{{stream_id}}/{{sequence}}` for the \
@@ -269,8 +304,9 @@ impl IrcMcpService {
                  resource notifications and `subscriptions/listen` wake the host application but \
                  cannot force or schedule a model turn. MCP 2026-07-28 has no server-initiated \
                  sampling — it is deprecated by SEP-2577 — and input requests exist only inside an \
-                 active client request. Autonomous participation belongs to the host's scheduler \
-                 or a separately configured direct LLM integration, not to this relay contract.",
+                 active client request. For autonomous model participation, use \
+                 `irc.attention.open` and its at-most-60-second same-conversation scheduler recipe, \
+                 or a host bridge that directly resumes the model from this listen stream.",
                 input.agent_id
             ),
         )]
@@ -412,15 +448,20 @@ impl IrcMcpService {
                         registered: true,
                         motd: motd_for_tool_result(connected.motd, result_detail),
                         result_detail,
+                        attention: ATTENTION_ONBOARDING,
                     };
                     let summary = if output.motd.text.is_empty() {
                         format!(
-                            "Connected {} as {}. The server has no MOTD.",
-                            output.agent_id, output.nickname
+                            "Connected {} as {}. Before yielding, call irc.attention.open and \
+                             arrange its returned check at least every 60 seconds while connected. \
+                             The server has no MOTD.",
+                            output.agent_id, output.nickname,
                         )
                     } else {
                         format!(
-                            "Connected {} as {}. Server MOTD:\n{}",
+                            "Connected {} as {}. Before yielding, call irc.attention.open and \
+                             arrange its returned check at least every 60 seconds while connected. \
+                             Server MOTD:\n{}",
                             output.agent_id, output.nickname, output.motd.text
                         )
                     };
@@ -445,6 +486,112 @@ impl IrcMcpService {
                 Err(error) => tool_error(error).into(),
             },
         )
+    }
+
+    /// Open the single compound attention selection used by host subscriptions
+    /// and by the portable one-minute model-scheduler fallback.
+    #[tool(
+        name = "irc.attention.open",
+        description = "Open model attention for one IRC guest, combining direct/addressed messages, \
+                       account-identified humans, and complete traffic in selected task targets.",
+        output_schema = envelope_schema::<AttentionOpenOutput>(),
+        annotations(
+            title = "Open IRC model attention",
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn irc_attention_open(
+        &self,
+        Parameters(input): Parameters<AttentionOpenInput>,
+    ) -> CallToolResult {
+        let filter = input.filter();
+        match self.gateway.create_watch(&input.agent_id, filter).await {
+            Ok(created) => {
+                let schedule = AttentionSchedule::new(&created.watch, &created.latest_cursor);
+                let resources = ResourceUris::for_agent(&created.watch.agent_id);
+                let subscription = AttentionSubscription::new(&created.watch, &resources);
+                let summary = format!(
+                    "Attention opened for {} at {}. Merge the returned filter addition under \
+                     params.notifications and open or reopen the client's one subscriptions/listen \
+                     stream with complete request metadata. Because that stream wakes the host \
+                     rather than the model, also schedule the returned ordinary prompt in this same \
+                     conversation at least every 60 seconds unless the host directly resumes the \
+                     model on matching updates. Scheduled quiet checks consume model tokens.",
+                    created.watch.agent_id, created.watch.uri,
+                );
+                let link = ContentBlock::ResourceLink(watch_resource_entry(&created.watch));
+                let output = AttentionOpenOutput {
+                    watch: created.watch,
+                    initial_cursor: created.latest_cursor,
+                    subscription,
+                    schedule,
+                    instructions: ATTENTION_ONBOARDING,
+                };
+                tool_success_with_content(summary, &output, vec![link])
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Perform one compact, normally non-blocking scheduled attention check.
+    #[tool(
+        name = "irc.attention.check",
+        description = "Check one model-attention watch with a compact quiet path and a scan \
+                       checkpoint that advances through irrelevant traffic.",
+        output_schema = envelope_schema::<AttentionCheckOutput>(),
+        annotations(
+            title = "Check IRC model attention",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn irc_attention_check(
+        &self,
+        Parameters(input): Parameters<AttentionCheckInput>,
+    ) -> CallToolResult {
+        let wait = Duration::from_millis(input.wait_ms);
+        match self
+            .gateway
+            .read_attention_events(
+                &input.agent_id,
+                &input.watch_id,
+                input.cursor,
+                input.limit,
+                wait,
+            )
+            .await
+        {
+            Ok(page) => {
+                let output = AttentionCheckOutput::from_page(page);
+                // Like the opt-in flag on `irc.events.read`, this acknowledges
+                // only the courtesy activity hint. It never moves a watch or
+                // delivery cursor, so retrying the caller's previous attention
+                // cursor remains at-least-once even if this response is lost.
+                if input.set_activity_anchor {
+                    self.gateway
+                        .set_activity_anchor(&input.agent_id, output.resume_cursor.clone())
+                        .await;
+                }
+                let summary = match output.state {
+                    AttentionCheckState::Quiet => "quiet".into(),
+                    AttentionCheckState::Events => format!(
+                        "{} attention event(s){}",
+                        output.events.len(),
+                        if output.has_more { "; drain again" } else { "" }
+                    ),
+                    AttentionCheckState::StreamReset => {
+                        "stream_reset: report lost continuity and recover".into()
+                    }
+                    AttentionCheckState::EventGap => {
+                        "event_gap: report lost records and recover".into()
+                    }
+                };
+                tool_success(summary, &output)
+            }
+            Err(error) => tool_error(error),
+        }
     }
 
     /// Disconnect and destroy one actor and all of its direct sessions.
@@ -499,7 +646,8 @@ impl IrcMcpService {
             Ok(created) => {
                 let next_uri = watch_events_uri(&created.watch.watch_id, &created.latest_cursor);
                 let summary = format!(
-                    "Watching {} at {}. Subscribe to that URI, then on each notification call \
+                    "Watching {} at {}. Merge that URI into the client's one \
+                     subscriptions/listen stream, then on each notification call \
                      irc.events.read with watch_id {} and the cursor you last persisted, starting \
                      from sequence {}.",
                     created.watch.agent_id,
@@ -2435,12 +2583,12 @@ impl ServerHandler for IrcMcpService {
 
         let profile = RequestProfile::from_context(&context);
         if runs_as_task(&request.name, &profile) {
-            // Input first, task second. The tasks extension says MRTR
-            // exchanges are resolved synchronously *before* a `CreateTaskResult`
-            // is returned, and the reason is plain here: a task handle is
-            // returned once the originating stream has closed, so a question
-            // discovered afterwards has nowhere to be asked and the caller holds
-            // a handle for work that will never start.
+            // Input first, task second. The tasks extension says pre-creation
+            // MRTR exchanges SHOULD be resolved synchronously before a
+            // `CreateTaskResult`. Tasks have a distinct later input path via
+            // `tasks/get` and `tasks/update`, but this destination is required
+            // to decide what work the task represents, so creating first would
+            // add a poll/update loop for no benefit.
             if let Some(settled) = self
                 .settle_input_before_task(&owner, &profile, &request)
                 .await?
@@ -2460,11 +2608,17 @@ impl ServerHandler for IrcMcpService {
             return Ok(CreateTaskResult::new(task).into());
         }
         let agent_id = named_agent(&request);
+        // The attention check is itself the stronger, cursor-bearing activity
+        // answer and is the one result expected every minute on fallback hosts.
+        // Repeating a derived hint beside it adds tokens but no information.
+        let carries_activity_hint = request.name != "irc.attention.check";
         let call = ToolCallContext::new(self, request, context);
         let mut response = self.tool_router.call(call).await?;
         if let CallToolResponse::Complete(result) = &mut response {
             adopt_unstructured(result);
-            self.hint_at_activity(agent_id.as_ref(), result).await;
+            if carries_activity_hint {
+                self.hint_at_activity(agent_id.as_ref(), result).await;
+            }
         }
         Ok(response)
     }
@@ -3255,9 +3409,9 @@ impl IrcMcpService {
     ///
     /// Separated from the tool body on purpose. A task-augmented acceptance must
     /// settle its input round trips *before* a task exists — the tasks extension
-    /// says MRTR exchanges are resolved synchronously first, and a task handle
-    /// returned for work that still needs an answer would strand the caller — so
-    /// the task path calls this and only spawns once it holds an
+    /// recommends resolving pre-creation MRTR synchronously, and this choice is
+    /// part of deciding what transfer the task will run — so the task path calls
+    /// this and only spawns once it holds an
     /// [`AcceptPlan`](dcc_accept::AcceptPlan).
     ///
     /// Every refusal here is in-band: a bad request state, a state minted for
@@ -3475,8 +3629,9 @@ impl IrcMcpService {
     /// refused any handle this caller does not own, so naming an agent here is
     /// the whole entitlement check: owner isolation is inherited rather than
     /// re-derived. `irc.connect` carries no hint because the anchor is born
-    /// during that very call, and `irc.watch.close` carries none because it
-    /// names a watch rather than an agent.
+    /// during that very call, `irc.watch.close` carries none because it names a
+    /// watch rather than an agent, and `irc.attention.check` is kept compact
+    /// because its own cursor-bearing result already says strictly more.
     ///
     /// Failures carry none either. A failure branch has no room for one in the
     /// declared schema, and burying news of a mention inside a report that
@@ -4680,6 +4835,8 @@ mod tests {
         let info = service.get_info();
         assert_eq!(info.instructions.as_deref(), Some(MCP_INSTRUCTIONS));
         assert!(!MCP_INSTRUCTIONS.contains("AGENT"));
+        assert!(MCP_INSTRUCTIONS.contains("irc.attention.open"));
+        assert!(MCP_INSTRUCTIONS.contains("60 seconds"));
     }
 
     #[test]
@@ -4893,6 +5050,28 @@ mod tests {
             !text.text.contains("durable cursor"),
             "the watch no longer holds a position for the caller"
         );
+
+        let attention = service
+            .prompt_maintain_attention(Parameters(MaintainAttentionPromptInput {
+                agent_id: "agent-example".into(),
+                full_traffic_targets: Some("#project".into()),
+            }))
+            .await;
+        let text = attention[0].content.as_text().expect("attention prompt");
+        for boundary in [
+            "irc.attention.open",
+            "subscriptions/listen",
+            "notifications/resources/updated",
+            "60 seconds",
+            "consumes model tokens",
+            "top-level MRTR",
+            "task's input_required",
+        ] {
+            assert!(
+                text.text.contains(boundary),
+                "attention prompt omits {boundary}"
+            );
+        }
     }
 
     #[test]
@@ -5036,12 +5215,15 @@ mod tests {
         for tool in service.tool_router.list_all() {
             // Each handle names the tool that mints it, so a caller reading one
             // schema never has to search for where the value comes from.
-            for (property, source) in [
-                ("agent_id", "irc.connect"),
-                ("watch_id", "irc.watch.create"),
-            ] {
+            for property in ["agent_id", "watch_id"] {
                 let Some(description) = property_description(&tool.input_schema, property) else {
                     continue;
+                };
+                let source = match (tool.name.as_ref(), property) {
+                    ("irc.attention.check", "watch_id") => "irc.attention.open",
+                    (_, "agent_id") => "irc.connect",
+                    (_, "watch_id") => "irc.watch.create",
+                    _ => unreachable!(),
                 };
                 assert!(
                     description.contains(source),
@@ -5051,10 +5233,10 @@ mod tests {
                 checked += 1;
             }
         }
-        // Every tool takes a handle except irc.connect, which mints one, and
-        // irc.events.read takes both: an agent and, optionally, the watch whose
-        // selection it should read through.
-        assert_eq!(checked, TOOL_NAMES.len());
+        // Every tool takes a handle except irc.connect, which mints one.
+        // irc.events.read and irc.attention.check each take both their agent
+        // and their watch, yielding one more checked property than tool names.
+        assert_eq!(checked, TOOL_NAMES.len() + 1);
     }
 
     #[test]
