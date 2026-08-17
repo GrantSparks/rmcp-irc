@@ -97,15 +97,22 @@ the failure shape is part of every tool's schema rather than an undocumented
 alternative to it.
 
 The failure branch carries `kind`, a safe `message` identical to the text
-summary, and `retriable`. Two structured extras appear only where the refusal
-has something to add:
+summary, and `retriable`. Structured extras appear only where the refusal has
+something to add:
 
 - `command_result` — the complete correlated IRC exchange behind a rejected or
   unacknowledged command, replies and warnings intact, so the numeric that
   refused it stays readable;
 - `receive_roots` and `default_destination_path` — the configured DCC receive
   roots a retried `irc.dcc.accept` must choose between, and the destination it
-  gets if it names a root and nothing else.
+  gets if it names a root and nothing else;
+- `delivered_lines` — for an `irc.send` whose logical message became several
+  physical lines, the per-line results of the lines that did reach the server,
+  in the same shape a successful send reports. They are public whatever
+  happened to the rest, so this is where the caller learns the `msgid`s it now
+  owns;
+- `session` — the last observed DCC session state when a followed transfer's
+  agent went away, which is the only remaining record of how far it got.
 
 The kinds are:
 
@@ -318,7 +325,9 @@ Common rules:
   not change; a client keys its `inputResponses` by them.
 - **Missing or partial answers are asked again.** A retry that echoes the state
   but answers nothing, or leaves the field blank, receives a fresh
-  `input_required` rather than an error, as the specification requires.
+  `input_required` rather than an error, as the specification requires. Every
+  round is judged on its own declarations, so a retry that no longer declares
+  `elicitation` gets that flow's fallback instead of another question.
 - **Declining is terminal and applies nothing.** `action: "decline"` or
   `"cancel"`, and an explicit `confirm: false`, return an `isError` result with
   kind `declined`. Nothing was sent upstream and nothing was written.
@@ -447,7 +456,11 @@ not currently need that path. See [Input round trips](#input-round-trips).
 enveloped; neither is an `input_required` interim result. A completed task's
 `result`, however, is an ordinary complete tool result and carries the same
 envelope — and the same [activity hint](#activity-hints) — as the synchronous
-call would have.
+call would have. `status: "failed"` is reserved for faults in the protocol
+exchange itself: an outcome of the work, including an agent that went away
+mid-transfer, settles the task `completed` with `isError: true` and the shared
+failure branch inside it. A client therefore reads *what happened* the same way
+whether or not the call became a task.
 
 **Owner binding.** A task belongs to the caller that created it. `tasks/get`,
 `tasks/update`, and `tasks/cancel` resolve the caller the same way every other
@@ -823,6 +836,15 @@ retries all leave the channel untouched. Argument validation and capability
 checks run *before* the question, so nobody is asked to approve a call that was
 never going to reach the server, and the confirmed arguments are the checked
 ones.
+
+**One approval applies one action.** A confirmed `requestState` is spent the
+moment the mutation is written, and presenting it again is refused with kind
+`confirmation_required` and a message saying to confirm again — otherwise a
+single decision would authorize the identical kick or redaction for the rest of
+its two-minute window. This is deliberately specific to the confirmation flow:
+the other exchanges answer a question about what an operation should *do*, and
+re-running one repeats an attempt the caller asked for, while this one is an
+authorization.
 
 With the setting enabled and a request that declared no form elicitation, the
 call is **refused** with kind `confirmation_required` rather than served. The

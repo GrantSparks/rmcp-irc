@@ -34,6 +34,7 @@ use crate::{
     mcp::{
         activity::{ActivityHint, ActivityPreference},
         authorization::{OwnerId, not_authorized},
+        confirm_action::RedeemedConfirmations,
         conversation::CompactEvent,
         mrtr::RequestStateSealer,
         resources::{ConversationResource, WireResource},
@@ -120,6 +121,7 @@ pub struct Gateway {
     resource_updates: broadcast::Sender<String>,
     watches: Arc<WatchRegistry>,
     request_states: RequestStateSealer,
+    redeemed_confirmations: RedeemedConfirmations,
     tasks: TaskLedger,
 }
 
@@ -140,6 +142,7 @@ impl Gateway {
             resource_updates,
             watches: Arc::new(WatchRegistry::new(watch_limits)),
             request_states: RequestStateSealer::generate(),
+            redeemed_confirmations: RedeemedConfirmations::default(),
             tasks: TaskLedger::new(),
         }
     }
@@ -178,6 +181,16 @@ impl Gateway {
     /// sealed a state and the round that must open it.
     pub fn request_states(&self) -> &RequestStateSealer {
         &self.request_states
+    }
+
+    /// Confirmations already acted on, so one approval applies one action.
+    ///
+    /// Beside the sealer for the same reason: the round that mints a
+    /// confirmation and the round that spends it are separate POSTs served by
+    /// separate handlers, so a ledger held by the handler would forget every
+    /// approval the instant it was given.
+    pub fn redeemed_confirmations(&self) -> &RedeemedConfirmations {
+        &self.redeemed_confirmations
     }
 
     /// Shared immutable process configuration.

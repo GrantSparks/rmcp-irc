@@ -27,10 +27,7 @@
 //! they describe what a client can *handle*, not who it *is*. Separating
 //! callers on a shared endpoint requires a credential.
 
-use std::{
-    collections::BTreeSet,
-    hash::{DefaultHasher, Hash, Hasher},
-};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use rmcp::{ErrorData as McpError, RoleServer, service::RequestContext};
 use serde::{Deserialize, Serialize};
@@ -49,7 +46,11 @@ impl OwnerId {
     /// Identity derived from a bearer credential.
     ///
     /// The token is hashed rather than stored, so a handle listing, a log
-    /// line, or a debug print can never carry the credential itself.
+    /// line, or a debug print can never carry the credential itself. This is a
+    /// *naming* function and nothing more: the digest is short and not
+    /// cryptographic, so it may never decide whether a credential is accepted
+    /// — see [`AcceptedTokens::authorize`], which compares the credential
+    /// itself and only then derives the name for it.
     pub fn from_bearer(token: &str) -> Self {
         let mut hasher = DefaultHasher::new();
         token.hash(&mut hasher);
@@ -63,6 +64,98 @@ impl std::fmt::Display for OwnerId {
     }
 }
 
+/// The bearer credentials one endpoint accepts, and the identity each names.
+///
+/// The credentials themselves are here because authenticating is a comparison
+/// against them. Comparing derived [`OwnerId`]s instead would authorize on a
+/// 64-bit non-cryptographic digest, and two tokens that happened to share one
+/// would then be one caller: the wrong credential would authenticate and
+/// inherit the right one's handles. So the digest is only ever the *name* of a
+/// caller that has already been recognized by its bytes.
+#[derive(Clone, Default)]
+pub struct AcceptedTokens(Vec<(String, OwnerId)>);
+
+impl std::fmt::Debug for AcceptedTokens {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // This is the one place in the process holding live credentials, so a
+        // derived `Debug` would put them in every log line that prints the
+        // caller policy. Only the count is safe to say.
+        formatter
+            .debug_struct("AcceptedTokens")
+            .field("configured", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AcceptedTokens {
+    /// Accept exactly these configured bearer tokens.
+    pub fn new(tokens: &[String]) -> Self {
+        Self(
+            tokens
+                .iter()
+                .map(|token| (token.clone(), OwnerId::from_bearer(token)))
+                .collect(),
+        )
+    }
+
+    /// Whether this endpoint requires a credential at all.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The identity behind one presented credential, if this endpoint accepts
+    /// it.
+    ///
+    /// Every configured token is compared, and each comparison runs to its end,
+    /// so neither which token matched nor how far a wrong one matched is
+    /// visible in the time this takes.
+    pub fn authorize(&self, presented: &str) -> Option<OwnerId> {
+        let mut matched = None;
+        for (token, owner) in &self.0 {
+            if constant_time_eq(presented.as_bytes(), token.as_bytes()) {
+                matched = Some(owner.clone());
+            }
+        }
+        matched
+    }
+
+    /// Accept tokens under identities chosen rather than derived.
+    ///
+    /// The one failure a byte comparison exists to prevent is a digest
+    /// collision: two different credentials that reduce to one identity. A real
+    /// collision is not something a test can produce, so this stages the
+    /// situation directly — an accepted token recorded under the identity some
+    /// *other* token derives — and lets a test assert that the other token is
+    /// still refused.
+    #[cfg(test)]
+    fn with_identities(entries: &[(&str, OwnerId)]) -> Self {
+        Self(
+            entries
+                .iter()
+                .map(|(token, owner)| ((*token).to_owned(), owner.clone()))
+                .collect(),
+        )
+    }
+}
+
+/// Whether two byte strings are equal, in time that depends only on their
+/// lengths.
+///
+/// Folding the whole width rather than returning at the first difference is
+/// what keeps a near-miss credential from being distinguishable from a wrong
+/// one by how long it took to reject. Unequal lengths are folded in for the
+/// same reason instead of short-circuiting.
+fn constant_time_eq(presented: &[u8], expected: &[u8]) -> bool {
+    let width = presented.len().max(expected.len());
+    let mut difference = u8::from(presented.len() != expected.len());
+    for index in 0..width {
+        let presented = presented.get(index).copied().unwrap_or_default();
+        let expected = expected.get(index).copied().unwrap_or_default();
+        difference |= presented ^ expected;
+    }
+    difference == 0
+}
+
 /// How callers on this transport are identified.
 #[derive(Clone, Debug, Default)]
 pub enum CallerPolicy {
@@ -72,10 +165,9 @@ pub enum CallerPolicy {
     /// Callers are identified per request, and may be required to present a
     /// credential from a configured set.
     Http {
-        /// Accepted bearer tokens, already reduced to owner identities. Empty
-        /// means the endpoint requires no credential, and every caller shares
-        /// the single local owner.
-        accepted: BTreeSet<OwnerId>,
+        /// Accepted bearer credentials. Empty means the endpoint requires no
+        /// credential, and every caller shares the single local owner.
+        accepted: AcceptedTokens,
     },
 }
 
@@ -83,10 +175,7 @@ impl CallerPolicy {
     /// Build the HTTP policy for a set of configured bearer tokens.
     pub fn http(tokens: &[String]) -> Self {
         Self::Http {
-            accepted: tokens
-                .iter()
-                .map(|token| OwnerId::from_bearer(token))
-                .collect(),
+            accepted: AcceptedTokens::new(tokens),
         }
     }
 
@@ -111,7 +200,7 @@ impl CallerPolicy {
 /// Split out from [`CallerPolicy::identify`] so the decision can be tested
 /// without fabricating a whole `RequestContext`.
 fn http_owner(
-    accepted: &BTreeSet<OwnerId>,
+    accepted: &AcceptedTokens,
     parts: Option<&axum::http::request::Parts>,
 ) -> Result<OwnerId, McpError> {
     if accepted.is_empty() {
@@ -128,14 +217,11 @@ fn http_owner(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .map(OwnerId::from_bearer);
+        .filter(|token| !token.is_empty());
     match presented {
-        Some(owner) if accepted.contains(&owner) => Ok(owner),
-        Some(_) => Err(McpError::invalid_request(
-            "bearer credential is not authorized for this service",
-            None,
-        )),
+        Some(token) => accepted.authorize(token).ok_or_else(|| {
+            McpError::invalid_request("bearer credential is not authorized for this service", None)
+        }),
         None => Err(McpError::invalid_request(
             "this endpoint requires an Authorization: Bearer credential",
             None,
@@ -186,8 +272,61 @@ mod tests {
         let CallerPolicy::Http { accepted } = &policy else {
             panic!("expected an HTTP policy");
         };
-        assert!(accepted.contains(&OwnerId::from_bearer("good")));
-        assert!(!accepted.contains(&OwnerId::from_bearer("bad")));
+        assert_eq!(
+            accepted.authorize("good"),
+            Some(OwnerId::from_bearer("good"))
+        );
+        for wrong in ["bad", "goo", "goods", "Good", " good", "good ", ""] {
+            assert!(accepted.authorize(wrong).is_none(), "{wrong:?}");
+        }
+    }
+
+    #[test]
+    fn a_credential_that_shares_an_identity_with_an_accepted_one_is_still_refused() {
+        // The failure a byte comparison exists to prevent: the identity is a
+        // 64-bit non-cryptographic digest, so two tokens can in principle
+        // reduce to one owner. Producing a real collision is not something a
+        // test can do, so this stages one — the accepted credential is recorded
+        // under exactly the identity the *wrong* credential derives — and
+        // asserts that acceptance never consults it.
+        let accepted =
+            AcceptedTokens::with_identities(&[("s3cret", OwnerId::from_bearer("guessed"))]);
+        assert_eq!(
+            accepted.authorize("s3cret"),
+            Some(OwnerId::from_bearer("guessed")),
+            "the configured credential is still accepted, under the identity recorded for it"
+        );
+        assert!(
+            accepted.authorize("guessed").is_none(),
+            "a credential is accepted for its bytes, never for the identity derived from them"
+        );
+    }
+
+    #[test]
+    fn comparing_a_credential_folds_its_whole_width() {
+        // Returning at the first differing byte would make a near-miss
+        // measurably slower to reject than a wrong first character.
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        for (presented, expected) in [
+            (&b"s3cret"[..], &b"s3cres"[..]),
+            (b"s3cret", b"s3cre"),
+            (b"s3cre", b"s3cret"),
+            // Padding shorter input with zero bytes must not make a token and
+            // its zero-extension compare equal.
+            (b"s3cret\0", b"s3cret"),
+            (b"", b"s3cret"),
+        ] {
+            assert!(!constant_time_eq(presented, expected), "{presented:?}");
+        }
+    }
+
+    #[test]
+    fn a_configured_credential_set_never_prints_its_credentials() {
+        let policy = CallerPolicy::http(&["s3cret".to_string()]);
+        let rendered = format!("{policy:?}");
+        assert!(!rendered.contains("s3cret"), "{rendered}");
+        assert!(rendered.contains("configured"), "{rendered}");
     }
 
     #[test]
@@ -202,7 +341,7 @@ mod tests {
         // Startup already restricts this shape to loopback unless the operator
         // opted a trusted network in, so the endpoint has exactly one caller
         // and every request must land on the same owner as stdio does.
-        let accepted = BTreeSet::new();
+        let accepted = AcceptedTokens::default();
         let first = http_owner(&accepted, Some(&parts(&[]))).expect("first request");
         let second = http_owner(&accepted, None).expect("second request");
         assert_eq!(first, OwnerId::local());
@@ -213,7 +352,7 @@ mod tests {
     fn an_mcp_session_id_header_never_contributes_to_identity() {
         // The header does not exist in this protocol revision. Honoring it
         // would let a caller mint its own owner by inventing a value.
-        let accepted = BTreeSet::new();
+        let accepted = AcceptedTokens::default();
         let claimed = http_owner(&accepted, Some(&parts(&[("mcp-session-id", "session-a")])))
             .expect("session header is ignored, not rejected");
         assert_eq!(claimed, OwnerId::local());

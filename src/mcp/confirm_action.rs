@@ -20,6 +20,16 @@
 //! The summary a caller confirms is built from the already-validated arguments
 //! and sealed with them, so the action described in the question is exactly the
 //! action the retry performs.
+//!
+//! A third property needs state, which is why [`RedeemedConfirmations`] lives
+//! here: **one approval applies one action**. A sealed confirmation is an HMAC
+//! over the caller, the arguments, and a deadline, and nothing in that says how
+//! often it may be presented — so without a record of what has been spent, a
+//! single human "yes" re-executes the same kick for the rest of its
+//! time-to-live, which is exactly the authority the deployment withheld from the
+//! model.
+
+use std::{collections::VecDeque, sync::Mutex, time::Instant};
 
 use rmcp::{
     ErrorData as McpError,
@@ -27,7 +37,19 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::mcp::mrtr::{FormAnswer, bool_field, form_elicitation, read_form_answer};
+use crate::mcp::mrtr::{
+    FormAnswer, REQUEST_STATE_TTL, bool_field, form_elicitation, read_form_answer,
+};
+
+/// Confirmations retained at once, an upper bound on what this costs.
+///
+/// A record lives for [`REQUEST_STATE_TTL`], and every one of them is a
+/// separate action a person approved inside that window, so the ceiling is far
+/// above any human-paced deployment. Past it the oldest record is dropped —
+/// deliberately, rather than refusing further confirmations: turning memory
+/// pressure into an outage of the gated tools would be the worse failure, and
+/// reaching this at all means something other than a person is answering.
+const MAX_REDEEMED: usize = 1_024;
 
 /// Key the confirmation question is filed under within one MRTR round.
 ///
@@ -58,6 +80,107 @@ impl PendingConfirmation {
     /// Whether this state still describes the action in front of us.
     pub fn matches(&self, action: &str) -> bool {
         self.action == action
+    }
+}
+
+/// The confirmations this process has already acted on.
+///
+/// ## Why this exists
+///
+/// A `requestState` is integrity-protected and short-lived, and both of those
+/// are about *who* may redeem it and *for how long* — neither says *how many
+/// times*. For a question whose answer is "yes, remove that person", once is
+/// the whole point: a client that repeats the identical call with the identical
+/// answer would otherwise kick again, and again, for two minutes, on one
+/// person's approval.
+///
+/// ## Why only this flow
+///
+/// Single-use is deliberately **not** a property of request state in general.
+/// The other exchanges answer a question about what an operation should do — a
+/// nickname, a channel key, a destination — and re-running one is at worst a
+/// repeated attempt at something the caller asked for; the DCC acceptance path
+/// re-opens its own state *inside* the task it creates, so making states
+/// single-use would break it outright. What is special here is that the answer
+/// is an authorization rather than an argument, and an authorization that can
+/// be replayed is not one. So the ledger is consumed in exactly one place: the
+/// moment a confirmed destructive mutation is about to be written.
+///
+/// Records are process-local and expire with the states they describe, which
+/// needs no more retention than that: a record can only be useful while the
+/// state it names is still redeemable at all.
+#[derive(Default)]
+pub struct RedeemedConfirmations {
+    spent: Mutex<VecDeque<Spent>>,
+}
+
+/// One confirmation that has already been acted on, and when.
+struct Spent {
+    /// The sealed state exactly as the client presented it.
+    ///
+    /// Kept whole rather than digested: it already ends in the codec's own
+    /// authentication tag, so it is its own collision-resistant identifier,
+    /// while a short digest could only make two distinct approvals collide into
+    /// one and refuse a legitimate confirmation.
+    sealed: String,
+    redeemed_at: Instant,
+}
+
+impl std::fmt::Debug for RedeemedConfirmations {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The records are live request states; only how many there are is safe
+        // to print inside a debug of the whole gateway.
+        formatter
+            .debug_struct("RedeemedConfirmations")
+            .field("spent", &self.lock().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RedeemedConfirmations {
+    /// Spend one confirmation, reporting whether it had already been spent.
+    ///
+    /// Returns `true` exactly once per sealed state — the caller may apply the
+    /// action — and `false` for every later presentation of the same one.
+    pub fn redeem(&self, sealed: &str) -> bool {
+        self.redeem_at(sealed, Instant::now())
+    }
+
+    /// The same decision at an explicit instant, so retention is testable
+    /// without waiting out the time-to-live.
+    fn redeem_at(&self, sealed: &str, now: Instant) -> bool {
+        let mut spent = self.lock();
+        // A record outliving the state it names could only refuse a
+        // confirmation that can no longer be redeemed anyway.
+        while spent
+            .front()
+            .is_some_and(|oldest| now.duration_since(oldest.redeemed_at) >= REQUEST_STATE_TTL)
+        {
+            spent.pop_front();
+        }
+        if spent.iter().any(|entry| entry.sealed == sealed) {
+            return false;
+        }
+        if spent.len() >= MAX_REDEEMED {
+            spent.pop_front();
+        }
+        spent.push_back(Spent {
+            sealed: sealed.to_owned(),
+            redeemed_at: now,
+        });
+        true
+    }
+
+    /// Take the ledger, recovering from a panic in another holder.
+    ///
+    /// Nothing under this lock can leave a record half-written, so a poisoned
+    /// lock means an unrelated panic — and refusing every later confirmation
+    /// over it would turn that into a gate nobody can pass.
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Spent>> {
+        self.spent.lock().unwrap_or_else(|poisoned| {
+            self.spent.clear_poison();
+            poisoned.into_inner()
+        })
     }
 }
 
@@ -182,5 +305,47 @@ mod tests {
         let pending = PendingConfirmation::for_action("kick Prometheus from #forge");
         assert!(pending.matches("kick Prometheus from #forge"));
         assert!(!pending.matches("kick Prometheus from #other"));
+    }
+
+    #[test]
+    fn one_approval_is_spent_by_the_first_action_it_applies() {
+        let spent = RedeemedConfirmations::default();
+        assert!(spent.redeem("rs1.approved"), "the first use is the answer");
+        for _ in 0..3 {
+            assert!(
+                !spent.redeem("rs1.approved"),
+                "a replayed approval must not apply the action a second time"
+            );
+        }
+        assert!(
+            spent.redeem("rs1.approved-again"),
+            "a fresh confirmation is unaffected by another one being spent"
+        );
+    }
+
+    #[test]
+    fn a_record_is_retired_with_the_state_it_describes() {
+        // A record that outlived its state would only refuse a confirmation
+        // that has expired anyway, and one retired early would let the
+        // approval be replayed for the rest of its window.
+        let spent = RedeemedConfirmations::default();
+        let approved = Instant::now();
+        assert!(spent.redeem_at("rs1.approved", approved));
+        assert!(!spent.redeem_at("rs1.approved", approved + REQUEST_STATE_TTL / 2));
+        assert!(spent.redeem_at("rs1.approved", approved + REQUEST_STATE_TTL));
+    }
+
+    #[test]
+    fn the_ledger_holds_a_bounded_number_of_records() {
+        let spent = RedeemedConfirmations::default();
+        let now = Instant::now();
+        for index in 0..MAX_REDEEMED + 8 {
+            assert!(spent.redeem_at(&format!("rs1.{index}"), now));
+        }
+        assert_eq!(spent.lock().len(), MAX_REDEEMED);
+        assert!(
+            !spent.redeem_at(&format!("rs1.{}", MAX_REDEEMED + 7), now),
+            "the newest approvals are the ones still protected from replay"
+        );
     }
 }

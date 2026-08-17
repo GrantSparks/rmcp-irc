@@ -30,12 +30,15 @@ at least one repeatable `--allow-host HOST` are supplied. This is an explicit
 network-listener opt-in, not caller authentication. Configure repeatable
 `--http-bearer-token TOKEN` values to require bearer authentication; each
 accepted token becomes a distinct owner whose handles are invisible to other
-owners. With no configured tokens, the endpoint is trusted and every HTTP
-request shares the single local owner. MCP 2026-07-28 has no session identity,
-so unauthenticated callers cannot be separated from one another.
-Browser requests carrying an `Origin` header are denied by default; add exact
-origins with repeatable `--allow-origin SCHEME://HOST[:PORT]`. Every HTTP
-response uses `Cache-Control: private, no-store`.
+owners. With no configured tokens there is no caller separation at all: every
+HTTP caller shares one local owner — MCP 2026-07-28 has no session identity,
+so unauthenticated callers cannot be told apart — which is why startup
+restricts that shape to a trusted endpoint, loopback unless the network opt-in
+above is given. Bearer tokens are the only thing that separates callers, so
+configure them before the endpoint is shared with anyone else. Browser
+requests carrying an `Origin` header are denied by default; add exact origins
+with repeatable `--allow-origin SCHEME://HOST[:PORT]`. Every HTTP response
+uses `Cache-Control: private, no-store`.
 
 ## `[irc]`: Ergo endpoint
 
@@ -83,7 +86,8 @@ certificate and hostname.
 | `nickname_attempts` | positive integer | `8` | Total bounded candidates allowed inside one registration call. |
 | `connect_timeout_ms` | positive integer | `15000` | Deadline covering connect, CAP, guest registration, collision handling, and initial MOTD completion. |
 
-The MCP server's initialization `instructions` remain four short steps:
+The server's onboarding `instructions`, which `server/discover` returns, remain
+four short steps:
 
 1. Choose a nickname based on a mythological character.
 2. Call `irc.connect` with that nickname.
@@ -285,9 +289,9 @@ error, with sensitive values redacted.
   explicitly required; non-loopback mode adds request validation, while
   `--http-bearer-token` independently enables caller authentication.
 - Treat `agent_id` as a routing handle, not a credential. The gateway enforces
-  its recorded caller ownership; do not expect a handle to cross bearer
-  identities. Without bearer authentication all HTTP callers share the local
-  owner.
+  its recorded caller ownership; a handle never crosses bearer-token owners.
+  Without configured tokens there is a single owner, so ownership isolates
+  nothing on that endpoint.
 - Choose `plain` or `tls` to match Ergo's configured listener.
 - Size event and command bounds for the number of agents while preserving
   predictable total memory.

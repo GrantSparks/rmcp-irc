@@ -63,10 +63,13 @@ artifact:
   --listen 127.0.0.1:8181 --config /path/to/live.toml
 ```
 
-Initialize both MCP connections with a supported protocol version. For HTTP,
-use the Streamable HTTP endpoint at `/mcp`. Assert that initialization returns
-the same server identity, capabilities, and three-step onboarding instructions;
-`tools/list`, `resources/list`, and `resources/templates/list` must agree.
+Stdio keeps a conventional client connection. HTTP has no initialize
+handshake: a client discovers the server with `server/discover` at the
+Streamable HTTP endpoint `/mcp`, and every request declares its own protocol
+version, `clientInfo`, and `clientCapabilities` in `_meta`. Assert that both
+transports report the same server identity, capabilities, and three-step
+onboarding instructions; `tools/list`, `resources/list`, and
+`resources/templates/list` must agree.
 
 ## Required operation matrix
 
@@ -93,7 +96,7 @@ addresses, local paths, or credentials do not belong in committed evidence.
 | Progress | Call `irc.connect` and `irc.history` with a `_meta.progressToken`, then repeat each without one. | With a token, `notifications/progress` arrive on that request's own stream with strictly increasing `progress`, `total` 7 for connect and 3 for history, and distinct registered/autojoin stages; the result is last and nothing follows it. Without a token, no notifications at all. |
 | DCC receive roots | Configure two `[[dcc.receive_roots]]`, then accept one offer naming a root and a nested relative destination, and one naming neither. Also try an absolute `destination_path` and a link planted at the destination name. | The named accept lands under that root and reports matching `receive_root`/`receive_path`; the unnamed accept returns `input_required` offering exactly the configured names (or a structured `receive_roots` error from a client without elicitation) and completes on the retry; the absolute path is refused; the planted link is never written through and the offer survives every refusal. |
 | Input round trips | From a client declaring `elicitation`, connect with `nick_conflict_policy: "elicit"` against a nickname the other identity already holds and answer the question with a third name; join a `+k` channel without a `key`, answer it, then repeat with a deliberately wrong key; with `mcp.confirm_destructive = true`, kick and redact once confirming and once declining. Repeat one of each from a client declaring no elicitation. | Each question arrives as `resultType: "input_required"` under its documented key and the retry completes the original call — a fresh registration under the chosen nickname, a JOIN carrying the key, the kick and redaction applied. A declined answer, a wrong key, and an expired or edited `requestState` all leave nothing applied and return an in-band `isError` result. Without elicitation: `elicit` is refused as a validation error, the keyed join returns its ordinary 475 rejection, and the gated mutations are refused with `confirmation_required` rather than applied. |
-| HTTP ownership | Start HTTP with two bearer tokens (or two isolated MCP sessions), create one agent/watch per owner, and attempt cross-owner list, read, subscribe, tool, and disconnect operations. Inspect response cache headers. | Each owner sees and operates only its own handles; an unowned handle is indistinguishable from a missing one; notifications do not cross owners; responses are `private, no-store`. |
+| HTTP ownership | Start HTTP with two bearer tokens, create one agent/watch per owner, and attempt cross-owner list, read, subscribe, tool, and disconnect operations. Inspect response cache headers. | Each owner sees and operates only its own handles; an unowned handle is indistinguishable from a missing one; notifications do not cross owners; responses are `private, no-store`. |
 | Lifecycle | Disconnect both handles, close stdio input, and stop HTTP gracefully. Inspect processes and server presence. | QUIT is attempted, DCC sessions close, handles become invalid, stdio exits on EOF, HTTP stops on cancellation, and no gateway or IRC identity is orphaned. |
 
 If a human cannot accept a DCC offer within its configured deadline, treat that

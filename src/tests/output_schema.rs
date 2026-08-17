@@ -36,7 +36,7 @@ use crate::{
     tests::{
         fake_ergo::FakeErgo,
         gateway_integration::config_with_receive_roots,
-        streamable_http::{Envelope, router_for, send},
+        streamable_http::{Envelope, router_for, send, task_request, tasks_meta},
     },
     time::Timestamp,
 };
@@ -104,6 +104,22 @@ fn rejected_exchange() -> CommandResult {
     }
 }
 
+/// One correlated exchange the server took, with the id it assigned.
+fn delivered_exchange() -> CommandResult {
+    CommandResult {
+        command: "PRIVMSG".into(),
+        outcome: CommandOutcome::Completed,
+        retriable: true,
+        replies: vec![
+            crate::irc::wire::WireMessage::parse(bytes::Bytes::from_static(
+                b"@msgid=line-1 :Me!u@h PRIVMSG #agents :the first half",
+            ))
+            .expect("wire reply"),
+        ],
+        ..rejected_exchange()
+    }
+}
+
 /// Every failure this gateway can produce, each built by the constructor that
 /// production uses rather than transcribed here.
 fn every_failure() -> Vec<(&'static str, Value)> {
@@ -130,6 +146,26 @@ fn every_failure() -> Vec<(&'static str, Value)> {
                 "name one of the configured roots",
                 vec!["inbox".into(), "archive".into()],
                 Some(std::path::PathBuf::from("report.txt")),
+            ),
+        ),
+        (
+            "partial multi-line send",
+            ToolFailure::from_command(
+                CommandOutcome::Rejected,
+                "IRC send failed after processing 2 line(s): Rejected.",
+                rejected_exchange(),
+            )
+            .with_delivered_lines(vec![delivered_exchange()]),
+        ),
+        (
+            "a followed transfer whose agent went away",
+            ToolFailure::from_error(&GatewayError::AgentNotFound(AgentId::new())).with_session(
+                DccSession::offered(
+                    DccKind::Send,
+                    DccDirection::Outbound,
+                    "peer",
+                    Timestamp::now(),
+                ),
             ),
         ),
     ]
@@ -269,11 +305,17 @@ async fn every_tool_result_conforms_to_the_schema_that_tool_declared() {
             "{name}: the discriminator and isError must agree: {result}"
         );
         conforms(&schemas[name], name, "live result", &structured);
-        if structured["ok"] == json!(true) {
-            succeeded.insert(name.to_owned(), structured);
-        } else {
-            eprintln!("FAILED {name}: {}", structured["error"]);
-        }
+        // Every call below is one this fixture can complete, and the coverage
+        // assertion at the end needs a validated success from each. Saying so
+        // here rather than there is what puts the server's own explanation next
+        // to the call that failed instead of in a list of missing names.
+        assert_eq!(
+            structured["ok"],
+            json!(true),
+            "{name} was expected to succeed here: {}",
+            structured["error"]
+        );
+        succeeded.insert(name.to_owned(), structured);
     };
 
     let connected = call(&router, "irc.connect", json!({"nickname": "Ariadne"})).await;
@@ -559,6 +601,77 @@ async fn every_tool_result_conforms_to_the_schema_that_tool_declared() {
             .iter()
             .filter(|name| !succeeded.contains_key(**name))
             .collect::<Vec<_>>()
+    );
+}
+
+/// A task's terminal payload is a complete tool result, so it has to satisfy
+/// the tool's declared schema exactly as one returned directly does.
+///
+/// Nothing else can see it. The payload never travels through `tools/call`, and
+/// the client reads it out of `tasks/get` minutes later — which is where a
+/// result shaped unlike anything the schema allows would surface, long after
+/// the call that produced it.
+#[tokio::test]
+async fn a_completed_tasks_terminal_result_conforms_to_the_schema_its_tool_declared() {
+    let server = FakeErgo::spawn().await;
+    let scratch = tempfile::tempdir().expect("scratch");
+    // Short enough that the follow loop reaches its own deadline while the peer
+    // is still not there, and settles with the session as it stands. That is
+    // the terminal payload, and it goes through the same construction a
+    // finished transfer's does.
+    let gateway = Arc::new(
+        Gateway::new(server.config()).with_task_ttl(std::time::Duration::from_millis(600)),
+    );
+    let router = router_for(gateway, CallerPolicy::Local);
+    let schemas = declared_schemas(&router).await;
+
+    let connected = call(&router, "irc.connect", json!({"nickname": "Ariadne"})).await;
+    let agent = connected["structuredContent"]["result"]["agent_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a connected agent: {connected}"))
+        .to_owned();
+    let source = scratch.path().join("outgoing.txt");
+    std::fs::write(&source, b"payload").expect("write source");
+
+    let (status, created) = send(
+        &router,
+        Envelope::tool_call(
+            "irc.dcc.send",
+            json!({
+                "agent_id": agent,
+                "target": "Theseus",
+                "source_path": source.to_string_lossy(),
+            }),
+        )
+        .with_meta(Some(tasks_meta())),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{created}");
+    assert_eq!(created["result"]["resultType"], "task", "{created}");
+    let task_id = created["result"]["taskId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a created task: {created}"))
+        .to_owned();
+
+    let settled = loop {
+        let (_, polled) = send(&router, task_request("tasks/get", &task_id)).await;
+        if polled["result"]["status"] != "working" {
+            break polled;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    assert_eq!(settled["result"]["status"], "completed", "{settled}");
+    let structured = settled["result"]["result"]["structuredContent"].clone();
+    assert_eq!(structured["ok"], json!(true), "{settled}");
+    assert!(
+        structured["result"]["session"]["id"].is_string(),
+        "the declared schema nests the session under `session`: {settled}"
+    );
+    conforms(
+        &schemas["irc.dcc.send"],
+        "irc.dcc.send",
+        "a task's terminal result",
+        &structured,
     );
 }
 

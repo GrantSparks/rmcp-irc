@@ -615,12 +615,6 @@ async fn hints_are_suppressed_only_by_configuration_or_the_connect_preference() 
     let subscribed = Fixture::start().await;
     let watch = subscribed.watch(json!([])).await;
     subscribed.peer_says("Ariadne", "still counted").await;
-    let (_, listed) = send(
-        &subscribed.router,
-        Envelope::new("resources/list").with_meta(None),
-    )
-    .await;
-    let _ = listed;
     let (status, resources) = send(&subscribed.router, Envelope::new("resources/list")).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{resources}");
     assert!(

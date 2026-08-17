@@ -134,13 +134,44 @@ impl RequestStateSealer {
         operation: &OriginatingOperation,
         state: &T,
     ) -> Result<String, McpError> {
+        self.seal_for(owner, operation, state, REQUEST_STATE_TTL)
+    }
+
+    /// Seal `state` with a lifetime other than the standard one.
+    ///
+    /// The time-to-live is fixed when the token is minted and read back out of
+    /// it, so an already-expired state cannot be produced by waiting less than
+    /// two minutes — it has to be minted that way. That makes this the whole
+    /// seam a test needs to drive expiry through a real tool call, and it is
+    /// test-only precisely because nothing in the served surface may choose a
+    /// window other than [`REQUEST_STATE_TTL`].
+    ///
+    /// # Errors
+    ///
+    /// Fails only if `state` cannot be serialized to JSON.
+    #[cfg(test)]
+    pub fn seal_with_ttl<T: Serialize>(
+        &self,
+        owner: &OwnerId,
+        operation: &OriginatingOperation,
+        state: &T,
+        ttl: Duration,
+    ) -> Result<String, McpError> {
+        self.seal_for(owner, operation, state, ttl)
+    }
+
+    fn seal_for<T: Serialize>(
+        &self,
+        owner: &OwnerId,
+        operation: &OriginatingOperation,
+        state: &T,
+        ttl: Duration,
+    ) -> Result<String, McpError> {
         let binding = binding(owner, operation);
         self.codec
             .seal_json_with(
                 state,
-                &SealOptions::new()
-                    .associated_data(&binding)
-                    .ttl(REQUEST_STATE_TTL),
+                &SealOptions::new().associated_data(&binding).ttl(ttl),
             )
             .map_err(|error| {
                 McpError::internal_error(format!("could not seal request state: {error}"), None)
@@ -421,14 +452,12 @@ mod tests {
         // possible lifetime and lets it lapse rather than waiting out the
         // production value.
         let sealer = RequestStateSealer::generate();
-        let binding = binding(&OwnerId::local(), &operation());
         let sealed = sealer
-            .codec
-            .seal_json_with(
+            .seal_with_ttl(
+                &OwnerId::local(),
+                &operation(),
                 &pending(),
-                &SealOptions::new()
-                    .associated_data(&binding)
-                    .ttl(Duration::from_millis(1)),
+                Duration::from_millis(1),
             )
             .expect("seal");
         std::thread::sleep(Duration::from_millis(20));

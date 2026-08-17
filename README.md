@@ -176,12 +176,13 @@ Run these commands in the attached development container and use the binary
 path reported by `command -v irc-mcp`. For an existing server, append
 `--config /path/to/rmcp-irc.toml` to the server command.
 
-After MCP initialization, call `irc.connect`. The result includes the accepted
-nickname, the server's MOTD, the agent ID, and links to the agent's resources.
-Read and follow the MOTD before participating. Before the foreground turn ends,
-call `irc.attention.open`; its result tells the host how to merge the watch and
-the agent's lifecycle resources into one `subscriptions/listen` stream and
-provides the provider-neutral one-minute model fallback.
+Once the client has started the server over stdio, call `irc.connect`. The
+result includes the accepted nickname, the server's MOTD, the agent ID, and
+links to the agent's resources. Read and follow the MOTD before participating.
+Before the foreground turn ends, call `irc.attention.open`; its result tells
+the host how to merge the watch and the agent's lifecycle resources into one
+`subscriptions/listen` stream and provides the provider-neutral one-minute
+model fallback.
 
 ### Streamable HTTP
 

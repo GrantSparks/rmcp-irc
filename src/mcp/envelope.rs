@@ -24,9 +24,12 @@
 //!
 //! The failure branch is shared by every tool, which is why it carries room for
 //! the structured extras individual refusals need: the correlated
-//! [`CommandResult`] behind a rejected IRC command, and the configured receive
-//! roots behind a DCC acceptance that cannot choose a destination on its own.
-//! Both used to be returned as bare objects that no declared schema allowed.
+//! [`CommandResult`] behind a rejected IRC command, the configured receive
+//! roots behind a DCC acceptance that cannot choose a destination on its own,
+//! the lines a partial send did deliver, and the last known state of a direct
+//! session whose agent went away. The first two used to be returned as bare
+//! objects that no declared schema allowed; the last two used to be dropped, and
+//! each is something the caller now owns and cannot otherwise learn.
 //!
 //! Interim results are *not* enveloped. `InputRequiredResult` and
 //! `CreateTaskResult` are different `resultType`s carrying no
@@ -46,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
+    dcc::session::DccSession,
     error::GatewayError,
     irc::correlation::{CommandOutcome, CommandResult},
     mcp::activity::ActivityHint,
@@ -89,6 +93,17 @@ pub struct ToolFailure {
     /// the same reason as `receive_roots`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_destination_path: Option<PathBuf>,
+    /// The physical lines one logical message did deliver before a later line
+    /// failed, correlated exactly as a successful send reports them. Absent
+    /// unless a partial send is what this failure is about — and then it is how
+    /// a caller learns the `msgid`s it now publicly owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_lines: Option<Vec<CommandResult>>,
+    /// Last observed state of the direct session this failure is about. Absent
+    /// unless the failure interrupted one, which is the only case where the
+    /// server holds a snapshot the caller cannot go and read for itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<DccSession>,
 }
 
 impl ToolFailure {
@@ -136,6 +151,30 @@ impl ToolFailure {
         }
     }
 
+    /// Keep the lines a partial send delivered before it failed.
+    ///
+    /// A logical message can become several physical lines, and the ones that
+    /// were written are public and correlated whatever happened afterwards.
+    /// Reporting only the line that failed would leave the caller unable to
+    /// name — or redact, or react to — what it had already said. An empty list
+    /// is no news, so it stays absent.
+    #[must_use]
+    pub fn with_delivered_lines(mut self, delivered: Vec<CommandResult>) -> Self {
+        self.delivered_lines = (!delivered.is_empty()).then_some(delivered);
+        self
+    }
+
+    /// Keep the last known state of the direct session a failure interrupted.
+    ///
+    /// The snapshot a follower was holding when the agent went away is the only
+    /// remaining evidence of how far the transfer got: the session went with the
+    /// actor, so there is no resource left to read it from.
+    #[must_use]
+    pub fn with_session(mut self, session: DccSession) -> Self {
+        self.session = Some(session);
+        self
+    }
+
     fn new(kind: &str, message: impl Into<String>, retriable: bool) -> Self {
         Self {
             kind: kind.to_owned(),
@@ -144,6 +183,8 @@ impl ToolFailure {
             command_result: None,
             receive_roots: None,
             default_destination_path: None,
+            delivered_lines: None,
+            session: None,
         }
     }
 }
@@ -324,13 +365,13 @@ mod tests {
 
     #[test]
     fn definitions_referenced_by_either_branch_live_at_the_document_root() {
-        let schema = envelope_schema::<DccListOutput>();
+        let schema = envelope_schema::<ActivityHint>();
         let definitions = schema["$defs"].as_object().expect("shared definitions");
-        // `DccSession` comes from the tool's own output and `CommandResult`
-        // from the shared failure, so finding both proves the hoist merged
-        // rather than replaced.
+        // `EventCursor` can only have come from the tool's own output and
+        // `DccSession` only from the shared failure, so finding both proves the
+        // hoist merged rather than replaced.
+        assert!(definitions.contains_key("EventCursor"), "{definitions:?}");
         assert!(definitions.contains_key("DccSession"), "{definitions:?}");
-        assert!(definitions.contains_key("CommandResult"), "{definitions:?}");
         assert!(
             !schema["oneOf"][0]["properties"]["result"]
                 .as_object()
@@ -347,6 +388,16 @@ mod tests {
         assert_eq!(value["kind"], "declined");
         assert!(value.get("receive_roots").is_none(), "{value}");
         assert!(value.get("command_result").is_none(), "{value}");
+        assert!(value.get("delivered_lines").is_none(), "{value}");
+        assert!(value.get("session").is_none(), "{value}");
+
+        // An empty list of delivered lines is no news, so it stays absent
+        // rather than becoming an empty array a reader has to interpret.
+        let nothing_delivered =
+            ToolFailure::refusal("rejected", "the first line was refused", false)
+                .with_delivered_lines(Vec::new());
+        let value = serde_json::to_value(&nothing_delivered).expect("failure serializes");
+        assert!(value.get("delivered_lines").is_none(), "{value}");
 
         let roots = ToolFailure::unchosen_destination(
             "name one",

@@ -22,7 +22,11 @@ use crate::{
     agent::actor::ConnectMilestone,
     gateway::Gateway,
     http_service,
-    mcp::{authorization::CallerPolicy, tasks::TASK_TTL},
+    mcp::{
+        authorization::CallerPolicy,
+        service::{HISTORY_PROGRESS_TOTAL, TASK_INITIAL_STATUS},
+        tasks::TASK_TTL,
+    },
     tests::fake_ergo::{CHANNEL_KEY, FakeErgo, KEYED_CHANNEL},
 };
 
@@ -143,7 +147,7 @@ pub(super) fn client_meta(capabilities: serde_json::Value) -> serde_json::Value 
 /// Client `_meta` declaring the tasks extension, which is the whole trigger:
 /// tasks are server-directed, and the client's only say is whether it declared
 /// that it can follow one.
-fn tasks_meta() -> serde_json::Value {
+pub(super) fn tasks_meta() -> serde_json::Value {
     client_meta(serde_json::json!({
         "extensions": { rmcp::model::TASKS_EXTENSION_ID: {} },
     }))
@@ -537,6 +541,7 @@ async fn a_tool_call_whose_name_header_disagrees_with_its_body_is_refused() {
 struct ConnectedFixture {
     server: FakeErgo,
     _directory: tempfile::TempDir,
+    gateway: Arc<Gateway>,
     router: axum::Router,
     agent_id: String,
     source_path: String,
@@ -560,7 +565,7 @@ impl ConnectedFixture {
         let mut config = server.config();
         configure(&mut config);
         let gateway = Arc::new(Gateway::new(config).with_task_ttl(task_ttl));
-        let router = router_for(gateway, callers);
+        let router = router_for(gateway.clone(), callers);
         let (status, body) = send(
             &router,
             authorized(
@@ -581,6 +586,7 @@ impl ConnectedFixture {
         Self {
             server,
             _directory: directory,
+            gateway,
             router,
             agent_id,
             source_path: source_path.to_string_lossy().into_owned(),
@@ -612,7 +618,7 @@ pub(super) fn authorized(envelope: Envelope, credential: Option<&str>) -> Envelo
 }
 
 /// A `tasks/*` request for one task id.
-fn task_request(method: &str, task_id: &str) -> Envelope {
+pub(super) fn task_request(method: &str, task_id: &str) -> Envelope {
     let mut envelope = Envelope::new(method);
     envelope.name = Some(task_id.to_owned());
     envelope.params = serde_json::json!({ "taskId": task_id });
@@ -1569,9 +1575,16 @@ async fn destructive_tools_are_unchanged_while_the_gate_is_off() {
 /// Two roots is what makes the destination a question at all, and the offer has
 /// to be real: acceptance is refused for anything but a pending inbound offer,
 /// so a fabricated handle would never reach the decision under test.
-async fn offered(
-    router_callers: CallerPolicy,
-) -> (FakeErgo, tempfile::TempDir, axum::Router, String, String) {
+struct OfferedFixture {
+    _server: FakeErgo,
+    _scratch: tempfile::TempDir,
+    gateway: Arc<Gateway>,
+    router: axum::Router,
+    agent_id: String,
+    dcc_session_id: String,
+}
+
+async fn offered(router_callers: CallerPolicy) -> OfferedFixture {
     let scratch = tempfile::tempdir().expect("scratch");
     let server = FakeErgo::spawn().await;
     let gateway = Arc::new(Gateway::new(
@@ -1602,25 +1615,38 @@ async fn offered(
         "report.txt",
     )
     .await;
-    (server, scratch, router, agent_id, offer.id.to_string())
+    OfferedFixture {
+        _server: server,
+        _scratch: scratch,
+        gateway,
+        router,
+        agent_id,
+        dcc_session_id: offer.id.to_string(),
+    }
 }
 
 #[tokio::test]
 async fn an_accept_that_still_needs_input_creates_no_task_until_it_is_answered() {
-    // The tasks extension recommends resolving pre-creation MRTR before a task
-    // handle is returned. A task can later ask through tasks/get/tasks/update,
-    // but this destination decides what transfer is being created and belongs
-    // to the original call.
-    let (_server, _scratch, router, agent_id, dcc_session_id) = offered(CallerPolicy::Local).await;
+    // The tasks extension resolves input exchanges before a task handle is
+    // returned: a task can later ask through tasks/get and tasks/update, but
+    // this destination decides what transfer is being created and belongs to
+    // the original call. Getting this wrong is not cosmetic — the handle
+    // arrives after the originating stream closed, so the caller would hold a
+    // task that cannot succeed.
+    let fixture = offered(CallerPolicy::Local).await;
     let accept = |meta: serde_json::Value| {
         Envelope::tool_call(
             "irc.dcc.accept",
-            serde_json::json!({ "agent_id": agent_id, "dcc_session_id": dcc_session_id }),
+            serde_json::json!({
+                "agent_id": fixture.agent_id,
+                "dcc_session_id": fixture.dcc_session_id,
+            }),
         )
         .with_meta(Some(meta))
     };
+    let router = &fixture.router;
 
-    let (status, asked) = send(&router, accept(tasks_and_elicitation_meta())).await;
+    let (status, asked) = send(router, accept(tasks_and_elicitation_meta())).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{asked}");
     // `question` asserts the absence of a task id: this is the whole point.
     let (request, state) = question(&asked, "dcc_destination");
@@ -1632,7 +1658,7 @@ async fn an_accept_that_still_needs_input_creates_no_task_until_it_is_answered()
 
     // Answered, the same call is the long-running work a task exists for.
     let (status, created) = send(
-        &router,
+        router,
         accept(tasks_and_elicitation_meta()).answering(
             "dcc_destination",
             accepted(serde_json::json!({ "root": "archive" })),
@@ -1647,12 +1673,15 @@ async fn an_accept_that_still_needs_input_creates_no_task_until_it_is_answered()
 
 #[tokio::test]
 async fn a_task_client_that_cannot_answer_gets_the_roots_error_and_no_task() {
-    let (_server, _scratch, router, agent_id, dcc_session_id) = offered(CallerPolicy::Local).await;
+    let fixture = offered(CallerPolicy::Local).await;
     let (status, refused) = send(
-        &router,
+        &fixture.router,
         Envelope::tool_call(
             "irc.dcc.accept",
-            serde_json::json!({ "agent_id": agent_id, "dcc_session_id": dcc_session_id }),
+            serde_json::json!({
+                "agent_id": fixture.agent_id,
+                "dcc_session_id": fixture.dcc_session_id,
+            }),
         )
         .with_meta(Some(tasks_meta())),
     )
@@ -1671,6 +1700,454 @@ async fn a_task_client_that_cannot_answer_gets_the_roots_error_and_no_task() {
     assert_eq!(
         structured["default_destination_path"], "report.txt",
         "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_destination_choice_refuses_the_acceptance_and_leaves_the_offer_pending() {
+    // The expiry branch is otherwise only reachable by waiting out two minutes,
+    // so the state is minted already lapsed and driven through the real tool.
+    let fixture = offered(CallerPolicy::Local).await;
+    let arguments = serde_json::json!({
+        "agent_id": fixture.agent_id,
+        "dcc_session_id": fixture.dcc_session_id,
+    });
+    let input: crate::mcp::tools::DccAcceptInput =
+        serde_json::from_value(arguments.clone()).expect("the arguments the tool will see");
+    let offer = fixture
+        .gateway
+        .dcc_session(
+            &crate::agent::AgentId::from_str(&fixture.agent_id).expect("agent handle"),
+            &crate::dcc::session::DccSessionId::from_str(&fixture.dcc_session_id)
+                .expect("session handle"),
+        )
+        .await
+        .expect("the waiting offer");
+    let expired = fixture
+        .gateway
+        .request_states()
+        .seal_with_ttl(
+            &crate::mcp::authorization::OwnerId::local(),
+            &crate::mcp::mrtr::OriginatingOperation::for_tool("irc.dcc.accept", &input.salient()),
+            &crate::mcp::dcc_accept::PendingAccept::for_offer(
+                &offer,
+                vec!["inbox".into(), "archive".into()],
+            ),
+            Duration::from_millis(1),
+        )
+        .expect("seal a lapsed destination choice");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let (status, refused) = send(
+        &fixture.router,
+        Envelope::tool_call("irc.dcc.accept", arguments)
+            .with_meta(Some(elicitation_meta()))
+            .answering(
+                "dcc_destination",
+                accepted(serde_json::json!({ "root": "archive" })),
+                &expired,
+            ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{refused}");
+    let structured = refusal(&refused);
+    let message = structured["message"].as_str().expect("a message");
+    assert!(
+        message.contains("expired") && message.contains("start the operation again"),
+        "a caller whose window lapsed can recover by starting over, and has to be told so: \
+         {message}"
+    );
+
+    // Nothing was consumed: the offer is still there to accept.
+    let (_, listed) = send(
+        &fixture.router,
+        Envelope::tool_call(
+            "irc.dcc.list",
+            serde_json::json!({ "agent_id": fixture.agent_id }),
+        ),
+    )
+    .await;
+    let sessions = listed["result"]["structuredContent"]["result"]["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a session listing: {listed}"));
+    let offer = sessions
+        .iter()
+        .find(|session| session["id"] == fixture.dcc_session_id.as_str())
+        .unwrap_or_else(|| panic!("the offer survives every refusal: {listed}"));
+    assert_eq!(offer["state"], "offered", "{listed}");
+}
+
+#[tokio::test]
+async fn an_expired_confirmation_refuses_the_kick_and_leaves_the_channel_alone() {
+    let fixture = guarded().await;
+    let mut lines = fixture.server.client_lines.subscribe();
+    let arguments = serde_json::json!({
+        "agent_id": fixture.agent_id,
+        "channel": "#agents",
+        "nickname": "Prometheus",
+        "reason": "repeated flooding",
+        "timeout_ms": 2_000,
+    });
+    let input: crate::mcp::tools::KickInput =
+        serde_json::from_value(arguments.clone()).expect("the arguments the tool will see");
+    let expired = fixture
+        .gateway
+        .request_states()
+        .seal_with_ttl(
+            &crate::mcp::authorization::OwnerId::local(),
+            &crate::mcp::mrtr::OriginatingOperation::for_tool("irc.kick", &input.salient()),
+            &crate::mcp::confirm_action::PendingConfirmation::for_action(input.action()),
+            Duration::from_millis(1),
+        )
+        .expect("seal a lapsed confirmation");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let (status, refused) = send(
+        &fixture.router,
+        Envelope::tool_call("irc.kick", arguments)
+            .with_meta(Some(elicitation_meta()))
+            .answering(
+                "destructive_confirmation",
+                accepted(serde_json::json!({ "confirm": true })),
+                &expired,
+            ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{refused}");
+    let structured = refusal(&refused);
+    assert_eq!(structured["kind"], "confirmation_required", "{refused}");
+    let message = structured["message"].as_str().expect("a message");
+    assert!(
+        message.contains("expired") && message.contains("start the operation again"),
+        "{message}"
+    );
+    assert!(
+        !wrote(&mut lines, "KICK"),
+        "an approval nobody can still redeem is not an approval"
+    );
+}
+
+#[tokio::test]
+async fn one_confirmation_authorizes_exactly_one_kick() {
+    // The state is an HMAC over the caller, the arguments and a deadline, so
+    // without a record of what has been spent the identical call replays for
+    // two minutes — one person's decision authorizing an unbounded number of
+    // irreversible mutations.
+    let fixture = guarded().await;
+    let mut lines = fixture.server.client_lines.subscribe();
+    let kick = || {
+        Envelope::tool_call(
+            "irc.kick",
+            serde_json::json!({
+                "agent_id": fixture.agent_id,
+                "channel": "#agents",
+                "nickname": "Prometheus",
+                "timeout_ms": 2_000,
+            }),
+        )
+        .with_meta(Some(elicitation_meta()))
+    };
+
+    let (_, asked) = send(&fixture.router, kick()).await;
+    let (_, state) = question(&asked, "destructive_confirmation");
+    let confirmed = || {
+        kick().answering(
+            "destructive_confirmation",
+            accepted(serde_json::json!({ "confirm": true })),
+            &state,
+        )
+    };
+
+    let (_, applied) = send(&fixture.router, confirmed()).await;
+    assert_eq!(applied["result"]["isError"], false, "{applied}");
+    assert!(wrote(&mut lines, "KICK"), "a confirmed kick is a kick");
+
+    // The identical call, with the identical state and the identical answer.
+    let (status, replayed) = send(&fixture.router, confirmed()).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{replayed}");
+    let structured = refusal(&replayed);
+    assert_eq!(structured["kind"], "confirmation_required", "{replayed}");
+    let message = structured["message"].as_str().expect("a message");
+    assert!(
+        message.contains("already used") && message.contains("confirm again"),
+        "the refusal has to name the recovery: {message}"
+    );
+    assert!(
+        !wrote(&mut lines, "KICK"),
+        "one approval must not remove somebody twice"
+    );
+}
+
+#[tokio::test]
+async fn a_nickname_retry_that_can_no_longer_be_asked_is_refused_rather_than_asked_again() {
+    // Capabilities are per request in this revision, so a retry is free to
+    // declare none. Sending it another form would be a protocol violation
+    // rather than a degraded experience.
+    let (_server, router) = contested(CallerPolicy::Local, None).await;
+    let (_, asked) = send(&router, asking_connect()).await;
+    let (_, state) = question(&asked, "connect_nickname");
+
+    let (status, refused) = send(
+        &router,
+        Envelope::tool_call(
+            "irc.connect",
+            serde_json::json!({ "nickname": "Athena", "nick_conflict_policy": "elicit" }),
+        )
+        .echoing(&state),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{refused}");
+    let structured = refusal(&refused);
+    assert_eq!(structured["kind"], "validation_error", "{refused}");
+    assert!(
+        structured["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("suffix") && message.contains("fail")),
+        "the retry gets the same answer a first call without elicitation would: {refused}"
+    );
+}
+
+#[tokio::test]
+async fn a_channel_key_retry_that_can_no_longer_be_asked_is_refused_rather_than_asked_again() {
+    let fixture = ConnectedFixture::start(CallerPolicy::Local, None, TASK_TTL).await;
+    let join = |meta: Option<serde_json::Value>| {
+        let envelope = Envelope::tool_call(
+            "irc.join",
+            serde_json::json!({
+                "agent_id": fixture.agent_id,
+                "channel": KEYED_CHANNEL,
+                "timeout_ms": 2_000,
+            }),
+        );
+        match meta {
+            Some(meta) => envelope.with_meta(Some(meta)),
+            None => envelope,
+        }
+    };
+
+    let (_, asked) = send(&fixture.router, join(Some(elicitation_meta()))).await;
+    let (_, state) = question(&asked, "channel_key");
+
+    let (status, refused) = send(&fixture.router, join(None).echoing(&state)).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{refused}");
+    let structured = refusal(&refused);
+    assert_eq!(structured["kind"], "validation_error", "{refused}");
+    assert!(
+        structured["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("key") && message.contains("not joined")),
+        "the refusal names the one thing that still works: {refused}"
+    );
+}
+
+#[tokio::test]
+async fn a_confirmation_retry_that_can_no_longer_be_asked_is_refused_rather_than_asked_again() {
+    let fixture = guarded().await;
+    let mut lines = fixture.server.client_lines.subscribe();
+    let kick = |meta: Option<serde_json::Value>| {
+        let envelope = Envelope::tool_call(
+            "irc.kick",
+            serde_json::json!({
+                "agent_id": fixture.agent_id,
+                "channel": "#agents",
+                "nickname": "Prometheus",
+                "timeout_ms": 2_000,
+            }),
+        );
+        match meta {
+            Some(meta) => envelope.with_meta(Some(meta)),
+            None => envelope,
+        }
+    };
+
+    let (_, asked) = send(&fixture.router, kick(Some(elicitation_meta()))).await;
+    let (_, state) = question(&asked, "destructive_confirmation");
+
+    let (status, refused) = send(&fixture.router, kick(None).echoing(&state)).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{refused}");
+    let structured = refusal(&refused);
+    assert_eq!(structured["kind"], "confirmation_required", "{refused}");
+    assert!(
+        structured["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("nothing was applied")),
+        "{refused}"
+    );
+    assert!(
+        !wrote(&mut lines, "KICK"),
+        "an unanswered gate applies nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_followed_transfer_whose_agent_disconnects_completes_carrying_the_error() {
+    // The tasks extension reserves `failed` for faults in the protocol exchange
+    // itself. An agent that went away mid-transfer is an outcome of the work, so
+    // the task completes and the tool result says what happened — otherwise a
+    // client reading `failed` cannot tell a lost transfer from a broken server.
+    let fixture = ConnectedFixture::start(CallerPolicy::Local, None, TASK_TTL).await;
+    let (_, created) = send(
+        &fixture.router,
+        fixture.transfer().with_meta(Some(tasks_meta())),
+    )
+    .await;
+    let task_id = created["result"]["taskId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a created task: {created}"))
+        .to_owned();
+
+    // Wait until the task is following the session rather than still starting
+    // it, so the disconnect interrupts the follow loop it is about.
+    loop {
+        let (_, polled) = send(&fixture.router, task_request("tasks/get", &task_id)).await;
+        if polled["result"]["statusMessage"] != TASK_INITIAL_STATUS {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (_, disconnected) = send(
+        &fixture.router,
+        Envelope::tool_call(
+            "irc.disconnect",
+            serde_json::json!({ "agent_id": fixture.agent_id }),
+        ),
+    )
+    .await;
+    assert_eq!(disconnected["result"]["isError"], false, "{disconnected}");
+
+    let settled = loop {
+        let (_, polled) = send(&fixture.router, task_request("tasks/get", &task_id)).await;
+        if polled["result"]["status"] != "working" {
+            break polled;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        settled["result"]["status"], "completed",
+        "a tool-level outcome settles the task completed, never failed: {settled}"
+    );
+    assert!(
+        settled["result"]["error"].is_null(),
+        "a completed task carries a result, not a JSON-RPC error: {settled}"
+    );
+    let result = &settled["result"]["result"];
+    assert_eq!(result["isError"], true, "{settled}");
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["ok"], false, "{settled}");
+    assert_eq!(structured["error"]["kind"], "not_found", "{settled}");
+    assert!(
+        structured["error"]["session"]["id"].is_string(),
+        "the last snapshot the follower held is the only remaining evidence of the transfer: \
+         {settled}"
+    );
+}
+
+#[tokio::test]
+async fn a_history_read_reports_its_stages_to_a_caller_that_supplied_a_progress_token() {
+    let fixture = ConnectedFixture::start(CallerPolicy::Local, None, TASK_TTL).await;
+    let mut meta = client_meta(serde_json::json!({}));
+    meta["progressToken"] = serde_json::json!("history-1");
+    let (status, messages) = send_stream(&fixture.router, history(&fixture, Some(meta))).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    let mut reported = Vec::new();
+    for message in &messages {
+        if message["method"] != "notifications/progress" {
+            continue;
+        }
+        assert_eq!(message["params"]["progressToken"], "history-1", "{message}");
+        assert_eq!(
+            message["params"]["total"],
+            f64::from(HISTORY_PROGRESS_TOTAL),
+            "the declared total is the one the notifications carry: {message}"
+        );
+        reported.push(message["params"]["progress"].as_f64().expect("a step"));
+    }
+    assert!(
+        reported.windows(2).all(|pair| pair[0] < pair[1]),
+        "progress for one token must strictly increase: {reported:?}"
+    );
+    assert_eq!(
+        reported.last().copied(),
+        Some(f64::from(HISTORY_PROGRESS_TOTAL)),
+        "every phase reports, so the last step is the total: {reported:?}"
+    );
+
+    let last = messages.last().expect("a reply");
+    assert!(
+        last["result"].is_object(),
+        "progress stops at the result, which is last on the stream: {last}"
+    );
+}
+
+#[tokio::test]
+async fn a_history_read_without_a_progress_token_narrates_nothing() {
+    let fixture = ConnectedFixture::start(CallerPolicy::Local, None, TASK_TTL).await;
+    let (_, messages) = send_stream(&fixture.router, history(&fixture, None)).await;
+    assert!(
+        messages
+            .iter()
+            .all(|message| message["method"] != "notifications/progress"),
+        "{messages:?}"
+    );
+}
+
+/// One `irc.history` call, with or without the `_meta` a caller shapes it with.
+fn history(fixture: &ConnectedFixture, meta: Option<serde_json::Value>) -> Envelope {
+    let envelope = Envelope::tool_call(
+        "irc.history",
+        serde_json::json!({
+            "agent_id": fixture.agent_id,
+            "target": "#agents",
+            "selector": { "kind": "latest" },
+            "timeout_ms": 2_000,
+        }),
+    );
+    match meta {
+        Some(meta) => envelope.with_meta(Some(meta)),
+        None => envelope,
+    }
+}
+
+#[tokio::test]
+async fn server_discover_reports_this_servers_capabilities_and_the_revision_it_serves() {
+    // Discovery is a request like any other here: there is no handshake to
+    // carry it, so a client that cannot ask this cannot learn what the server
+    // does at all.
+    let (status, body) = send(
+        &router(CallerPolicy::Local),
+        Envelope::new("server/discover"),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert!(body["error"].is_null(), "{body}");
+    let result = &body["result"];
+    assert_eq!(
+        result["supportedVersions"],
+        serde_json::json!([VERSION]),
+        "this server serves exactly one revision, and says so: {body}"
+    );
+    for capability in ["tools", "resources", "prompts", "completions"] {
+        assert!(
+            result["capabilities"][capability].is_object(),
+            "{capability} is missing from discovery: {body}"
+        );
+    }
+    assert!(
+        result["capabilities"]["extensions"][rmcp::model::TASKS_EXTENSION_ID].is_object(),
+        "a client learns here that this server directs work into tasks: {body}"
+    );
+    assert!(
+        result["instructions"]
+            .as_str()
+            .is_some_and(|text| text.contains("irc.connect")),
+        "the onboarding instructions travel with discovery: {body}"
+    );
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        env!("CARGO_PKG_NAME"),
+        "{body}"
     );
 }
 

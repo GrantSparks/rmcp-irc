@@ -130,10 +130,10 @@ const DCC_ACCEPT_TOOL: &str = "irc.dcc.accept";
 
 /// Status message a task-augmented DCC call starts with, before its session
 /// exists to describe.
-const TASK_INITIAL_STATUS: &str = "Negotiating the direct connection.";
+pub(crate) const TASK_INITIAL_STATUS: &str = "Negotiating the direct connection.";
 
 /// The steps `irc.history` reports, for the `total` its progress carries.
-const HISTORY_PROGRESS_TOTAL: u32 = 3;
+pub(crate) const HISTORY_PROGRESS_TOTAL: u32 = 3;
 
 /// MCP request handler backed by a shared gateway.
 #[derive(Clone)]
@@ -408,6 +408,7 @@ impl IrcMcpService {
         let chosen = match request_state.as_deref() {
             Some(sealed) => match self.open_nickname_choice(
                 &owner,
+                &profile,
                 &operation,
                 sealed,
                 responses.as_ref(),
@@ -424,13 +425,7 @@ impl IrcMcpService {
         // would register a different identity than the caller asked for. Said
         // before connecting, because there is nothing to undo yet.
         if chosen.is_none() && asks && !profile.supports_form_elicitation() {
-            return Ok(refusal(
-                ErrorKind::Validation.as_str(),
-                "nick_conflict_policy \"elicit\" needs a request that declares form elicitation; \
-                 use \"suffix\" or \"fail\", or declare the elicitation capability",
-                false,
-            )
-            .into());
+            return Ok(elicit_needs_a_way_to_ask().into());
         }
 
         let request = connect_request(&input, chosen);
@@ -784,6 +779,7 @@ impl IrcMcpService {
             Some(sealed) => {
                 match self.open_channel_key(
                     &owner,
+                    &profile,
                     &operation,
                     sealed,
                     responses.as_ref(),
@@ -892,27 +888,7 @@ impl IrcMcpService {
     )]
     async fn irc_send(&self, Parameters(input): Parameters<SendInput>) -> CallToolResult {
         match self.send_message(input).await {
-            Ok(output) => {
-                // One logical message can become several lines, and the first
-                // one the server did not take is the exchange worth reporting:
-                // the rest either preceded it or never had a chance.
-                let failed = output
-                    .results
-                    .iter()
-                    .find(|result| {
-                        result.outcome != CommandOutcome::Completed
-                            && result.outcome != CommandOutcome::SentUnconfirmed
-                    })
-                    .map(|result| CommandFailure {
-                        outcome: result.outcome,
-                        result: result.clone(),
-                    });
-                let summary = send_result_summary(
-                    output.line_count,
-                    failed.as_ref().map(|failure| failure.outcome),
-                );
-                command_tool_result(summary, &output, failed)
-            }
+            Ok(output) => send_tool_result(output),
             Err(error) => tool_error(error),
         }
     }
@@ -3173,9 +3149,15 @@ impl IrcMcpService {
     /// name that is not a nickname all produce an ordinary tool result with
     /// `isError`, because the model that issued the call is the one that has to
     /// react.
+    ///
+    /// `profile` is the *retry's* own declaration, which is why it is threaded
+    /// in rather than remembered: capabilities are per request in this
+    /// revision, so a second round may arrive from a client that no longer
+    /// declares elicitation, and asking it anyway would be a protocol violation.
     fn open_nickname_choice(
         &self,
         owner: &OwnerId,
+        profile: &RequestProfile,
         operation: &OriginatingOperation,
         sealed: &str,
         responses: Option<&rmcp::model::InputResponses>,
@@ -3196,6 +3178,9 @@ impl IrcMcpService {
             // A round that answered nothing is asked again rather than refused,
             // which is what the specification requires of a partial response.
             connect_nickname::Answer::Missing => {
+                if !profile.supports_form_elicitation() {
+                    return Ok(Resolution::Settled(elicit_needs_a_way_to_ask()));
+                }
                 Resolution::NeedsInput(self.ask_for_a_nickname(owner, operation, &pending, input)?)
             }
             connect_nickname::Answer::Declined => Resolution::Settled(declined(format!(
@@ -3248,9 +3233,14 @@ impl IrcMcpService {
     ///
     /// Refusals are in band and leave the channel unjoined, which is exactly
     /// what a join that was never re-issued means.
+    ///
+    /// `profile` is the *retry's* own declaration: capabilities are per request,
+    /// so a round that dropped the elicitation capability must be answered
+    /// rather than asked again.
     fn open_channel_key(
         &self,
         owner: &OwnerId,
+        profile: &RequestProfile,
         operation: &OriginatingOperation,
         sealed: &str,
         responses: Option<&rmcp::model::InputResponses>,
@@ -3279,6 +3269,9 @@ impl IrcMcpService {
             // A round that answered nothing is asked again rather than refused,
             // which is what the specification requires of a partial response.
             join_key::Answer::Missing => {
+                if !profile.supports_form_elicitation() {
+                    return Ok(Resolution::Settled(key_needs_a_way_to_ask(&channel)));
+                }
                 Resolution::NeedsInput(self.ask_for_a_key(owner, operation, &channel, None)?)
             }
             join_key::Answer::Declined => Resolution::Settled(declined(format!(
@@ -3345,15 +3338,7 @@ impl IrcMcpService {
         }
         let Some(sealed) = request_state else {
             if !profile.supports_form_elicitation() {
-                return Ok(Resolution::Settled(refusal(
-                    CONFIRMATION_REQUIRED,
-                    format!(
-                        "this gateway requires a confirmed decision before it will {action}, and \
-                         this request declared no form elicitation to ask through; nothing was \
-                         applied"
-                    ),
-                    false,
-                )));
+                return Ok(Resolution::Settled(confirmation_needs_a_way_to_ask(action)));
             }
             return Ok(Resolution::NeedsInput(
                 self.ask_for_confirmation(owner, operation, action)?,
@@ -3378,11 +3363,32 @@ impl IrcMcpService {
             )));
         }
         Ok(match confirm_action::read_answer(responses)? {
-            confirm_action::Answer::Confirmed => Resolution::Ready(()),
+            // Spent here, at the last moment before the caller applies it. The
+            // sealed state stays redeemable for its whole time-to-live, so
+            // without this one person's "yes" would authorize the same
+            // irreversible mutation over and over — which is precisely the
+            // authority this setting exists to withhold.
+            confirm_action::Answer::Confirmed => {
+                if self.gateway.redeemed_confirmations().redeem(sealed) {
+                    Resolution::Ready(())
+                } else {
+                    Resolution::Settled(refusal(
+                        CONFIRMATION_REQUIRED,
+                        format!(
+                            "this confirmation was already used; confirm again to {action}. \
+                             Nothing was applied."
+                        ),
+                        true,
+                    ))
+                }
+            }
             confirm_action::Answer::Refused => Resolution::Settled(declined(format!(
                 "The request to {action} was not confirmed; nothing was applied."
             ))),
             confirm_action::Answer::Missing => {
+                if !profile.supports_form_elicitation() {
+                    return Ok(Resolution::Settled(confirmation_needs_a_way_to_ask(action)));
+                }
                 Resolution::NeedsInput(self.ask_for_confirmation(owner, operation, action)?)
             }
         })
@@ -3541,15 +3547,20 @@ impl IrcMcpService {
             // here means the answer stopped being valid in between — a request
             // state that expired between the two resolutions is the only way —
             // and by now the handle is in the client's hands with its stream
-            // closed, so there is nowhere left to ask. Failing deterministically
-            // with the reason is the honest answer; the recovery is to call the
-            // tool again and answer the question it returns.
+            // closed, so there is nowhere left to ask.
+            //
+            // The task therefore *completes* carrying an in-band refusal rather
+            // than failing: `failed` belongs to faults in the protocol exchange
+            // itself, and this is a tool that declined to run — a result the
+            // model reads and acts on. The recovery is to call the tool again
+            // and answer the question it returns.
             CallToolResponse::InputRequired(_) => {
-                return Err(TaskExit::Error(McpError::invalid_request(
+                return Ok(refusal(
+                    ErrorKind::Validation.as_str(),
                     "this operation needs its input resolved before it can run as a task: answer \
                      the input request the tool returns, then call it again",
-                    None,
-                )));
+                    true,
+                ));
             }
             // Only this wrapper creates tasks, so a tool cannot have made one,
             // and the enum is `non_exhaustive`: a future response kind this
@@ -3579,6 +3590,7 @@ impl IrcMcpService {
         // gateway whatever this task does — so the honest terminal result is
         // the session as it stands plus where to keep watching it.
         let deadline = tokio::time::Instant::now() + self.gateway.tasks().follow_window();
+        let mut last_seen: Option<DccSession> = None;
         loop {
             if task.is_cancel_requested() {
                 // Best effort: the peer may already have finished, in which
@@ -3586,11 +3598,24 @@ impl IrcMcpService {
                 let _ = self.gateway.dcc_cancel(&agent_id, session_id.clone()).await;
                 return Err(TaskExit::Cancelled);
             }
-            let session = self
-                .gateway
-                .dcc_session(&agent_id, &session_id)
-                .await
-                .map_err(|error| TaskExit::Error(gateway_read_error(error)))?;
+            let session = match self.gateway.dcc_session(&agent_id, &session_id).await {
+                Ok(session) => session,
+                // The agent went away while this task was following its
+                // transfer — disconnected, or its actor stopped — so there is
+                // nothing left to follow and no session resource left to read
+                // either. That is an outcome of the work rather than a fault in
+                // the protocol exchange, so the task completes carrying the
+                // refusal, and the last snapshot this loop held travels with it
+                // as the only remaining evidence of how far the transfer got.
+                Err(error) => {
+                    let failure = ToolFailure::from_error(&error);
+                    return Ok(failure_result(match last_seen {
+                        Some(last) => failure.with_session(last),
+                        None => failure,
+                    }));
+                }
+            };
+            last_seen = Some(session.clone());
             let expired = tokio::time::Instant::now() >= deadline;
             if session.state.is_terminal() || expired {
                 let link = describe_resource(
@@ -3606,9 +3631,13 @@ impl IrcMcpService {
                 } else {
                     terminal_session_summary(&session)
                 };
+                // Wrapped exactly as the non-task path wraps it: a task's
+                // terminal payload is a complete tool result, so it has to
+                // satisfy the same declared `outputSchema` — which nests the
+                // session under `session`, not at the top of `result`.
                 let mut result = tool_success_with_content(
                     summary,
-                    &session,
+                    &DccSessionOutput { session },
                     vec![ContentBlock::ResourceLink(link)],
                 );
                 self.hint_at_activity(Some(&agent_id), &mut result).await;
@@ -3726,6 +3755,55 @@ fn refusal(kind: &str, message: impl Into<String>, retriable: bool) -> CallToolR
 /// calling again and answering is the recovery.
 fn declined(message: impl Into<String>) -> CallToolResult {
     refusal("declined", message, true)
+}
+
+/// Refuse an `elicit` nickname policy on a request that cannot be asked.
+///
+/// One function for the first round and every later one, because they are the
+/// same situation: capabilities are declared per request, so a retry that
+/// dropped the elicitation capability has to reach the answer a first call
+/// without it would have reached, rather than being sent a question it cannot
+/// answer.
+fn elicit_needs_a_way_to_ask() -> CallToolResult {
+    refusal(
+        ErrorKind::Validation.as_str(),
+        "nick_conflict_policy \"elicit\" needs a request that declares form elicitation; use \
+         \"suffix\" or \"fail\", or declare the elicitation capability",
+        false,
+    )
+}
+
+/// Refuse an unanswered key question on a request that cannot be asked.
+///
+/// Reached only by a retry that carries the exchange's state, declares no form
+/// elicitation, and answers nothing. Re-issuing the keyless JOIN would only
+/// collect the same rejection again, so this names the one thing that does
+/// work instead: supplying the key on the call.
+fn key_needs_a_way_to_ask(channel: &str) -> CallToolResult {
+    refusal(
+        ErrorKind::Validation.as_str(),
+        format!(
+            "the key for {channel} is still unanswered and this request declared no form \
+             elicitation to ask through; supply it as `key`. The channel was not joined."
+        ),
+        false,
+    )
+}
+
+/// Refuse a gated mutation on a request that cannot be asked.
+///
+/// The setting exists because somebody decided a model may not do this alone,
+/// and every round is judged on its own declarations: a retry that dropped the
+/// elicitation capability is a request with nobody to ask, first round or not.
+fn confirmation_needs_a_way_to_ask(action: &str) -> CallToolResult {
+    refusal(
+        CONFIRMATION_REQUIRED,
+        format!(
+            "this gateway requires a confirmed decision before it will {action}, and this request \
+             declared no form elicitation to ask through; nothing was applied"
+        ),
+        false,
+    )
 }
 
 /// Refuse an acceptance whose destination cannot be settled.
@@ -3981,6 +4059,59 @@ fn query_message(query: Query) -> Result<OutboundMessage, GatewayError> {
         .encode(crate::irc::wire::LineBudget::with_body(usize::MAX))
         .map_err(|error| GatewayError::InvalidMessage(error.to_string()))?;
     Ok(message)
+}
+
+/// Report one logical send, keeping whatever it delivered before it failed.
+///
+/// One logical message can become several physical lines, and the first one the
+/// server did not take is the exchange worth reporting: the rest either preceded
+/// it or never had a chance. But the lines that *did* land are public and
+/// correlated whether or not a later one failed, so they travel with the
+/// failure. Their `msgid`s are what the caller now owns — to quote, to redact,
+/// or to answer for — and this result is the only place it can learn them.
+fn send_tool_result(output: SendOutput) -> CallToolResult {
+    let failed = output
+        .results
+        .iter()
+        .find(|result| !is_delivered(result))
+        .map(|result| CommandFailure {
+            outcome: result.outcome,
+            result: result.clone(),
+        });
+    let summary = send_result_summary(
+        output.line_count,
+        failed.as_ref().map(|failure| failure.outcome),
+    );
+    match failed {
+        Some(failure) => failure_result(
+            ToolFailure::from_command(failure.outcome, summary, failure.result)
+                .with_delivered_lines(delivered_lines(&output)),
+        ),
+        None => tool_success(summary, &output),
+    }
+}
+
+/// Whether one written line reached the server, as far as correlation can tell.
+///
+/// Exactly the complement of [`is_failure_outcome`], said once so the two can
+/// never disagree about `sent_unconfirmed`: that line went out and the server
+/// simply does not echo it, so the caller owns it as much as an acknowledged
+/// one.
+fn is_delivered(result: &CommandResult) -> bool {
+    !is_failure_outcome(result.outcome)
+}
+
+/// The lines of one logical message that did reach the server.
+///
+/// Not merely the ones before the failure: a later line can be written after an
+/// earlier one is refused, and it is just as public.
+fn delivered_lines(output: &SendOutput) -> Vec<CommandResult> {
+    output
+        .results
+        .iter()
+        .filter(|result| is_delivered(result))
+        .cloned()
+        .collect()
 }
 
 /// Classify one correlated exchange, keeping it whole only when it failed.
@@ -5508,6 +5639,51 @@ mod tests {
             history_result.content[0].as_text().expect("text").text,
             history
         );
+    }
+
+    /// A message that became several lines can fail after some of them were
+    /// already relayed. Those lines are public, and their ids are the only
+    /// handle the caller has on what it has now said — so reporting the
+    /// rejection alone would leave it unable to quote, redact, or answer for
+    /// its own traffic.
+    #[test]
+    fn a_partial_send_keeps_the_lines_it_delivered() {
+        let mut delivered =
+            command_result_with(&[b"@msgid=line-1 :Me!u@h PRIVMSG #agents :the first half"]);
+        delivered.command = "PRIVMSG".into();
+        let mut refused =
+            command_result_with(&[b":irc.example 404 Me #agents :Cannot send to channel"]);
+        refused.command = "PRIVMSG".into();
+        refused.outcome = CommandOutcome::Rejected;
+
+        let result = send_tool_result(SendOutput {
+            line_count: 2,
+            results: vec![delivered, refused],
+        });
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("an enveloped failure");
+        assert_eq!(structured["ok"], serde_json::json!(false));
+        assert_eq!(structured["error"]["kind"], "rejected");
+        let kept = structured["error"]["delivered_lines"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the lines that did land: {structured}"));
+        assert_eq!(kept.len(), 1, "{structured}");
+        assert_eq!(kept[0]["outcome"], "completed", "{structured}");
+        assert_eq!(
+            kept[0]["replies"][0]["tags"][0]["value"], "line-1",
+            "the id the caller now owns has to survive the failure: {structured}"
+        );
+
+        // A send that lost nothing carries nothing: the field is for the one
+        // situation that needs it.
+        let clean = send_tool_result(SendOutput {
+            line_count: 1,
+            results: vec![command_result_with(&[])],
+        });
+        assert_ne!(clean.is_error, Some(true));
+        let structured = clean.structured_content.expect("an enveloped success");
+        assert_eq!(structured["ok"], serde_json::json!(true));
+        assert_eq!(structured["result"]["line_count"], 1, "{structured}");
     }
 
     /// A command the server refused takes the failure branch, and takes its
