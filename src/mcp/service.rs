@@ -1157,6 +1157,159 @@ mod tests {
         let _ = CallToolRequestParams::new("irc.status");
     }
 
+    /// Description of one top-level property of a tool's input schema.
+    fn property_description(
+        schema: &serde_json::Map<String, serde_json::Value>,
+        name: &str,
+    ) -> Option<String> {
+        schema
+            .get("properties")?
+            .get(name)?
+            .get("description")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn every_handle_property_tells_the_caller_where_the_handle_comes_from() {
+        let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
+        let mut checked = 0_usize;
+        for tool in service.tool_router.list_all() {
+            let Some(description) = property_description(&tool.input_schema, "agent_id") else {
+                continue;
+            };
+            assert!(
+                description.contains("irc.connect"),
+                "{}: agent_id description does not name its source: {description:?}",
+                tool.name
+            );
+            checked += 1;
+        }
+        // Every tool except irc.connect itself takes a handle.
+        assert_eq!(checked, TOOL_NAMES.len() - 1);
+    }
+
+    #[test]
+    fn caller_supplied_deadlines_publish_the_bound_they_are_rejected_against() {
+        let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
+        let limit = crate::config::GatewayLimits::default();
+        assert_eq!(limit.max_command_timeout_ms, 30_000);
+        assert_eq!(limit.max_event_wait_ms, 30_000);
+        let mut checked = 0_usize;
+        for tool in service.tool_router.list_all() {
+            for field in ["timeout_ms", "wait_ms"] {
+                let Some(property) = tool
+                    .input_schema
+                    .get("properties")
+                    .and_then(|properties| properties.get(field))
+                else {
+                    continue;
+                };
+                let description = property
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("{}: {field} has no description", tool.name));
+                assert!(
+                    description.contains("30000"),
+                    "{}: {field} does not publish its bound: {description:?}",
+                    tool.name
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 7,
+            "expected every bounded deadline, saw {checked}"
+        );
+    }
+
+    #[test]
+    fn send_text_schema_states_which_kinds_require_it() {
+        let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
+        let send = service
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "irc.send")
+            .expect("irc.send");
+        let description = property_description(&send.input_schema, "text").expect("text");
+        assert!(description.contains("tagmsg"), "{description:?}");
+        // The prose must match what build_send_messages actually enforces.
+        let tagmsg = SendInput {
+            agent_id: crate::agent::AgentId::new(),
+            target: "Athena".parse().expect("target"),
+            kind: SendKind::Tagmsg,
+            text: Some("body".into()),
+            tags: Vec::new(),
+            reply_to: None,
+            multiline: MultilinePolicy::Prefer,
+            timeout_ms: 1_000,
+        };
+        assert!(matches!(
+            build_send_messages(&tagmsg, 512, 0, 512, 1),
+            Err(GatewayError::InvalidMessage(_))
+        ));
+        let empty = SendInput {
+            text: None,
+            ..tagmsg
+        };
+        assert!(build_send_messages(&empty, 512, 0, 512, 1).is_ok());
+    }
+
+    #[test]
+    fn enum_backed_inputs_publish_their_exact_json_tokens() {
+        let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
+        let tools = service.tool_router.list_all();
+        let description = |tool_name: &str, property: &str| {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == tool_name)
+                .unwrap_or_else(|| panic!("missing {tool_name}"));
+            property_description(&tool.input_schema, property)
+                .unwrap_or_else(|| panic!("missing {tool_name}.{property} description"))
+        };
+
+        for (tool, property, tokens) in [
+            (
+                "irc.connect",
+                "nick_conflict_policy",
+                &["suffix", "fail"][..],
+            ),
+            (
+                "irc.send",
+                "kind",
+                &["privmsg", "notice", "action", "tagmsg"][..],
+            ),
+            (
+                "irc.send",
+                "multiline",
+                &["require", "prefer", "split", "reject_if_too_long"][..],
+            ),
+            (
+                "irc.execute",
+                "response_mode",
+                &["auto", "collect", "fire_and_forget"][..],
+            ),
+        ] {
+            let description = description(tool, property);
+            for token in tokens {
+                assert!(
+                    description.contains(token),
+                    "{tool}.{property} does not publish {token:?}: {description:?}"
+                );
+            }
+        }
+
+        let history = description("irc.history", "selector");
+        for token in ["latest", "before", "anchor", "timestamp", "value"] {
+            assert!(history.contains(token), "irc.history.selector: {history:?}");
+        }
+        let query = description("irc.query", "query");
+        for token in ["names", "channels", "topic", "channel"] {
+            assert!(query.contains(token), "irc.query.query: {query:?}");
+        }
+    }
+
     #[test]
     fn utf8_splitting_is_lossless_and_bounded() {
         let chunks = split_utf8("Māui🙂Athena", 5).expect("split");

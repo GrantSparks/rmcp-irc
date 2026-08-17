@@ -9,6 +9,14 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Fixed
 
+- Explicit `irc.execute` collection now completes when a multi-message labeled
+  response batch closes instead of retaining all replies until the request
+  times out.
+- Typed ISON, USERHOST, VERSION, and TIME queries now use static single-reply
+  collectors, including on servers without `labeled-response` support.
+- MCP input schemas now identify where `agent_id` handles come from, publish
+  deadline bounds and exact enum tokens, explain event cursor reuse, and state
+  which message kinds require text.
 - `irc.send` now reserves the `:nick!user@host ` prefix the server prepends
   when it relays a message, so text that previously overran the 512-byte body
   budget is split instead of being silently truncated by the server. The self

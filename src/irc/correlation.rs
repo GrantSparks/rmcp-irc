@@ -317,6 +317,7 @@ pub(crate) struct MessageAttribution {
     label: Option<String>,
     batch_lineage: Vec<ActiveBatch>,
     closing_batch_kind: Option<String>,
+    closing_batch_is_root: bool,
 }
 
 impl MessageAttribution {
@@ -495,6 +496,9 @@ impl Correlator {
             .filter(|reference| reference.starts_with('-'))
             .and_then(|reference| reference.get(1..))
             .map(|id| self.batches.lineage(id));
+        let closing_batch_is_root = closing_batch
+            .as_ref()
+            .is_some_and(|lineage| lineage.len() == 1);
         let closing_batch_kind = self.track_batch(message);
         let command_id = self.route(message);
         let entry = command_id
@@ -509,6 +513,7 @@ impl Correlator {
             label,
             batch_lineage,
             closing_batch_kind,
+            closing_batch_is_root,
         }
     }
 
@@ -547,6 +552,7 @@ impl Correlator {
             strategy,
             &entry.command,
             attribution.closing_batch_kind.as_deref(),
+            attribution.closing_batch_is_root,
         );
         if let Some(warning) = standard_reply(message) {
             entry.warnings.push(warning);
@@ -709,6 +715,7 @@ fn classify(
     strategy: ResponseStrategy,
     command: &str,
     closing_batch_kind: Option<&str>,
+    closing_batch_is_root: bool,
 ) -> Option<CommandOutcome> {
     if message.command.eq_ignore_ascii_case("FAIL") {
         return Some(CommandOutcome::Rejected);
@@ -755,10 +762,24 @@ fn classify(
                     .is_some_and(|kind| FeatureId::of(kind) == FeatureId::of(expected_type)))
             .then_some(CommandOutcome::Completed)
         }
-        ResponseStrategy::Ack => message
-            .command
-            .eq_ignore_ascii_case("ACK")
-            .then_some(CommandOutcome::Completed),
+        ResponseStrategy::Ack => {
+            let batch_reference = message
+                .command
+                .eq_ignore_ascii_case("BATCH")
+                .then(|| message.params.first())
+                .flatten();
+            let opens_batch = batch_reference.is_some_and(|reference| reference.starts_with('+'));
+            let closes_logical_response_batch = batch_reference
+                .is_some_and(|reference| reference.starts_with('-'))
+                && closing_batch_kind.is_some()
+                && closing_batch_is_root;
+            let direct_labeled_response = message.tag_value("label").is_some() && !opens_batch;
+
+            (message.command.eq_ignore_ascii_case("ACK")
+                || direct_labeled_response
+                || closes_logical_response_batch)
+                .then_some(CommandOutcome::Completed)
+        }
         ResponseStrategy::Unconfirmed => {
             let _ = command;
             None
@@ -957,6 +978,67 @@ mod tests {
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].outcome, CommandOutcome::Completed);
         assert_eq!(completions[0].replies.len(), 3);
+    }
+
+    #[test]
+    fn an_ack_collector_completes_on_one_direct_labeled_response() {
+        let mut correlator = correlator();
+        let entry = pending("FUTURE", ResponseStrategy::Ack, Some("cmd_f"));
+        let command_id = entry.command_id.clone();
+        correlator.register(entry).expect("register");
+        correlator.record_write(&command_id, true);
+
+        let completions =
+            correlator.ingest(&parse("@label=cmd_f :server NOTE FUTURE OK :Accepted"));
+
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].outcome, CommandOutcome::Completed);
+        assert!(completions[0].acknowledged);
+        assert_eq!(completions[0].replies.len(), 1);
+    }
+
+    #[test]
+    fn an_ack_collector_waits_for_the_complete_labeled_response_batch() {
+        let mut correlator = correlator();
+        let entry = pending("FUTURE", ResponseStrategy::Ack, Some("cmd_f"));
+        let command_id = entry.command_id.clone();
+        correlator.register(entry).expect("register");
+        correlator.record_write(&command_id, true);
+
+        assert!(
+            correlator
+                .ingest(&parse("@label=cmd_f :server BATCH +response chathistory"))
+                .is_empty()
+        );
+        assert!(
+            correlator
+                .ingest(&parse(
+                    "@batch=response :server BATCH +inner draft/multiline"
+                ))
+                .is_empty()
+        );
+        assert!(
+            correlator
+                .ingest(&parse("@batch=inner :server 700 me :first"))
+                .is_empty()
+        );
+        assert!(
+            correlator
+                .ingest(&parse("@batch=response :server BATCH -inner"))
+                .is_empty()
+        );
+        assert!(
+            correlator
+                .ingest(&parse("@batch=response :server 701 me :second"))
+                .is_empty()
+        );
+
+        let completions = correlator.ingest(&parse(":server BATCH -response"));
+
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].outcome, CommandOutcome::Completed);
+        assert!(completions[0].acknowledged);
+        assert_eq!(completions[0].replies.len(), 6);
     }
 
     #[test]

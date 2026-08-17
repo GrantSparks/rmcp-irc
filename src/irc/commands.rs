@@ -84,7 +84,7 @@ impl StateEffects {
 /// Completion collector selected for an outbound command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResponseStrategy {
-    /// Labeled ACK is normally sufficient.
+    /// Collect one complete logical labeled response, including its batch.
     Ack,
     /// Exactly one semantic reply or error is expected.
     SingleReply,
@@ -116,7 +116,7 @@ pub enum ResponseStrategy {
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CollectorKind {
-    /// Labeled ACK is normally sufficient.
+    /// One complete logical labeled response, including its batch.
     Ack,
     /// Exactly one semantic reply or error is expected.
     SingleReply,
@@ -470,6 +470,46 @@ pub static COMMANDS: &[CommandSpec] = &[
         mapping: MappingGrade::Native,
     },
     CommandSpec {
+        name: "ISON",
+        phase: CommandPhase::Registered,
+        required_capabilities: &[],
+        response: ResponseStrategy::SingleReply,
+        degraded_response: ResponseStrategy::SingleReply,
+        state_effects: StateEffects::None,
+        privilege: PrivilegeClass::Normal,
+        mapping: MappingGrade::Native,
+    },
+    CommandSpec {
+        name: "USERHOST",
+        phase: CommandPhase::Registered,
+        required_capabilities: &[],
+        response: ResponseStrategy::SingleReply,
+        degraded_response: ResponseStrategy::SingleReply,
+        state_effects: StateEffects::None,
+        privilege: PrivilegeClass::Normal,
+        mapping: MappingGrade::Native,
+    },
+    CommandSpec {
+        name: "VERSION",
+        phase: CommandPhase::Registered,
+        required_capabilities: &[],
+        response: ResponseStrategy::SingleReply,
+        degraded_response: ResponseStrategy::SingleReply,
+        state_effects: StateEffects::None,
+        privilege: PrivilegeClass::Normal,
+        mapping: MappingGrade::Native,
+    },
+    CommandSpec {
+        name: "TIME",
+        phase: CommandPhase::Registered,
+        required_capabilities: &[],
+        response: ResponseStrategy::SingleReply,
+        degraded_response: ResponseStrategy::SingleReply,
+        state_effects: StateEffects::None,
+        privilege: PrivilegeClass::Normal,
+        mapping: MappingGrade::Native,
+    },
+    CommandSpec {
         name: "NAMES",
         phase: CommandPhase::Registered,
         required_capabilities: &[],
@@ -734,6 +774,17 @@ mod tests {
             assert!(spec_for(command).is_some(), "missing {command}");
         }
         assert_eq!(spec_for("PING").expect("PING").phase, CommandPhase::Any);
+    }
+
+    #[test]
+    fn single_reply_query_commands_have_static_collectors() {
+        for command in ["ISON", "USERHOST", "VERSION", "TIME"] {
+            assert_eq!(
+                spec_for(command).map(|spec| spec.response),
+                Some(ResponseStrategy::SingleReply),
+                "missing static collector for typed {command} query"
+            );
+        }
     }
 
     #[test]

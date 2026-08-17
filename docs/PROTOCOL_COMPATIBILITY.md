@@ -192,7 +192,7 @@ The required response strategies are:
 
 | Strategy | Completion rule |
 | --- | --- |
-| `ack` | Labeled ACK normally completes a silent command. |
+| `ack` | One complete logical labeled response: a direct reply/ACK or an outer batch. |
 | `single_reply` | One matching reply or error completes the command. |
 | `numeric_sequence` | Collect until a command-specific terminal numeric. |
 | `batch` | Collect a complete batch of the expected type, including nested batches. |
@@ -217,9 +217,10 @@ Initial numeric terminators are:
 | ban / exception / invite mode lists | 368, 349, or 347 as appropriate |
 | CHATHISTORY / event playback | complete advertised history batch |
 
-Registry entries also cover registration, JOIN/PART echoes, messages, QUIT,
-and server/operator commands needed for structured execution. Unknown commands
-remain valid `irc.execute` inputs when syntactically encodable.
+Registry entries also cover registration, single-reply ISON, USERHOST, VERSION,
+and TIME queries, JOIN/PART echoes, messages, QUIT, and server/operator commands
+needed for structured execution. Unknown commands remain valid `irc.execute`
+inputs when syntactically encodable.
 
 ## Correlation and collectors
 

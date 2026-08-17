@@ -58,14 +58,15 @@ pub struct ConnectInput {
     /// Ordered caller-supplied mythological fallbacks.
     #[serde(default)]
     pub nickname_fallbacks: Vec<Nickname>,
-    /// Suffix the requested name or fail after supplied candidates.
+    /// Nickname collision behavior: `suffix` (default) or `fail`.
     #[serde(default)]
     pub nick_conflict_policy: NickConflictPolicy,
     /// Optional IRC username override.
     pub username: Option<String>,
     /// Optional IRC real-name override.
     pub real_name: Option<String>,
-    /// Initial channels in addition to configured defaults.
+    /// Initial IRC channel names, such as `#control`, in addition to configured
+    /// defaults.
     #[serde(default)]
     pub channels: Vec<ChannelName>,
 }
@@ -137,13 +138,14 @@ pub struct StatusOutput {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JoinInput {
-    /// Owning guest identity.
+    /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// Case-preserved channel name.
     pub channel: ChannelName,
     /// Optional channel key.
     pub key: Option<String>,
-    /// Bounded completion deadline.
+    /// Milliseconds to wait for completion. Must be between 1 and the
+    /// configured maximum, 30000 by default; anything else is rejected.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -163,13 +165,14 @@ pub struct JoinOutput {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PartInput {
-    /// Owning guest identity.
+    /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// Case-preserved channel name.
     pub channel: ChannelName,
     /// Optional part reason.
     pub reason: Option<String>,
-    /// Bounded completion deadline.
+    /// Milliseconds to wait for completion. Must be between 1 and the
+    /// configured maximum, 30000 by default; anything else is rejected.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -184,7 +187,8 @@ pub enum SendKind {
     Notice,
     /// CTCP ACTION inside PRIVMSG.
     Action,
-    /// IRCv3 TAGMSG.
+    /// IRCv3 TAGMSG, carrying tags only. Requires the `message-tags`
+    /// capability.
     Tagmsg,
 }
 
@@ -207,23 +211,26 @@ pub enum MultilinePolicy {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SendInput {
-    /// Explicit guest identity.
+    /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// Nickname or channel.
     pub target: Target,
-    /// PRIVMSG, NOTICE, ACTION, or TAGMSG.
+    /// Message kind: `privmsg`, `notice`, `action`, or `tagmsg`.
     pub kind: SendKind,
-    /// Text when permitted by kind.
+    /// Message text. Required for `privmsg`, `notice`, and `action`; must be
+    /// absent or empty for `tagmsg`, which carries only tags.
     pub text: Option<String>,
     /// Caller-controlled client-only tags.
     #[serde(default)]
     pub tags: Vec<Tag>,
     /// Server message ID being replied to.
     pub reply_to: Option<String>,
-    /// Long-message behavior.
+    /// Long-message behavior: `require`, `prefer` (default), `split`, or
+    /// `reject_if_too_long`.
     #[serde(default)]
     pub multiline: MultilinePolicy,
-    /// Bounded completion deadline.
+    /// Milliseconds to wait for completion. Must be between 1 and the
+    /// configured maximum, 30000 by default; anything else is rejected.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -281,11 +288,13 @@ pub enum HistorySelector {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HistoryInput {
-    /// Owning guest identity.
+    /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// Nickname or channel whose history is requested.
     pub target: Target,
-    /// History region.
+    /// Tagged history region such as `{"kind":"latest"}` or
+    /// `{"kind":"before","anchor":{"kind":"timestamp","value":"..."}}`;
+    /// kinds are `latest`, `before`, `after`, `around`, and `between`.
     pub selector: HistorySelector,
     /// Maximum returned events.
     #[serde(default = "default_event_limit")]
@@ -293,7 +302,8 @@ pub struct HistoryInput {
     /// Retain history state playback in addition to chat messages.
     #[serde(default)]
     pub include_non_message_events: bool,
-    /// Bounded completion deadline.
+    /// Milliseconds to wait for completion. Must be between 1 and the
+    /// configured maximum, 30000 by default; anything else is rejected.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -425,11 +435,16 @@ pub enum MonitorQuery {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QueryInput {
-    /// Owning guest identity.
+    /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
-    /// Typed query and its required arguments.
+    /// Tagged query object whose `kind` is one of `whois`, `whowas`, `who`,
+    /// `names`, `list`, `topic`, `mode`, `ison`, `userhost`, `monitor`, `motd`,
+    /// `version`, `time`, `admin`, `info`, `lusers`, `stats`, `links`, or `help`;
+    /// for example `{"kind":"names","channels":["#control"]}` or
+    /// `{"kind":"topic","channel":"#control"}`.
     pub query: Query,
-    /// Bounded completion deadline.
+    /// Milliseconds to wait for completion. Must be between 1 and the
+    /// configured maximum, 30000 by default; anything else is rejected.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -441,7 +456,8 @@ pub enum ResponseMode {
     /// Select a strategy from static and runtime protocol knowledge.
     #[default]
     Auto,
-    /// Collect labeled replies for an otherwise unknown command.
+    /// Collect labeled replies for an otherwise unknown command. Requires the
+    /// `labeled-response` capability; the call fails outright without it.
     Collect,
     /// Return once the socket writer accepts the line.
     FireAndForget,
@@ -451,7 +467,7 @@ pub enum ResponseMode {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExecuteInput {
-    /// Explicit guest identity.
+    /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// IRC command, never a raw CRLF-delimited line.
     pub command: String,
@@ -463,10 +479,11 @@ pub struct ExecuteInput {
     /// Caller tags; label and batch are reserved by the bridge.
     #[serde(default)]
     pub tags: Vec<Tag>,
-    /// Completion collector mode.
+    /// Completion mode: `auto` (default), `collect`, or `fire_and_forget`.
     #[serde(default)]
     pub response_mode: ResponseMode,
-    /// Bounded collector deadline.
+    /// Milliseconds to wait for the collector. Must be between 1 and the
+    /// configured maximum, 30000 by default; anything else is rejected.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -475,14 +492,16 @@ pub struct ExecuteInput {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EventsReadInput {
-    /// Explicit guest identity.
+    /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
-    /// Last cursor consumed by this caller.
+    /// Last cursor consumed by this caller: pass back the `next_cursor` from
+    /// the previous read. Omit it to start at the oldest retained event.
     pub cursor: Option<EventCursor>,
     /// Maximum ordered events returned.
     #[serde(default = "default_event_limit")]
     pub limit: usize,
-    /// Zero for non-blocking, positive for bounded long polling.
+    /// Zero for non-blocking, positive to long poll for that many
+    /// milliseconds, up to the configured maximum of 30000 by default.
     #[serde(default)]
     pub wait_ms: u64,
     /// Optional gateway command identifier filter.
@@ -517,7 +536,7 @@ impl EventsReadInput {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DccChatOpenInput {
-    /// Owning guest identity.
+    /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// Peer nickname.
     pub target: Target,
@@ -530,7 +549,7 @@ pub struct DccChatOpenInput {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DccChatSendInput {
-    /// Owning guest identity.
+    /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// Direct-session handle.
     pub dcc_session_id: DccSessionId,
@@ -542,7 +561,7 @@ pub struct DccChatSendInput {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DccSendInput {
-    /// Owning guest identity.
+    /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// Peer nickname.
     pub target: Target,
@@ -559,7 +578,7 @@ pub struct DccSendInput {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DccAcceptInput {
-    /// Owning guest identity.
+    /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// Offered session.
     pub dcc_session_id: DccSessionId,
@@ -574,7 +593,7 @@ pub struct DccAcceptInput {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DccSessionInput {
-    /// Owning guest identity.
+    /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// Direct-session handle.
     pub dcc_session_id: DccSessionId,
@@ -584,7 +603,7 @@ pub struct DccSessionInput {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DccListInput {
-    /// Owning guest identity.
+    /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// Optional lifecycle state.
     pub state: Option<DccState>,

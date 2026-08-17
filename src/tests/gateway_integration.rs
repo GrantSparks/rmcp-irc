@@ -212,6 +212,27 @@ async fn serve_client(
                 )
                 .await;
             }
+            "NAMES" => {
+                let target = nickname.as_deref().unwrap_or("*");
+                let channel = message.params.first().map_or("#test", String::as_str);
+                let label = message.tag_value("label").unwrap_or("names");
+                write_line(
+                    &mut writer,
+                    &format!("@label={label} :fake BATCH +{label} labeled-response"),
+                )
+                .await;
+                write_line(
+                    &mut writer,
+                    &format!("@batch={label} :fake 353 {target} = {channel} :{target}"),
+                )
+                .await;
+                write_line(
+                    &mut writer,
+                    &format!("@batch={label} :fake 366 {target} {channel} :End of NAMES list"),
+                )
+                .await;
+                write_line(&mut writer, &format!(":fake BATCH -{label}")).await;
+            }
             "JOIN" => {
                 let channel = message.params.first().map_or("#test", String::as_str);
                 let tag = label_prefix(&message);
@@ -260,6 +281,15 @@ async fn serve_client(
                 write_line(
                     &mut writer,
                     &format!("{tag}:fake 376 {target} :End of MOTD"),
+                )
+                .await;
+            }
+            "TIME" => {
+                let target = nickname.as_deref().unwrap_or("*");
+                let tag = label_prefix(&message);
+                write_line(
+                    &mut writer,
+                    &format!("{tag}:fake 391 {target} fake :Mon, 17 Aug 2026 05:08:34 UTC"),
                 )
                 .await;
             }
@@ -398,6 +428,44 @@ async fn live_gateway_registers_queries_history_and_keeps_cursors_independent() 
     assert_eq!(whois.outcome, CommandOutcome::Completed);
     assert_eq!(whois.replies.len(), 2);
     assert!(whois.first_event_cursor.is_some());
+
+    let explicitly_collected_names = gateway
+        .execute(
+            &connected.agent_id,
+            OutboundMessage::new("NAMES", vec!["#agents".into()]),
+            CompletionMode::Collect,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("explicitly collected NAMES");
+    assert_eq!(
+        explicitly_collected_names.outcome,
+        CommandOutcome::Completed
+    );
+    assert!(explicitly_collected_names.acknowledged);
+    assert_eq!(explicitly_collected_names.replies.len(), 4);
+    assert!(
+        explicitly_collected_names
+            .replies
+            .last()
+            .is_some_and(|reply| reply.command == "BATCH")
+    );
+
+    for mode in [CompletionMode::Auto, CompletionMode::Collect] {
+        let time = gateway
+            .execute(
+                &connected.agent_id,
+                OutboundMessage::new("TIME", Vec::new()),
+                mode,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("direct labeled TIME reply");
+        assert_eq!(time.outcome, CommandOutcome::Completed);
+        assert!(time.acknowledged);
+        assert_eq!(time.replies.len(), 1);
+        assert_eq!(time.replies[0].command, "391");
+    }
 
     let before = gateway
         .snapshot(&connected.agent_id)

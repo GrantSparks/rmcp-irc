@@ -287,7 +287,11 @@ service, or future IRC command.
   bridge-reserved `label`/`batch` tags are rejected.
 - `auto` selects the static command registry strategy augmented by runtime
   discovery.
-- `collect` requests labeled collection for an otherwise unknown command.
+- `collect` requests one complete logical labeled response for an otherwise
+  unknown command. A direct labeled reply or `ACK` completes immediately; a
+  multi-message response remains open through its outer closing `BATCH`,
+  whether it uses the generic `labeled-response` type or an applicable
+  command-specific batch type.
 - `fire_and_forget` returns after a successful write with
   `sent_unconfirmed` and says that no acknowledgment was awaited.
 - Documentary privilege metadata never blocks execution. Ergo accepts or
