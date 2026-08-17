@@ -25,6 +25,7 @@ use crate::{
         wire::Tag,
     },
     mcp::resources::ResourceUris,
+    time::Timestamp,
 };
 
 /// Amount of redundant protocol detail included directly in a tool result.
@@ -64,6 +65,11 @@ pub const TOOL_NAMES: &[&str] = &[
     "irc.invite",
     "irc.monitor.update",
     "irc.mode.set",
+    "irc.reaction.update",
+    "irc.message.redact",
+    "irc.read.get",
+    "irc.read.set",
+    "irc.typing.set",
     "irc.execute",
     "irc.events.read",
     "irc.dcc.chat.open",
@@ -977,6 +983,189 @@ pub struct ModeSetOutput {
     pub arguments: Vec<String>,
     /// Stable channel-resource URI when the target is a channel.
     pub resource: Option<String>,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// Whether a reaction is being added or removed.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReactionUpdateKind {
+    /// Add a reaction to the referenced message.
+    Add,
+    /// Remove a previously added reaction.
+    Remove,
+}
+
+/// Add or remove an IRCv3 reaction through a client-only tag.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReactionUpdateInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Channel or nickname containing the referenced message.
+    pub target: Target,
+    /// Server-assigned `msgid` of the message being reacted to.
+    pub message_id: String,
+    /// Reaction value, such as an emoji or short text token.
+    pub reaction: String,
+    /// Add or remove operation.
+    pub operation: ReactionUpdateKind,
+    /// Milliseconds to wait for server echo or rejection, between 1 and the
+    /// configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Typed reaction mutation result.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct ReactionUpdateOutput {
+    /// Conversation containing the referenced message.
+    pub target: Target,
+    /// Referenced server message ID.
+    pub message_id: String,
+    /// Reaction value that was added or removed.
+    pub reaction: String,
+    /// Applied operation.
+    pub operation: ReactionUpdateKind,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// Redact one message through negotiated IRCv3 message redaction.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MessageRedactInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Channel or nickname containing the message.
+    pub target: Target,
+    /// Server-assigned `msgid` of the message to redact.
+    pub message_id: String,
+    /// Optional user-supplied reason; no default reason is invented.
+    pub reason: Option<String>,
+    /// Milliseconds to wait for server confirmation or rejection, between 1
+    /// and the configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Typed message-redaction result.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct MessageRedactOutput {
+    /// Conversation containing the redacted message.
+    pub target: Target,
+    /// Referenced server message ID.
+    pub message_id: String,
+    /// User-supplied reason, when present.
+    pub reason: Option<String>,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// Read the synchronized marker for one IRC conversation.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadMarkerGetInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Channel or nickname buffer whose marker is requested.
+    pub target: Target,
+    /// Milliseconds to wait for the server reply, between 1 and the configured
+    /// maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Advance the synchronized marker for one IRC conversation.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadMarkerSetInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Channel or nickname buffer whose marker is advanced.
+    pub target: Target,
+    /// Timestamp of a previously received message carrying a `time` tag.
+    pub read_at: Timestamp,
+    /// Milliseconds to wait for the server reply, between 1 and the configured
+    /// maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Typed synchronized read-marker result.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct ReadMarkerOutput {
+    /// Conversation whose marker was returned.
+    pub target: Target,
+    /// Server-confirmed marker, or `None` when the server returned `*` or no
+    /// successful marker reply was collected.
+    pub read_at: Option<Timestamp>,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// IRCv3 typing indicator state.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypingState {
+    /// The user is actively changing the input field.
+    Active,
+    /// The user paused without clearing the input field.
+    Paused,
+    /// The user cleared the input field without sending a message.
+    Done,
+}
+
+impl TypingState {
+    /// IRCv3 client-tag spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Done => "done",
+        }
+    }
+}
+
+/// Send a privacy-sensitive, per-target throttled IRCv3 typing indicator.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TypingSetInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Channel or nickname that can observe the indicator.
+    pub target: Target,
+    /// Typing state to publish.
+    pub state: TypingState,
+    /// Milliseconds to wait for server echo or rejection, between 1 and the
+    /// configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Typed typing-indicator result.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct TypingSetOutput {
+    /// Conversation that can observe the indicator.
+    pub target: Target,
+    /// Published state.
+    pub state: TypingState,
     /// Lossless correlated command result.
     pub result: CommandResult,
 }

@@ -335,6 +335,27 @@ Typed mutation tools are:
 | `irc.invite` | Invite one nickname to one channel and return the channel link. |
 | `irc.monitor.update` | Add/remove nicknames or clear the server-side MONITOR list; rejects the call unless ISUPPORT advertises `MONITOR`. |
 | `irc.mode.set` | Apply a `+`/`-` user or channel mode change with validated ordered arguments and an optional channel link. |
+| `irc.reaction.update` | Add/remove a `+draft/react` reaction using the referenced `msgid`; requires `message-tags` and rejects tags blocked by `CLIENTTAGDENY`. |
+| `irc.message.redact` | Send `REDACT` with an optional caller-supplied reason; requires negotiated `message-redaction` and `message-tags`. |
+| `irc.read.set` | Advance the server's synchronized marker to a typed RFC 3339 timestamp from a previously received `time` tag. |
+| `irc.typing.set` | Publish `active`, `paused`, or `done` with `+typing`; requires `message-tags`, honors `CLIENTTAGDENY`, and enforces the IRCv3 three-second per-target throttle. |
+
+`irc.read.get` is the corresponding typed read-only read-marker query. Its
+result returns the server-confirmed timestamp or `null` when the server reports
+`*`. Read markers are user-local synchronization state, not delivery receipts
+or public read receipts.
+
+The gateway requests `draft/message-redaction` and `draft/read-marker` only
+when the server advertises them. Reactions and typing are client-only tag
+features and therefore depend on negotiated `message-tags` plus the runtime
+`CLIENTTAGDENY` policy rather than having their own capabilities. Inbound
+`TAGMSG`, `REDACT`, and `MARKREAD` lines receive typed semantic projections
+while their lossless wire forms remain available.
+
+No interoperable editing command or capability is advertised by the supported
+Ergo protocol surface. The gateway therefore does not invent an edit syntax;
+future or vendor extensions remain accessible through `irc.execute` and the
+protocol catalog until a stable typed contract can be capability-checked.
 
 Every typed command result retains the common lossless `result` envelope.
 Query-specific fields are projected before `result_detail: "compact"` removes
@@ -521,9 +542,11 @@ irc.names                   irc.list                   irc.mode.get
 irc.help                    irc.topic.get              irc.topic.set
 irc.nick.set                irc.away.set               irc.kick
 irc.invite                  irc.monitor.update         irc.mode.set
-irc.execute                 irc.events.read            irc.dcc.chat.open
-irc.dcc.chat.send           irc.dcc.send               irc.dcc.accept
-irc.dcc.reject              irc.dcc.cancel             irc.dcc.list
+irc.reaction.update         irc.message.redact         irc.read.get
+irc.read.set                irc.typing.set              irc.execute
+irc.events.read             irc.dcc.chat.open          irc.dcc.chat.send
+irc.dcc.send                irc.dcc.accept             irc.dcc.reject
+irc.dcc.cancel              irc.dcc.list
 ```
 
 Complete IRC command coverage belongs in `irc.execute` and the lossless event

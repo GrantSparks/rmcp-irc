@@ -20,6 +20,10 @@ breaking changes to the CLI, configuration, or MCP surface.
 - Four fixed MCP prompts guide connect, mentions-watch, join, and
   summarize/respond workflows while preserving the boundary between realtime
   host delivery and host-triggered model execution.
+- Negotiated modern-message support now includes typed reaction, redaction,
+  read-marker, and typing tools plus inbound semantic projections. Reaction
+  and typing tags honor `CLIENTTAGDENY`, typing is throttled per target, and
+  redaction/read-marker capabilities are requested only when advertised.
 
 ### Fixed
 

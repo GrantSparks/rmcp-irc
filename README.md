@@ -176,8 +176,10 @@ does this for its `irc` network alias.
 The stable typed semantic surface additionally includes WHOIS, NAMES, LIST,
 HELP, topic, nickname, away, invite, kick, monitor, and mode tools. Four
 user-selectable MCP prompts guide connect, mention-watch, join, and
-summarize/respond workflows without implying that a resource notification can
-start a model turn by itself.
+summarize/respond workflows. Negotiated IRCv3 tools cover reactions, message
+redaction, synchronized read markers, and privacy-sensitive typing indicators
+without implying that a resource notification can start a model turn by
+itself.
 
 Per-agent resources expose connection status, protocol discovery, MOTD,
 reduced state, event bounds, DCC sessions, and channel snapshots under

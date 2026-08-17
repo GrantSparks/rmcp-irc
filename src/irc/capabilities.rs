@@ -348,6 +348,8 @@ pub enum NegotiationPhase {
 pub const IMPLEMENTED_CAPABILITIES: &[&str] = &[
     "batch",
     "draft/chathistory",
+    "draft/message-redaction",
+    "draft/read-marker",
     "cap-notify",
     "labeled-response",
     "message-tags",
@@ -817,6 +819,25 @@ mod tests {
             CapabilityStatus::ObservedUnnegotiated
         );
         assert_eq!(negotiator.entries()["sasl"].value.as_deref(), Some("PLAIN"));
+    }
+
+    #[test]
+    fn modern_message_capabilities_are_requested_and_normalized() {
+        let mut negotiator = CapabilityNegotiator::new();
+        let action = negotiator.apply(&parse(
+            ":server CAP * LS :message-tags draft/message-redaction draft/read-marker",
+        ));
+        let CapabilityAction::Request(request) = action else {
+            panic!("expected modern message capabilities to be requested");
+        };
+        assert!(request.contains(&"draft/message-redaction".to_owned()));
+        assert!(request.contains(&"draft/read-marker".to_owned()));
+
+        negotiator.apply(&parse(
+            ":server CAP * ACK :message-tags draft/message-redaction draft/read-marker",
+        ));
+        assert!(negotiator.is_active("message-redaction"));
+        assert!(negotiator.is_active("read-marker"));
     }
 
     #[test]

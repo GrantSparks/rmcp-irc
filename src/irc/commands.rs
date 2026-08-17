@@ -90,6 +90,11 @@ pub enum ResponseStrategy {
     Ack,
     /// Exactly one semantic reply or error is expected.
     SingleReply,
+    /// Exactly one named non-numeric server command or error is expected.
+    CommandReply {
+        /// Commands that complete the request.
+        commands: &'static [&'static str],
+    },
     /// Collect numerics until one of these terminal numerics.
     NumericSequence {
         /// Terminal numeric replies.
@@ -122,6 +127,8 @@ pub enum CollectorKind {
     Ack,
     /// Exactly one semantic reply or error is expected.
     SingleReply,
+    /// Exactly one named non-numeric server command or error is expected.
+    CommandReply,
     /// Numerics are collected until a terminal numeric.
     NumericSequence,
     /// A complete batch is collected.
@@ -140,6 +147,7 @@ impl ResponseStrategy {
         match self {
             Self::Ack => CollectorKind::Ack,
             Self::SingleReply => CollectorKind::SingleReply,
+            Self::CommandReply { .. } => CollectorKind::CommandReply,
             Self::NumericSequence { .. } => CollectorKind::NumericSequence,
             Self::Batch { .. } => CollectorKind::Batch,
             Self::Echo { .. } => CollectorKind::Echo,
@@ -233,7 +241,10 @@ const ADMIN_END: &[u16] = &[259];
 const MONITOR_END: &[u16] = &[733, 734];
 
 const ECHO_MESSAGE: &[&str] = &["echo-message"];
+const TAGMSG_ECHO: &[&str] = &["message-tags", "echo-message"];
 const CHATHISTORY: &[&str] = &["draft/chathistory"];
+const MESSAGE_REDACTION: &[&str] = &["draft/message-redaction"];
+const READ_MARKER: &[&str] = &["draft/read-marker"];
 const MONITOR_CAPS: &[&str] = &[];
 
 /// Initial static registry. Runtime HELP INDEX augments but never replaces it.
@@ -420,9 +431,33 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "TAGMSG",
         phase: CommandPhase::Registered,
-        required_capabilities: &["message-tags"],
+        required_capabilities: TAGMSG_ECHO,
         response: ResponseStrategy::Echo {
             commands: &["TAGMSG"],
+        },
+        degraded_response: ResponseStrategy::Unconfirmed,
+        state_effects: StateEffects::None,
+        privilege: PrivilegeClass::Normal,
+        mapping: MappingGrade::Native,
+    },
+    CommandSpec {
+        name: "REDACT",
+        phase: CommandPhase::Registered,
+        required_capabilities: MESSAGE_REDACTION,
+        response: ResponseStrategy::Echo {
+            commands: &["REDACT"],
+        },
+        degraded_response: ResponseStrategy::Unconfirmed,
+        state_effects: StateEffects::None,
+        privilege: PrivilegeClass::Normal,
+        mapping: MappingGrade::Native,
+    },
+    CommandSpec {
+        name: "MARKREAD",
+        phase: CommandPhase::Registered,
+        required_capabilities: READ_MARKER,
+        response: ResponseStrategy::CommandReply {
+            commands: &["MARKREAD"],
         },
         degraded_response: ResponseStrategy::Unconfirmed,
         state_effects: StateEffects::None,
@@ -815,6 +850,36 @@ mod tests {
         );
         assert_eq!(spec.strategy(&[]), ResponseStrategy::Unconfirmed);
         assert_eq!(spec.missing_capabilities(&[]), ["echo-message"]);
+    }
+
+    #[test]
+    fn modern_message_commands_require_their_exact_negotiated_features() {
+        let redact = spec_for("REDACT").expect("REDACT");
+        assert_eq!(
+            redact.missing_capabilities(&[]),
+            ["draft/message-redaction"]
+        );
+        assert_eq!(
+            redact.strategy(&["draft/message-redaction"]),
+            ResponseStrategy::Echo {
+                commands: &["REDACT"]
+            }
+        );
+
+        let markread = spec_for("MARKREAD").expect("MARKREAD");
+        assert_eq!(markread.missing_capabilities(&[]), ["draft/read-marker"]);
+        assert_eq!(
+            markread.strategy(&["draft/read-marker"]),
+            ResponseStrategy::CommandReply {
+                commands: &["MARKREAD"]
+            }
+        );
+
+        let tagmsg = spec_for("TAGMSG").expect("TAGMSG");
+        assert_eq!(
+            tagmsg.missing_capabilities(&["message-tags"]),
+            ["echo-message"]
+        );
     }
 
     #[test]

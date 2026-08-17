@@ -5,6 +5,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::time::Timestamp;
+
 use super::{isupport::IsupportRegistry, target::ChannelName, wire::WireMessage};
 
 /// Semantic event classes required by the MCP contract.
@@ -93,6 +95,28 @@ pub enum PresenceChange {
     RealName(String),
 }
 
+/// Whether a reaction was attached to or removed from a message.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReactionChange {
+    /// A reaction was attached.
+    Added,
+    /// A reaction was removed.
+    Removed,
+}
+
+/// IRCv3 typing indicator state.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypingStatus {
+    /// The sender is actively changing their input field.
+    Active,
+    /// The sender paused without clearing their input field.
+    Paused,
+    /// The sender cleared their input field without sending.
+    Done,
+}
+
 /// Which part of the MOTD sequence one reply carries.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -172,6 +196,46 @@ pub enum SemanticEvent {
         source: Source,
         /// Channel or nickname it was sent to.
         target: String,
+    },
+    /// A lightweight reaction attached to a server-identified message.
+    MessageReaction {
+        /// Sender.
+        source: Source,
+        /// Channel or nickname containing the message.
+        target: String,
+        /// Referenced server message ID.
+        message_id: String,
+        /// Reaction value.
+        reaction: String,
+        /// Whether the reaction was added or removed.
+        change: ReactionChange,
+    },
+    /// A privacy-sensitive typing indicator.
+    Typing {
+        /// Sender.
+        source: Source,
+        /// Channel or nickname observing the indicator.
+        target: String,
+        /// Published typing status.
+        status: TypingStatus,
+    },
+    /// A message was redacted from one conversation.
+    MessageRedaction {
+        /// Actor who requested or performed the redaction.
+        source: Source,
+        /// Channel or nickname containing the message.
+        target: String,
+        /// Redacted server message ID.
+        message_id: String,
+        /// Optional reason supplied by the actor.
+        reason: Option<String>,
+    },
+    /// Synchronized local read marker for one conversation.
+    ReadMarker {
+        /// Channel or nickname buffer.
+        target: String,
+        /// Last-read timestamp, or `None` when the server returned `*`.
+        read_at: Option<Timestamp>,
     },
     /// A CTCP query or reply other than ACTION.
     Ctcp {
@@ -265,6 +329,11 @@ impl SemanticEvent {
             Self::MessageAction { .. } => SemanticClass::MessageAction,
             Self::MessageNotice { .. } => SemanticClass::MessageNotice,
             Self::MessageTagged { .. } => SemanticClass::MessageTagged,
+            Self::MessageReaction { .. } | Self::MessageRedaction { .. } => {
+                SemanticClass::MessageTagged
+            }
+            Self::Typing { .. } => SemanticClass::Presence,
+            Self::ReadMarker { .. } => SemanticClass::ProtocolReply,
             Self::Ctcp { .. } => SemanticClass::Ctcp,
             Self::Membership { .. } => SemanticClass::Membership,
             Self::Presence { .. } => SemanticClass::Presence,
@@ -319,9 +388,22 @@ pub fn project(message: &WireMessage, isupport: &IsupportRegistry) -> SemanticPr
             target: target.unwrap_or_default(),
             text: text.unwrap_or_default(),
         },
-        "TAGMSG" => SemanticEvent::MessageTagged {
+        "TAGMSG" => project_tagmsg(message, source, target),
+        "REDACT" => SemanticEvent::MessageRedaction {
             source,
             target: target.unwrap_or_default(),
+            message_id: message.params.get(1).cloned().unwrap_or_default(),
+            reason: message.params.get(2).cloned().or(text),
+        },
+        "MARKREAD" => SemanticEvent::ReadMarker {
+            target: target.unwrap_or_default(),
+            read_at: message
+                .params
+                .get(1)
+                .or(message.trailing.as_ref())
+                .filter(|value| value.as_str() != "*")
+                .and_then(|value| value.strip_prefix("timestamp="))
+                .and_then(|value| value.parse().ok()),
         },
         "JOIN" => SemanticEvent::Membership {
             source,
@@ -409,6 +491,44 @@ pub fn project(message: &WireMessage, isupport: &IsupportRegistry) -> SemanticPr
         _ => project_numeric(message, command, text),
     };
     event.into()
+}
+
+fn project_tagmsg(message: &WireMessage, source: Source, target: Option<String>) -> SemanticEvent {
+    let target = target.unwrap_or_default();
+    let reply_to = message
+        .tag_value("+reply")
+        .or_else(|| message.tag_value("reply"));
+    for (key, change) in [
+        ("+draft/react", ReactionChange::Added),
+        ("+draft/unreact", ReactionChange::Removed),
+    ] {
+        if let (Some(message_id), Some(reaction)) = (reply_to, message.tag_value(key)) {
+            return SemanticEvent::MessageReaction {
+                source,
+                target,
+                message_id: message_id.to_owned(),
+                reaction: reaction.to_owned(),
+                change,
+            };
+        }
+    }
+    let typing = message
+        .tag_value("+typing")
+        .or_else(|| message.tag_value("typing"));
+    let status = match typing {
+        Some("active") => Some(TypingStatus::Active),
+        Some("paused") => Some(TypingStatus::Paused),
+        Some("done") => Some(TypingStatus::Done),
+        _ => None,
+    };
+    if let Some(status) = status {
+        return SemanticEvent::Typing {
+            source,
+            target,
+            status,
+        };
+    }
+    SemanticEvent::MessageTagged { source, target }
 }
 
 fn project_privmsg(
@@ -702,6 +822,81 @@ mod tests {
         };
         assert_eq!(stage, MotdStage::Missing);
         assert!(stage.is_terminal());
+    }
+
+    #[test]
+    fn reactions_and_typing_are_typed_from_client_only_tags() {
+        let reaction = project(
+            &parse("@+reply=abc;+draft/react=wave :a!u@h TAGMSG #room"),
+            &isupport(),
+        );
+        assert_eq!(reaction.class, SemanticClass::MessageTagged);
+        assert_eq!(
+            reaction.event,
+            SemanticEvent::MessageReaction {
+                source: Source {
+                    name: "a".into(),
+                    user: Some("u".into()),
+                    host: Some("h".into()),
+                    account: None,
+                },
+                target: "#room".into(),
+                message_id: "abc".into(),
+                reaction: "wave".into(),
+                change: ReactionChange::Added,
+            }
+        );
+
+        let typing = project(&parse("@+typing=paused :a!u@h TAGMSG Kuebiko"), &isupport());
+        assert_eq!(typing.class, SemanticClass::Presence);
+        assert!(matches!(
+            typing.event,
+            SemanticEvent::Typing {
+                status: TypingStatus::Paused,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn redactions_preserve_the_target_message_and_optional_reason() {
+        let projection = project(
+            &parse(":a!u@h REDACT #room abc :sent accidentally"),
+            &isupport(),
+        );
+        assert!(matches!(
+            projection.event,
+            SemanticEvent::MessageRedaction {
+                target,
+                message_id,
+                reason: Some(reason),
+                ..
+            } if target == "#room" && message_id == "abc" && reason == "sent accidentally"
+        ));
+    }
+
+    #[test]
+    fn read_markers_project_valid_timestamps_and_the_unknown_marker() {
+        let known = project(
+            &parse(":server MARKREAD #room timestamp=2026-08-17T07:00:00.123Z"),
+            &isupport(),
+        );
+        assert!(matches!(
+            known.event,
+            SemanticEvent::ReadMarker {
+                read_at: Some(_),
+                ..
+            }
+        ));
+
+        let unknown = project(&parse(":server MARKREAD #room *"), &isupport());
+        assert_eq!(
+            unknown.event,
+            SemanticEvent::ReadMarker {
+                target: "#room".into(),
+                read_at: None,
+            }
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     str::FromStr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rmcp::{
@@ -27,6 +27,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use crate::{
     MCP_INSTRUCTIONS,
@@ -76,6 +77,7 @@ pub struct IrcMcpService {
     gateway: Arc<Gateway>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
+    typing_deadlines: Arc<Mutex<BTreeMap<(crate::agent::AgentId, String), Instant>>>,
 }
 
 impl IrcMcpService {
@@ -85,6 +87,7 @@ impl IrcMcpService {
             gateway,
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
+            typing_deadlines: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -1151,6 +1154,332 @@ impl IrcMcpService {
                     failure,
                     content,
                 )
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Add or remove a lightweight reaction from one server-identified message.
+    #[tool(
+        name = "irc.reaction.update",
+        description = "Add or remove an IRCv3 reaction after checking message-tags and the server's client-tag policy.",
+        output_schema = schema_for_output::<ReactionUpdateOutput>(),
+        annotations(
+            title = "Update message reaction",
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_reaction_update(
+        &self,
+        Parameters(input): Parameters<ReactionUpdateInput>,
+    ) -> CallToolResult {
+        if let Err(error) = validate_irc_atom(&input.message_id, "message_id") {
+            return tool_error(error);
+        }
+        if input.reaction.is_empty()
+            || input
+                .reaction
+                .bytes()
+                .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+        {
+            return tool_error(GatewayError::InvalidMessage(
+                "reaction must be non-empty and contain no NUL, CR, or LF".into(),
+            ));
+        }
+        let snapshot = match self.gateway.snapshot(&input.agent_id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tool_error(error),
+        };
+        if let Err(error) = require_capability(&snapshot, "message-tags", "IRCv3 reactions") {
+            return tool_error(error);
+        }
+        let reaction_tag = match input.operation {
+            ReactionUpdateKind::Add => "draft/react",
+            ReactionUpdateKind::Remove => "draft/unreact",
+        };
+        for tag in ["reply", reaction_tag] {
+            if !client_tag_allowed(&snapshot, tag) {
+                return tool_error(GatewayError::InvalidMessage(format!(
+                    "+{tag} is blocked by the server's CLIENTTAGDENY policy"
+                )));
+            }
+        }
+
+        let target = input.target;
+        let message_id = input.message_id;
+        let reaction = input.reaction;
+        let outbound = OutboundMessage {
+            tags: vec![
+                Tag::new("+reply", Some(message_id.clone())),
+                Tag::new(format!("+{reaction_tag}"), Some(reaction.clone())),
+            ],
+            command: "TAGMSG".into(),
+            params: vec![target.to_string()],
+            trailing: None,
+        };
+        match self
+            .execute(
+                &input.agent_id,
+                outbound,
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = ReactionUpdateOutput {
+                    target,
+                    message_id,
+                    reaction,
+                    operation: input.operation,
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result(format!("Reaction update: {outcome:?}."), &output, failure)
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Redact one message after exact capability negotiation.
+    #[tool(
+        name = "irc.message.redact",
+        description = "Redact one server-identified message through negotiated IRCv3 message redaction.",
+        output_schema = schema_for_output::<MessageRedactOutput>(),
+        annotations(
+            title = "Redact IRC message",
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_message_redact(
+        &self,
+        Parameters(input): Parameters<MessageRedactInput>,
+    ) -> CallToolResult {
+        if let Err(error) = validate_irc_atom(&input.message_id, "message_id") {
+            return tool_error(error);
+        }
+        let snapshot = match self.gateway.snapshot(&input.agent_id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tool_error(error),
+        };
+        for (capability, operation) in [
+            ("message-tags", "IRCv3 message redaction"),
+            ("message-redaction", "IRCv3 message redaction"),
+        ] {
+            if let Err(error) = require_capability(&snapshot, capability, operation) {
+                return tool_error(error);
+            }
+        }
+
+        let target = input.target;
+        let message_id = input.message_id;
+        let reason = input.reason.filter(|reason| !reason.is_empty());
+        let mut outbound =
+            OutboundMessage::new("REDACT", vec![target.to_string(), message_id.clone()]);
+        outbound.trailing = reason.clone();
+        match self
+            .execute(
+                &input.agent_id,
+                outbound,
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = MessageRedactOutput {
+                    target,
+                    message_id,
+                    reason,
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result(format!("Message redaction: {outcome:?}."), &output, failure)
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Read one synchronized conversation read marker.
+    #[tool(
+        name = "irc.read.get",
+        description = "Read one synchronized IRCv3 conversation marker after exact capability negotiation.",
+        output_schema = schema_for_output::<ReadMarkerOutput>(),
+        annotations(
+            title = "Read conversation marker",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_read_get(
+        &self,
+        Parameters(input): Parameters<ReadMarkerGetInput>,
+    ) -> CallToolResult {
+        let snapshot = match self.gateway.snapshot(&input.agent_id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tool_error(error),
+        };
+        if let Err(error) = require_capability(&snapshot, "read-marker", "IRCv3 read markers") {
+            return tool_error(error);
+        }
+        let target = input.target;
+        match self
+            .execute(
+                &input.agent_id,
+                OutboundMessage::new("MARKREAD", vec![target.to_string()]),
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let read_at = read_marker_reply(&result);
+                let output = ReadMarkerOutput {
+                    target,
+                    read_at,
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result(format!("Read marker query: {outcome:?}."), &output, failure)
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Advance one synchronized conversation read marker.
+    #[tool(
+        name = "irc.read.set",
+        description = "Advance one synchronized IRCv3 conversation marker to a previously received server timestamp.",
+        output_schema = schema_for_output::<ReadMarkerOutput>(),
+        annotations(
+            title = "Advance conversation marker",
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_read_set(
+        &self,
+        Parameters(input): Parameters<ReadMarkerSetInput>,
+    ) -> CallToolResult {
+        let snapshot = match self.gateway.snapshot(&input.agent_id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tool_error(error),
+        };
+        if let Err(error) = require_capability(&snapshot, "read-marker", "IRCv3 read markers") {
+            return tool_error(error);
+        }
+        let target = input.target;
+        let requested = input.read_at;
+        let outbound = OutboundMessage::new(
+            "MARKREAD",
+            vec![target.to_string(), format!("timestamp={requested}")],
+        );
+        match self
+            .execute(
+                &input.agent_id,
+                outbound,
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let read_at = read_marker_reply(&result);
+                let output = ReadMarkerOutput {
+                    target,
+                    read_at,
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result(
+                    format!("Read marker update: {outcome:?}."),
+                    &output,
+                    failure,
+                )
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Publish one privacy-sensitive typing state with required throttling.
+    #[tool(
+        name = "irc.typing.set",
+        description = "Publish a privacy-sensitive IRCv3 typing state with negotiated-tag checks and per-target throttling.",
+        output_schema = schema_for_output::<TypingSetOutput>(),
+        annotations(
+            title = "Publish typing state",
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_typing_set(
+        &self,
+        Parameters(input): Parameters<TypingSetInput>,
+    ) -> CallToolResult {
+        let snapshot = match self.gateway.snapshot(&input.agent_id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tool_error(error),
+        };
+        if let Err(error) = require_capability(&snapshot, "message-tags", "IRCv3 typing") {
+            return tool_error(error);
+        }
+        if !client_tag_allowed(&snapshot, "typing") {
+            return tool_error(GatewayError::InvalidMessage(
+                "+typing is blocked by the server's CLIENTTAGDENY policy".into(),
+            ));
+        }
+
+        let target = input.target;
+        let throttle_key = (
+            input.agent_id.clone(),
+            casefold_target(&snapshot, target.as_str()),
+        );
+        let now = Instant::now();
+        {
+            let mut deadlines = self.typing_deadlines.lock().await;
+            if let Err(retry_after) = claim_typing_slot(&mut deadlines, throttle_key, now) {
+                return tool_error(GatewayError::InvalidMessage(format!(
+                    "typing notifications are limited to one per target every 3 seconds; retry after {} ms",
+                    retry_after.as_millis()
+                )));
+            }
+        }
+
+        let state = input.state;
+        let outbound = OutboundMessage {
+            tags: vec![Tag::new("+typing", Some(state.as_str().into()))],
+            command: "TAGMSG".into(),
+            params: vec![target.to_string()],
+            trailing: None,
+        };
+        match self
+            .execute(
+                &input.agent_id,
+                outbound,
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = TypingSetOutput {
+                    target,
+                    state,
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result(format!("Typing state: {outcome:?}."), &output, failure)
             }
             Err(error) => tool_error(error),
         }
@@ -2272,6 +2601,96 @@ fn capability_active(snapshot: &crate::agent::actor::AgentSnapshot, feature: &st
     })
 }
 
+fn require_capability(
+    snapshot: &crate::agent::actor::AgentSnapshot,
+    feature: &str,
+    operation: &str,
+) -> Result<(), GatewayError> {
+    if capability_active(snapshot, feature) {
+        Ok(())
+    } else {
+        Err(GatewayError::InvalidMessage(format!(
+            "{operation} requires the negotiated {feature} capability"
+        )))
+    }
+}
+
+/// Whether one client-only tag will be relayed under the current ISUPPORT
+/// policy. Tag names are compared exactly and omit their leading `+`, as the
+/// CLIENTTAGDENY token requires.
+fn client_tag_allowed(snapshot: &crate::agent::actor::AgentSnapshot, tag: &str) -> bool {
+    let token = snapshot
+        .protocol
+        .isupport
+        .values()
+        .find(|token| token.name.eq_ignore_ascii_case("CLIENTTAGDENY"));
+    client_tag_allowed_by_policy(token, tag)
+}
+
+fn client_tag_allowed_by_policy(
+    token: Option<&crate::irc::isupport::IsupportToken>,
+    tag: &str,
+) -> bool {
+    let Some(token) = token else {
+        return true;
+    };
+    if token.negated {
+        return true;
+    }
+    let Some(value) = token.unescaped_value() else {
+        return true;
+    };
+    let entries: Vec<_> = value.split(',').filter(|entry| !entry.is_empty()).collect();
+    if entries.first() == Some(&"*") {
+        entries
+            .iter()
+            .skip(1)
+            .any(|entry| entry.strip_prefix('-') == Some(tag))
+    } else {
+        !entries.contains(&tag)
+    }
+}
+
+fn casefold_target(snapshot: &crate::agent::actor::AgentSnapshot, target: &str) -> String {
+    let mapping = snapshot
+        .protocol
+        .isupport
+        .values()
+        .find(|token| token.name.eq_ignore_ascii_case("CASEMAPPING"))
+        .and_then(|token| token.value.as_deref())
+        .map_or_else(
+            crate::irc::isupport::CaseMapping::default,
+            crate::irc::isupport::CaseMapping::parse,
+        );
+    mapping.fold(target)
+}
+
+fn claim_typing_slot(
+    deadlines: &mut BTreeMap<(crate::agent::AgentId, String), Instant>,
+    key: (crate::agent::AgentId, String),
+    now: Instant,
+) -> Result<(), Duration> {
+    let interval = Duration::from_secs(3);
+    deadlines.retain(|_, sent_at| now.duration_since(*sent_at) < interval);
+    if let Some(sent_at) = deadlines.get(&key) {
+        return Err(interval.saturating_sub(now.duration_since(*sent_at)));
+    }
+    deadlines.insert(key, now);
+    Ok(())
+}
+
+fn read_marker_reply(result: &CommandResult) -> Option<crate::time::Timestamp> {
+    result
+        .replies
+        .iter()
+        .rev()
+        .find(|reply| reply.command.eq_ignore_ascii_case("MARKREAD"))
+        .and_then(|reply| reply.params.get(1).or(reply.trailing.as_ref()))
+        .filter(|value| value.as_str() != "*")
+        .and_then(|value| value.strip_prefix("timestamp="))
+        .and_then(|value| value.parse().ok())
+}
+
 fn validate_irc_atom(value: &str, field: &str) -> Result<(), GatewayError> {
     if value.is_empty()
         || value.starts_with(':')
@@ -2501,6 +2920,45 @@ mod tests {
     }
 
     #[test]
+    fn client_tag_deny_honors_catch_all_exemptions_and_exact_names() {
+        use crate::irc::isupport::IsupportToken;
+
+        assert!(client_tag_allowed_by_policy(None, "typing"));
+        let selective = IsupportToken::parse("CLIENTTAGDENY=typing,draft/react");
+        assert!(!client_tag_allowed_by_policy(Some(&selective), "typing"));
+        assert!(!client_tag_allowed_by_policy(
+            Some(&selective),
+            "draft/react"
+        ));
+        assert!(client_tag_allowed_by_policy(
+            Some(&selective),
+            "draft/unreact"
+        ));
+
+        let catch_all = IsupportToken::parse("CLIENTTAGDENY=*,-typing");
+        assert!(client_tag_allowed_by_policy(Some(&catch_all), "typing"));
+        assert!(!client_tag_allowed_by_policy(
+            Some(&catch_all),
+            "draft/react"
+        ));
+    }
+
+    #[test]
+    fn typing_slots_are_throttled_per_agent_and_casefolded_target() {
+        let agent_id = crate::agent::AgentId::new();
+        let key = (agent_id, "#room".into());
+        let mut deadlines = BTreeMap::new();
+        let now = Instant::now();
+
+        assert!(claim_typing_slot(&mut deadlines, key.clone(), now).is_ok());
+        let retry_after =
+            claim_typing_slot(&mut deadlines, key.clone(), now + Duration::from_secs(1))
+                .expect_err("second update should be throttled");
+        assert_eq!(retry_after, Duration::from_secs(2));
+        assert!(claim_typing_slot(&mut deadlines, key, now + Duration::from_secs(3)).is_ok());
+    }
+
+    #[test]
     fn stable_tool_list_is_exact_and_schema_backed() {
         let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
         let tools = service.tool_router.list_all();
@@ -2647,6 +3105,20 @@ mod tests {
                 Some(1_700_000_001)
             )
         );
+    }
+
+    #[test]
+    fn typed_read_marker_projection_uses_the_server_confirmed_value() {
+        let result = command_result_with(&[
+            b":irc.example MARKREAD #control timestamp=2026-08-17T07:00:00.123Z",
+        ]);
+        assert_eq!(
+            read_marker_reply(&result).map(|value| value.to_rfc3339()),
+            Some("2026-08-17T07:00:00.123Z".into())
+        );
+
+        let unknown = command_result_with(&[b":irc.example MARKREAD #control *"]);
+        assert_eq!(read_marker_reply(&unknown), None);
     }
 
     /// Description of one top-level property of a tool's input schema.

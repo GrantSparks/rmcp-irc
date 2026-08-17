@@ -220,6 +220,7 @@ impl ResponseClass {
         match strategy {
             ResponseStrategy::Ack | ResponseStrategy::Unconfirmed => Self::None,
             ResponseStrategy::SingleReply
+            | ResponseStrategy::CommandReply { .. }
             | ResponseStrategy::NumericSequence { .. }
             | ResponseStrategy::Batch { .. }
             | ResponseStrategy::Echo { .. }
@@ -700,6 +701,13 @@ impl Correlator {
             ResponseStrategy::NumericSequence { .. } | ResponseStrategy::SingleReply => {
                 message.numeric().is_some()
             }
+            ResponseStrategy::CommandReply { commands } => {
+                commands
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(&message.command))
+                    || standard_reply_names_command(message, &entry.command)
+                    || message.numeric().is_some_and(is_error_numeric)
+            }
             ResponseStrategy::Echo { commands } => {
                 commands
                     .iter()
@@ -795,6 +803,10 @@ fn classify(
         ResponseStrategy::SingleReply | ResponseStrategy::ConnectionLifecycle => {
             Some(CommandOutcome::Completed)
         }
+        ResponseStrategy::CommandReply { commands } => commands
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&message.command))
+            .then_some(CommandOutcome::Completed),
         ResponseStrategy::Echo { commands } => commands
             .iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(&message.command))
@@ -835,6 +847,16 @@ fn classify(
 }
 
 /// A standard reply worth attaching to a result, in typed form.
+fn standard_reply_names_command(message: &WireMessage, command: &str) -> bool {
+    matches!(
+        message.command.to_ascii_uppercase().as_str(),
+        "FAIL" | "WARN" | "NOTE"
+    ) && message
+        .params
+        .first()
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(command))
+}
+
 fn standard_reply(message: &WireMessage) -> Option<CommandWarning> {
     let severity = StandardReplySeverity::parse(&message.command)?;
     Some(CommandWarning::StandardReply {
@@ -961,6 +983,43 @@ mod tests {
         correlator.record_write(&command_id, true);
 
         let completions = correlator.ingest(&parse(":server 451 me :You have not registered"));
+        assert_eq!(completions[0].outcome, CommandOutcome::Rejected);
+    }
+
+    #[test]
+    fn a_named_command_reply_correlates_without_labels() {
+        let mut correlator = correlator();
+        let response = ResponseStrategy::CommandReply {
+            commands: &["MARKREAD"],
+        };
+        let entry = pending("MARKREAD", response, None);
+        let command_id = entry.command_id.clone();
+        correlator.register(entry).expect("register");
+        correlator.record_write(&command_id, true);
+
+        let completions = correlator.ingest(&parse(
+            ":server MARKREAD #room timestamp=2026-08-17T07:00:00.123Z",
+        ));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].outcome, CommandOutcome::Completed);
+        assert_eq!(completions[0].replies[0].command, "MARKREAD");
+    }
+
+    #[test]
+    fn a_named_command_standard_failure_correlates_without_labels() {
+        let mut correlator = correlator();
+        let response = ResponseStrategy::CommandReply {
+            commands: &["MARKREAD"],
+        };
+        let entry = pending("MARKREAD", response, None);
+        let command_id = entry.command_id.clone();
+        correlator.register(entry).expect("register");
+        correlator.record_write(&command_id, true);
+
+        let completions = correlator.ingest(&parse(
+            ":server FAIL MARKREAD INVALID_PARAMS #room :Invalid timestamp",
+        ));
+        assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].outcome, CommandOutcome::Rejected);
     }
 
