@@ -36,6 +36,15 @@ max_command_timeout_ms = 30000
 max_event_wait_ms = 30000
 max_event_page_size = 1000
 
+[mcp]
+# Require an answered confirmation before irc.kick or irc.message.redact is
+# written upstream. Off by default. With it on, those two calls first return an
+# input_required question stating the exact action, apply nothing until the
+# answer arrives, and are refused outright for a request that declared no
+# form-mode elicitation — a gate that could be bypassed by not declaring a
+# capability would not be a gate.
+confirm_destructive = false
+
 [dcc]
 bind_address = "0.0.0.0"
 # Set this when automatic route discovery is not reachable by DCC peers.

@@ -88,6 +88,22 @@ pub enum GatewayError {
         attempted_nicknames: Vec<String>,
     },
 
+    /// Every candidate nickname was refused as taken, colliding, or
+    /// temporarily unavailable, under a policy that asks the caller for the
+    /// next one instead of inventing it.
+    ///
+    /// Distinct from [`Self::Registration`] because only this failure is
+    /// answerable: the server objected to the *name*, so a different name is a
+    /// complete fix, whereas a rejected credential or an unusable capability
+    /// set is not. Nothing was published either way.
+    #[error("no requested nickname was available: {message}")]
+    NicknameUnavailable {
+        /// Safe server explanation of the last rejection.
+        message: String,
+        /// Ordered nickname candidates the server refused.
+        attempted_nicknames: Vec<String>,
+    },
+
     /// A bounded operation exceeded its deadline.
     #[error("operation timed out: {0}")]
     TimedOut(String),
@@ -128,7 +144,7 @@ impl GatewayError {
             Self::InvalidMessage(_) => ErrorKind::Validation,
             Self::ResourceLimit(_) => ErrorKind::ResourceLimit,
             Self::NotConnected(_) => ErrorKind::NotConnected,
-            Self::Registration { .. } => ErrorKind::Registration,
+            Self::Registration { .. } | Self::NicknameUnavailable { .. } => ErrorKind::Registration,
             Self::TimedOut(_) => ErrorKind::TimedOut,
             Self::Indeterminate(_) => ErrorKind::Indeterminate,
             Self::Dcc(_) => ErrorKind::Dcc,
@@ -141,7 +157,10 @@ impl GatewayError {
     pub const fn retriable(&self) -> bool {
         matches!(
             self,
-            Self::ResourceLimit(_)
+            // A name the server refused is worth asking for again with a
+            // different one; nothing was published, so nothing is at risk.
+            Self::NicknameUnavailable { .. }
+                | Self::ResourceLimit(_)
                 | Self::NotConnected(_)
                 | Self::TimedOut(_)
                 | Self::Tls(_)

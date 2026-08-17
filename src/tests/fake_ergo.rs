@@ -29,6 +29,15 @@ use crate::{
     irc::wire::WireMessage,
 };
 
+/// Channel this server protects with a key, so a join without one collects the
+/// real `ERR_BADCHANNELKEY` an MCP caller has to answer.
+pub(super) const KEYED_CHANNEL: &str = "#locked";
+
+/// The key [`KEYED_CHANNEL`] accepts. Anything else is refused identically to
+/// no key at all, which is what makes "wrong key" and "missing key"
+/// distinguishable only by what the call itself carried.
+pub(super) const CHANNEL_KEY: &str = "sesame";
+
 pub(super) struct FakeErgo {
     pub(super) address: SocketAddr,
     pub(super) client_lines: broadcast::Sender<String>,
@@ -118,7 +127,7 @@ async fn serve_client(
             "CAP" if message.params.first().is_some_and(|value| value == "LS") => {
                 write_line(
                     &mut writer,
-                    ":fake CAP * LS :batch cap-notify draft/chathistory echo-message labeled-response message-tags server-time standard-replies",
+                    ":fake CAP * LS :batch cap-notify draft/chathistory draft/message-redaction echo-message labeled-response message-tags server-time standard-replies",
                 )
                 .await;
             }
@@ -236,10 +245,49 @@ async fn serve_client(
             "JOIN" => {
                 let channel = message.params.first().map_or("#test", String::as_str);
                 let tag = label_prefix(&message);
+                let target = nickname.as_deref().unwrap_or("guest");
+                // One keyed channel, refused with the numeric a real server
+                // sends, so the key round trip has something authentic to fail
+                // against before it succeeds.
+                if channel.eq_ignore_ascii_case(KEYED_CHANNEL)
+                    && message.params.get(1).map(String::as_str) != Some(CHANNEL_KEY)
+                {
+                    write_line(
+                        &mut writer,
+                        &format!("{tag}:fake 475 {target} {channel} :Cannot join channel (+k)"),
+                    )
+                    .await;
+                } else {
+                    write_line(
+                        &mut writer,
+                        &format!("{tag}:{target}!guest@localhost JOIN {channel}"),
+                    )
+                    .await;
+                }
+            }
+            "KICK" => {
+                let channel = message.params.first().map_or("#test", String::as_str);
+                let removed = message.params.get(1).map_or("someone", String::as_str);
+                let reason = message.trailing.as_deref().unwrap_or("");
+                let tag = label_prefix(&message);
                 write_line(
                     &mut writer,
                     &format!(
-                        "{tag}:{}!guest@localhost JOIN {channel}",
+                        "{tag}:{}!guest@localhost KICK {channel} {removed} :{reason}",
+                        nickname.as_deref().unwrap_or("guest")
+                    ),
+                )
+                .await;
+            }
+            "REDACT" => {
+                let target = message.params.first().map_or("#test", String::as_str);
+                let message_id = message.params.get(1).map_or("msgid", String::as_str);
+                let reason = message.trailing.as_deref().unwrap_or("");
+                let tag = label_prefix(&message);
+                write_line(
+                    &mut writer,
+                    &format!(
+                        "{tag}:{}!guest@localhost REDACT {target} {message_id} :{reason}",
                         nickname.as_deref().unwrap_or("guest")
                     ),
                 )
@@ -467,10 +515,19 @@ async fn maybe_welcome(
     write_line(writer, &format!(":fake 376 {nickname} :End of MOTD")).await;
 }
 
+/// Write one line, tolerating a client that has already gone.
+///
+/// A guest that abandons its registration — the caller asking about a refused
+/// nickname rather than accepting a substitute — closes the socket in the middle
+/// of the exchange. That is ordinary client behavior, not a fixture failure, so
+/// the half-written reply is dropped rather than turned into a panic in a
+/// background task.
 async fn write_line(writer: &mut tokio::net::tcp::OwnedWriteHalf, line: &str) {
-    writer.write_all(line.as_bytes()).await.expect("fake write");
-    writer.write_all(b"\r\n").await.expect("fake CRLF");
-    writer.flush().await.expect("fake flush");
+    if writer.write_all(line.as_bytes()).await.is_err() || writer.write_all(b"\r\n").await.is_err()
+    {
+        return;
+    }
+    let _ = writer.flush().await;
 }
 
 fn label_prefix(message: &WireMessage) -> String {

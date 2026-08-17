@@ -285,6 +285,14 @@ A request that declared no elicitation support gets a structured error instead o
 a question, carrying `receive_roots` and `default_destination_path` so its next
 attempt can name both explicitly.
 
+A caller that also declared the tasks extension gets this question *before* any
+task exists: an accept that still needs a destination answers `input_required`
+with no task handle, and the handle appears on the retry that settles it. The
+rules this exchange shares with the gateway's other input round trips — stable
+keys, re-asking a partial answer, in-band refusals, and the `requestState`
+posture — are in
+[MCP_API.md](MCP_API.md#input-round-trips).
+
 ### Acceptance and conflict behavior
 
 `fail` leaves the existing file untouched and the session fails before writing

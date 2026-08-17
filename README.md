@@ -36,6 +36,12 @@ connection, state snapshot, and bounded event stream.
 - Bounded in-memory queues, journals, collectors, and DCC sessions.
 - Progress notifications for the calls that block longest — connect reports each
   registration stage, history reports each phase of a playback.
+- Time-bounded decisions asked as MCP input round trips rather than guessed:
+  where an incoming file lands, which nickname to register when the server
+  refuses one, a channel's key on `ERR_BADCHANNELKEY`, and — where an operator
+  enables it — a human confirmation before a kick or a redaction. Every question
+  is opt-in per request, declinable, and integrity-protected; headless callers
+  keep the existing behavior.
 - Direct DCC CHAT and streamed DCC SEND, including reverse connections and
   resume negotiation; file transfers run as MCP tasks for clients that declare
   the tasks extension, with task handles bound to the caller that created them.

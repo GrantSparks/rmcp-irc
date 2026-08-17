@@ -84,7 +84,7 @@ pub const TOOL_NAMES: &[&str] = &[
 ];
 
 /// Input for initial guest registration.
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectInput {
     /// Mythological-character nickname chosen by the MCP client.
@@ -92,7 +92,10 @@ pub struct ConnectInput {
     /// Ordered caller-supplied mythological fallbacks.
     #[serde(default)]
     pub nickname_fallbacks: Vec<Nickname>,
-    /// Nickname collision behavior: `suffix` (default) or `fail`.
+    /// Nickname collision behavior: `suffix` (default), `fail`, or `elicit`.
+    /// `elicit` abandons the attempt on the first rejection and returns an
+    /// `input_required` question asking which nickname to register instead; it
+    /// requires a request that declared form elicitation.
     #[serde(default)]
     pub nick_conflict_policy: NickConflictPolicy,
     /// Optional IRC username override.
@@ -108,6 +111,17 @@ pub struct ConnectInput {
     /// lossless MOTD inline. The linked MOTD resource is always complete.
     #[serde(default)]
     pub result_detail: ToolResultDetail,
+}
+
+impl ConnectInput {
+    /// The arguments a request state is bound to.
+    ///
+    /// The whole call. A retry re-sends its original arguments unchanged, so a
+    /// caller that altered one of these is starting a different registration
+    /// and must not redeem the state minted for the first.
+    pub fn salient(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
 }
 
 /// Successful initial guest registration.
@@ -213,14 +227,16 @@ pub struct StatusOutput {
 }
 
 /// Join one channel.
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct JoinInput {
     /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
     /// Case-preserved channel name.
     pub channel: ChannelName,
-    /// Optional channel key.
+    /// Optional channel key. Omitting it for a keyed channel is answered with
+    /// an `input_required` question when the request declared form
+    /// elicitation, and with the structured rejection otherwise.
     pub key: Option<String>,
     /// Milliseconds to wait for completion. Must be between 1 and the
     /// configured maximum, 30000 by default; anything else is rejected.
@@ -230,6 +246,17 @@ pub struct JoinInput {
     /// semantic projection; `compact` sets the duplicate projection to null.
     #[serde(default = "default_full_result_detail")]
     pub result_detail: ToolResultDetail,
+}
+
+impl JoinInput {
+    /// The arguments a request state is bound to.
+    ///
+    /// The whole call, including the absent `key` that made the question
+    /// necessary: a retry that supplied one directly is a different join and
+    /// has no exchange to resume.
+    pub fn salient(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
 }
 
 /// Join result with a stable channel resource link.
@@ -873,7 +900,7 @@ pub struct AwaySetOutput {
 }
 
 /// Remove one member from a channel.
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct KickInput {
     /// Opaque handle returned by `irc.connect`.
@@ -891,6 +918,26 @@ pub struct KickInput {
     /// Amount of duplicate wire/semantic detail retained in `result`.
     #[serde(default = "default_full_result_detail")]
     pub result_detail: ToolResultDetail,
+}
+
+impl KickInput {
+    /// The arguments a request state is bound to.
+    pub fn salient(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// The action a caller is asked to confirm, in the words of its effect.
+    pub fn action(&self) -> String {
+        let reason = self
+            .reason
+            .as_deref()
+            .filter(|reason| !reason.is_empty())
+            .map_or_else(String::new, |reason| format!(" (reason: {reason})"));
+        format!(
+            "kick {} from {} as agent {}{reason}",
+            self.nickname, self.channel, self.agent_id
+        )
+    }
 }
 
 /// Typed KICK result.
@@ -1067,7 +1114,7 @@ pub struct ReactionUpdateOutput {
 }
 
 /// Redact one message through negotiated IRCv3 message redaction.
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageRedactInput {
     /// Opaque handle returned by `irc.connect`.
@@ -1085,6 +1132,26 @@ pub struct MessageRedactInput {
     /// Amount of duplicate wire/semantic detail retained in `result`.
     #[serde(default = "default_full_result_detail")]
     pub result_detail: ToolResultDetail,
+}
+
+impl MessageRedactInput {
+    /// The arguments a request state is bound to.
+    pub fn salient(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// The action a caller is asked to confirm, in the words of its effect.
+    pub fn action(&self) -> String {
+        let reason = self
+            .reason
+            .as_deref()
+            .filter(|reason| !reason.is_empty())
+            .map_or_else(String::new, |reason| format!(" (reason: {reason})"));
+        format!(
+            "redact message {} in {} as agent {}{reason}",
+            self.message_id, self.target, self.agent_id
+        )
+    }
 }
 
 /// Typed message-redaction result.

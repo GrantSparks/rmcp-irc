@@ -1,8 +1,11 @@
 //! Stable MCP service, tool schemas, and resource URI templates.
 
 pub mod authorization;
+pub mod confirm_action;
+pub mod connect_nickname;
 pub mod conversation;
 pub mod dcc_accept;
+pub mod join_key;
 pub mod mrtr;
 pub mod progress;
 pub mod request_profile;

@@ -1,9 +1,9 @@
 # Configuration reference
 
 `rmcp-irc` reads one TOML file describing the shared Ergo endpoint, onboarding
-defaults, operational bounds, reconnect policy, and DCC environment. It does
-not define persistent guest agents: every identity is created dynamically by
-`irc.connect` and exists only in memory.
+defaults, operational bounds, reconnect policy, MCP surface policy, and DCC
+environment. It does not define persistent guest agents: every identity is
+created dynamically by `irc.connect` and exists only in memory.
 
 Unknown fields are rejected. All omitted fields use the defaults below, and
 the complete configuration is validated before either MCP transport starts.
@@ -138,6 +138,36 @@ including CRLF. After discovery, the effective outbound limit is the smaller
 of the server-advertised limit and `max_line_bytes`; absent advertisement keeps
 the traditional limit. The configured ceiling also bounds inbound framing so a
 server cannot force unbounded allocation.
+
+## `[mcp]`: MCP surface policy
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `confirm_destructive` | boolean | `false` | Require an answered confirmation before `irc.kick` or `irc.message.redact` is written upstream. |
+
+Off by default, so existing deployments behave exactly as before: both tools
+apply immediately, and a client that declares elicitation does not acquire a
+question because of it.
+
+Enabled, each of those two calls first returns an MCP `input_required`
+confirmation stating the exact action — agent, channel or conversation, nickname
+or message id, and reason — and applies nothing until an answered `confirm: true`
+arrives on the retry. A declined answer, an unfilled box, an expired or altered
+`requestState`, and a client that simply never retries all leave the channel
+untouched.
+
+The gate is enforced rather than best effort: with the setting on, a request that
+declared no form-mode elicitation is **refused** with kind
+`confirmation_required` instead of being served. The setting exists because an
+operator decided a person must approve these mutations, and proceeding when
+there is nobody to ask would delete that policy while appearing to honor it. A
+deployment that wants unattended kicks and redactions should leave the setting
+off rather than rely on the capability being absent.
+
+Nothing else on the MCP surface is configurable here. The `irc.dcc.accept`
+destination, `irc.connect` nickname, and `irc.join` channel-key round trips are
+either inherent to the call's own arguments or opt-in per call, and are described
+in [MCP_API.md](MCP_API.md#input-round-trips).
 
 ## `[dcc]`: direct peer networking and files
 

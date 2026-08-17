@@ -36,8 +36,8 @@ use std::time::Duration;
 use rmcp::{
     ErrorData as McpError,
     model::{
-        ElicitRequest, ElicitRequestParams, ElicitationSchema, InputRequest, RequestStateCodec,
-        RequestStateError, SealOptions,
+        ElicitRequest, ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationSchema,
+        InputRequest, InputResponses, RequestStateCodec, RequestStateError, SealOptions,
     },
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -224,6 +224,67 @@ pub fn form_elicitation(
     ))
 }
 
+/// What a client said about one form this server asked it to fill in.
+///
+/// The three cases are genuinely different outcomes and every flow has to
+/// distinguish them: a missing answer means ask again, a refusal is terminal
+/// and leaves the operation unapplied, and only an acceptance carries content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormAnswer {
+    /// No response carried this round's key.
+    Missing,
+    /// The caller declined or cancelled the question.
+    Declined,
+    /// The caller filled the form in; its content is here, possibly empty.
+    Accepted(serde_json::Value),
+}
+
+/// Read one client answer out of a retry's `inputResponses`.
+///
+/// # Errors
+///
+/// A response that is not an elicitation result at all is malformed, which the
+/// specification classifies as an ordinary protocol error rather than another
+/// round of asking.
+pub fn read_form_answer(
+    responses: Option<&InputResponses>,
+    key: &str,
+) -> Result<FormAnswer, McpError> {
+    let Some(value) = responses.and_then(|responses| responses.get(key)) else {
+        return Ok(FormAnswer::Missing);
+    };
+    let result: ElicitResult = serde_json::from_value(value.clone()).map_err(|error| {
+        McpError::invalid_params(
+            format!("{key} response is not an elicitation result: {error}"),
+            None,
+        )
+    })?;
+    if result.action != ElicitationAction::Accept {
+        return Ok(FormAnswer::Declined);
+    }
+    Ok(FormAnswer::Accepted(
+        result.content.unwrap_or(serde_json::Value::Null),
+    ))
+}
+
+/// One non-blank string field of a filled-in form.
+///
+/// Blank is absent rather than a value spelled with spaces, because a form
+/// control a person tabbed through must not read as an answer.
+pub fn text_field(content: &serde_json::Value, field: &str) -> Option<String> {
+    content
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// One boolean field of a filled-in form.
+pub fn bool_field(content: &serde_json::Value, field: &str) -> Option<bool> {
+    content.get(field).and_then(serde_json::Value::as_bool)
+}
+
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
@@ -395,6 +456,54 @@ mod tests {
     fn the_key_is_never_printed() {
         let rendered = format!("{:?}", RequestStateSealer::generate());
         assert!(!rendered.contains("key"), "{rendered}");
+    }
+
+    #[test]
+    fn an_answer_is_read_only_under_the_key_it_was_asked_for() {
+        assert_eq!(
+            read_form_answer(None, "a").expect("none"),
+            FormAnswer::Missing
+        );
+        let responses = InputResponses::from([(
+            "a".to_owned(),
+            serde_json::json!({ "action": "accept", "content": { "text": " ", "yes": true } }),
+        )]);
+        assert_eq!(
+            read_form_answer(Some(&responses), "b").expect("other key"),
+            FormAnswer::Missing
+        );
+        let FormAnswer::Accepted(content) =
+            read_form_answer(Some(&responses), "a").expect("accepted")
+        else {
+            panic!("an accepted answer carries content");
+        };
+        assert_eq!(text_field(&content, "text"), None, "blank is not an answer");
+        assert_eq!(bool_field(&content, "yes"), Some(true));
+        assert_eq!(bool_field(&content, "missing"), None);
+
+        for refusal in ["decline", "cancel"] {
+            assert_eq!(
+                read_form_answer(
+                    Some(&InputResponses::from([(
+                        "a".to_owned(),
+                        serde_json::json!({ "action": refusal }),
+                    )])),
+                    "a",
+                )
+                .expect("refusal"),
+                FormAnswer::Declined
+            );
+        }
+        assert!(
+            read_form_answer(
+                Some(&InputResponses::from([(
+                    "a".to_owned(),
+                    serde_json::json!("not an elicitation result"),
+                )])),
+                "a",
+            )
+            .is_err()
+        );
     }
 
     #[test]

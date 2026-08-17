@@ -24,10 +24,7 @@ use std::path::PathBuf;
 
 use rmcp::{
     ErrorData as McpError,
-    model::{
-        ElicitResult, ElicitationAction, ElicitationSchema, EnumSchema, InputRequest,
-        InputRequests, InputResponses,
-    },
+    model::{ElicitationSchema, EnumSchema, InputRequest, InputRequests, InputResponses},
 };
 use serde::{Deserialize, Serialize};
 
@@ -38,7 +35,10 @@ use crate::{
         session::{DccKind, DccSession, DccSessionId},
         transfer::DestinationConflict,
     },
-    mcp::{mrtr::form_elicitation, tools::DccAcceptInput},
+    mcp::{
+        mrtr::{FormAnswer, form_elicitation, read_form_answer, text_field},
+        tools::DccAcceptInput,
+    },
 };
 
 /// Key the destination question is filed under within one MRTR round.
@@ -144,33 +144,14 @@ impl PendingAccept {
 /// A response that is not an elicitation result at all is malformed, which the
 /// specification says is an ordinary protocol error rather than another round.
 pub fn read_answer(responses: Option<&InputResponses>) -> Result<Answer, McpError> {
-    let Some(value) = responses.and_then(|responses| responses.get(DESTINATION_INPUT)) else {
-        return Ok(Answer::Missing);
-    };
-    let result: ElicitResult = serde_json::from_value(value.clone()).map_err(|error| {
-        McpError::invalid_params(
-            format!("{DESTINATION_INPUT} response is not an elicitation result: {error}"),
-            None,
-        )
-    })?;
-    if result.action != ElicitationAction::Accept {
-        return Ok(Answer::Declined);
-    }
-    let content = result.content.unwrap_or(serde_json::Value::Null);
-    Ok(Answer::Chosen(DestinationChoice {
-        root: text(&content, "root"),
-        path: text(&content, "destination_path").map(PathBuf::from),
-    }))
-}
-
-/// One non-empty string field of an elicitation's content.
-fn text(content: &serde_json::Value, field: &str) -> Option<String> {
-    content
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+    Ok(match read_form_answer(responses, DESTINATION_INPUT)? {
+        FormAnswer::Missing => Answer::Missing,
+        FormAnswer::Declined => Answer::Declined,
+        FormAnswer::Accepted(content) => Answer::Chosen(DestinationChoice {
+            root: text_field(&content, "root"),
+            path: text_field(&content, "destination_path").map(PathBuf::from),
+        }),
+    })
 }
 
 /// Decide what an acceptance still needs, given whatever the caller has said so

@@ -79,6 +79,8 @@ The structured tool-error envelope contains `kind`, safe `message`, and
 | `dcc_error` | Direct-session negotiation, state, socket, or file handling failed. | Depends on the session state. |
 | `io_error` | TCP, TLS, or filesystem I/O failed. | Usually retriable after external recovery. |
 | `actor_stopped` | The owning actor terminated before replying. | Reconnect a new agent. |
+| `declined` | A question this call asked was declined or cancelled. Nothing was applied. | Call again and answer it. |
+| `confirmation_required` | `mcp.confirm_destructive` is enabled and the mutation was not confirmed, could not be asked about, or presented an unusable `requestState`. Nothing was applied. | Answer the confirmation, or declare form elicitation. |
 
 `not_written`, `sent_unconfirmed`, `rejected`, `timed_out`, and `indeterminate`
 are command outcomes, not error-envelope kinds. A rejected or timed-out
@@ -143,6 +145,99 @@ resources, `irc.join` and typed channel mutations link the affected channel,
 and DCC tools link the live DCC-session resource. A resource link describes
 live state; it is not a copy of the snapshot at tool-completion time.
 
+## Input round trips
+
+Four operations can reach a point where the server genuinely cannot proceed on
+its own. Each answers with an MCP 2026-07-28 multi round-trip
+`input_required` result instead of a normal one, and the client answers and
+re-sends the same call. There is no other elicitation path: this server never
+initiates a request, because in this revision an input request exists only
+inside an active client request.
+
+| Flow | Trigger | Input key | Answer field | Enabled by |
+| --- | --- | --- | --- | --- |
+| `irc.dcc.accept` destination | Several `dcc.receive_roots` configured and the call named none | `dcc_destination` | `root` (enum), `destination_path` (string) | Always |
+| `irc.connect` nickname | The server refused every requested name and `nick_conflict_policy` is `elicit` | `connect_nickname` | `nickname` (string) | Opt-in per call |
+| `irc.join` channel key | The join was refused by `ERR_BADCHANNELKEY` (475) and carried no `key` | `channel_key` | `key` (string) | Always |
+| Destructive confirmation | `irc.kick` or `irc.message.redact` with `mcp.confirm_destructive` enabled | `destructive_confirmation` | `confirm` (boolean) | Configuration, default off |
+
+Common rules:
+
+- **Only for a client that declared it.** Every question is form mode, and the
+  server sends one only when the request's `_meta` client capabilities declare
+  `elicitation`. A request that did not gets the flow's fallback instead — a
+  structured error, the ordinary rejection, or a refusal — never a question it
+  cannot answer.
+- **Keys are stable.** The four names above are part of the wire contract and do
+  not change; a client keys its `inputResponses` by them.
+- **Missing or partial answers are asked again.** A retry that echoes the state
+  but answers nothing, or leaves the field blank, receives a fresh
+  `input_required` rather than an error, as the specification requires.
+- **Declining is terminal and applies nothing.** `action: "decline"` or
+  `"cancel"`, and an explicit `confirm: false`, return an `isError` result with
+  kind `declined`. Nothing was sent upstream and nothing was written.
+- **Every refusal is in band.** A bad, expired, or foreign `requestState` is a
+  tool result with `isError: true`, never a JSON-RPC error, and leaves the
+  underlying state unapplied.
+- **Tasks resolve input first.** `irc.dcc.accept` is task-augmented. When a
+  question is outstanding, the call answers with `input_required` and **no task
+  is created**; the task handle appears only once the answer settles the call.
+  A task handle is returned after the originating stream closes, so a question
+  raised inside a task would have nowhere to be asked.
+
+One exchange in full, using the channel key:
+
+```json
+{"jsonrpc":"2.0","id":7,"result":{
+  "resultType":"input_required",
+  "inputRequests":{
+    "channel_key":{"method":"elicitation/create","params":{
+      "mode":"form",
+      "message":"#ops needs a key and the join did not carry one. The server said: Cannot join channel (+k). Supply the key to join, or decline to leave the channel unjoined.",
+      "requestedSchema":{
+        "type":"object",
+        "properties":{"key":{"type":"string","title":"Channel key","description":"Key this channel requires. Sent as the JOIN key parameter."}},
+        "required":["key"]}}}},
+  "requestState":"rs1.…"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{
+  "name":"irc.join",
+  "arguments":{"agent_id":"agent-…","channel":"#ops"},
+  "inputResponses":{"channel_key":{"action":"accept","content":{"key":"hunter2"}}},
+  "requestState":"rs1.…"}}
+```
+
+Form mode carries **no secret masking**. A channel key is an ordinary string
+property and the host renders it like any other; treat it as visible to whoever
+sees the prompt, and do not use this flow for values that must not appear on a
+screen or in a client log.
+
+### `requestState` security posture
+
+`requestState` is opaque and must be echoed byte-for-byte and never inspected or
+modified. Server-side it is treated as attacker-controlled input and is
+integrity-protected with an HMAC over a process-local key, binding:
+
+1. the **authenticated caller**, so one owner's state never opens for another;
+2. a **short expiry** (120 seconds), so a captured value is worthless later;
+3. the **originating operation** — the method, the tool name, and the exact
+   arguments of the call that minted it — so an answer cannot be replayed into a
+   different call, or into the same call with altered arguments.
+
+All three live in HMAC associated data rather than in the token, so opening
+requires the server to re-derive them from the retry it is actually holding, and
+the token itself carries no readable detail. Each flow additionally re-checks
+what the question was about: the offer's peer and filename, the channel name, or
+the exact action summary that was displayed.
+
+Verification failure is refused in band, and expiry says so distinctly
+("request state has expired; start the operation again") because a caller can
+recover from it by starting the exchange over. The key is generated per process,
+so a restart invalidates outstanding state — correct, since the in-memory work it
+referred to did not survive either.
+
 ## Long-running work: progress and tasks
 
 Two distinct mechanisms cover two distinct situations. Progress narrates work
@@ -191,6 +286,11 @@ client-supplied TTL. `irc.dcc.send` and `irc.dcc.accept` are answered with a
 ordinary synchronous result when it does not. Calling `tasks/get`, `tasks/update`,
 or `tasks/cancel` without declaring the extension is a
 `MissingRequiredClientCapability` error (`-32021`).
+
+**Input first.** An outstanding question is settled before any task exists. An
+`irc.dcc.accept` that still needs a destination answers with `input_required` and
+creates no task, whatever the request declared; the task handle appears on the
+retry that settles it. See [Input round trips](#input-round-trips).
 
 **Owner binding.** A task belongs to the caller that created it. `tasks/get`,
 `tasks/update`, and `tasks/cancel` resolve the caller the same way every other
@@ -243,7 +343,7 @@ Input:
 | --- | --- | --- | --- |
 | `nickname` | string | yes | Caller-chosen mythological-character nickname. The social convention is described, not validated against a local catalog. |
 | `nickname_fallbacks` | string array | no | Ordered caller-supplied fallback names. |
-| `nick_conflict_policy` | `suffix` or `fail` | no | Defaults to `suffix`. |
+| `nick_conflict_policy` | `suffix`, `fail`, or `elicit` | no | Defaults to `suffix`. `elicit` asks the caller which name to register instead; see below. |
 | `username` | string | no | Overrides the configured guest username template. |
 | `real_name` | string | no | Overrides the configured real-name template. |
 | `channels` | string array | no | Initial channels in addition to configured defaults. |
@@ -259,6 +359,30 @@ Candidates are attempted in this order:
 1. requested nickname;
 2. caller-supplied fallbacks in order;
 3. bounded suffixed forms of the requested nickname when policy is `suffix`.
+
+`elicit` generates no candidates of its own, exactly like `fail`. When the
+server refuses every candidate with a retriable nickname numeric (433, 436, or
+437), the attempt is abandoned — the provisional actor stops, releases its
+capacity, and publishes no handle — and the tool returns an `input_required`
+question under the key `connect_nickname` naming the refused candidates, the
+server's own explanation, and the names a `suffix` policy would have taken, with
+the first of those as the field default. The field is a free string, not an
+enum: a caller choosing an identity must not be confined to a generated list.
+
+Answering and retrying makes a **fresh registration attempt** with the chosen
+name — a new connection, new capability negotiation, new MOTD — because the
+abandoned attempt kept nothing. A chosen name that collides in turn is asked
+about again. Declining connects nothing and returns kind `declined`.
+
+`elicit` on a request that declared no form elicitation is a deterministic
+in-band error before anything is attempted: the policy cannot be honored, and
+silently suffixing would register an identity the caller did not choose. Use
+`suffix` or `fail`, or declare the capability. `suffix` and `fail` behave exactly
+as they always have, so headless flows never see a question.
+
+Nickname collisions during a *reconnect* are never asked about — there is no
+client request to ask inside — and are retried by the backoff loop as any other
+reconnect failure is.
 
 When the server has advertised `NICKLEN`, generated candidates are trimmed at
 UTF-8 boundaries to that exact limit and revalidated. On an initial connection,
@@ -368,6 +492,24 @@ Input contains `agent_id`, `channel`, optional `key`, optional `timeout_ms`
 JOIN echo, labeled failure, or relevant error numeric. The result uses the
 common command envelope and adds the case-preserved channel and channel
 resource URI.
+
+One rejection is answerable rather than final: `ERR_BADCHANNELKEY` (475) on a
+call that carried no `key`. If the request declared form elicitation, the tool
+returns an `input_required` question under the key `channel_key` naming the
+channel and repeating the server's reason, and the retry re-issues the JOIN with
+the answer. Everything else is unchanged — invite-only (473), banned (474), full
+(471), and every other refusal is a decision about the guest that no answer would
+alter, and a key that was supplied and still refused is a wrong key, not a
+missing one. In all of those cases, and for any request that declared no
+elicitation, the result is exactly the structured rejection it has always been,
+with the raw numeric retained in `replies`.
+
+This flow has no configuration switch. It happens only inside a join the caller
+already asked for, asks for exactly the argument the tool already accepts, is
+offered only to a request that declared it can answer, and can be declined — so a
+flag would be a second, less discoverable way of saying "do not declare
+elicitation". Note that form mode has no secret masking; see
+[Input round trips](#input-round-trips).
 
 ### `irc.part`
 
@@ -488,14 +630,35 @@ Typed mutation tools are:
 | `irc.topic.set` | Set or clear a topic; returns the affected channel, confirmed/requested topic, metadata, command result, and channel link. |
 | `irc.nick.set` | Change this guest's nickname; returns the command envelope with the requested nickname. |
 | `irc.away.set` | Set an away message, or clear away state by omitting/emptying it. |
-| `irc.kick` | Remove one nickname from a channel, with an optional reason and channel link. |
+| `irc.kick` | Remove one nickname from a channel, with an optional reason and channel link. Gated by `mcp.confirm_destructive`. |
 | `irc.invite` | Invite one nickname to one channel and return the channel link. |
 | `irc.monitor.update` | Add/remove nicknames or clear the server-side MONITOR list; rejects the call unless ISUPPORT advertises `MONITOR`. |
 | `irc.mode.set` | Apply a `+`/`-` user or channel mode change with validated ordered arguments and an optional channel link. |
 | `irc.reaction.update` | Add/remove a `+draft/react` reaction using the referenced `msgid`; requires `message-tags` and rejects tags blocked by `CLIENTTAGDENY`. |
-| `irc.message.redact` | Send `REDACT` with an optional caller-supplied reason; requires negotiated `message-redaction` and `message-tags`. |
+| `irc.message.redact` | Send `REDACT` with an optional caller-supplied reason; requires negotiated `message-redaction` and `message-tags`. Gated by `mcp.confirm_destructive`. |
 | `irc.read.set` | Advance the server's synchronized marker to a typed RFC 3339 timestamp from a previously received `time` tag. |
 | `irc.typing.set` | Publish `active`, `paused`, or `done` with `+typing`; requires `message-tags`, honors `CLIENTTAGDENY`, and enforces the IRCv3 three-second per-target throttle. |
+
+#### Confirming destructive mutations
+
+`irc.kick` and `irc.message.redact` are the two mutations whose effect other
+people see and nobody can undo. With `mcp.confirm_destructive` enabled — off by
+default, so nothing changes for existing deployments — each first returns an
+`input_required` question under the key `destructive_confirmation`, whose message
+states the exact action (agent, channel or conversation, nickname or message id,
+and reason) and whose single required `confirm` boolean is the decision. The IRC
+command is written only after an answered `true`; `false`, a declined form, an
+unfilled box, an expired or forged `requestState`, and a client that never
+retries all leave the channel untouched. Argument validation and capability
+checks run *before* the question, so nobody is asked to approve a call that was
+never going to reach the server, and the confirmed arguments are the checked
+ones.
+
+With the setting enabled and a request that declared no form elicitation, the
+call is **refused** with kind `confirmation_required` rather than served. The
+setting exists because an operator decided a person must approve these two
+mutations; proceeding when there is nobody to ask would delete that policy while
+appearing to honor it.
 
 `irc.read.get` is the corresponding typed read-only read-marker query. Its
 result returns the server-confirmed timestamp or `null` when the server reports
@@ -709,7 +872,13 @@ an integrity-protected `requestState`. The client answers and retries the same
 call with `inputResponses` and the echoed `requestState`; see
 [DCC.md](DCC.md) for the full wire example, the validation applied to an answer,
 what a declined answer returns, and the structured `receive_roots` error a
-request that declared no elicitation support gets instead.
+request that declared no elicitation support gets instead, and
+[Input round trips](#input-round-trips) for the rules every such exchange shares.
+
+A task-augmented call resolves that question first: a request that declares the
+tasks extension and still needs a destination receives the `input_required`
+result with **no task created**, and gets its task handle on the retry that
+settles the destination.
 
 Successful output is a `DccSessionOutput` whose session carries `receive_root`
 and `receive_path` — the chosen root name and the root-relative destination —

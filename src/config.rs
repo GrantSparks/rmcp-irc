@@ -26,6 +26,8 @@ pub struct Config {
     pub limits: GatewayLimits,
     /// Direct-client-to-client networking configuration.
     pub dcc: DccConfig,
+    /// Policy for the MCP surface itself, rather than for IRC.
+    pub mcp: McpConfig,
 }
 
 impl Config {
@@ -425,6 +427,22 @@ impl Default for ReconnectConfig {
             jitter: 0.2,
         }
     }
+}
+
+/// Policy for how the MCP surface behaves, independently of IRC.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    /// Require an explicit human confirmation before `irc.kick` or
+    /// `irc.message.redact` takes effect.
+    ///
+    /// Off by default, because a gateway that asks a question its caller cannot
+    /// answer is a gateway whose destructive tools do not work. Turning it on
+    /// is an operator decision that a person — not a model — approves each of
+    /// those two mutations, and it is enforced by refusing the call when the
+    /// request declared no way to answer: silently proceeding would defeat the
+    /// only reason the setting exists.
+    pub confirm_destructive: bool,
 }
 
 /// Bounded resources owned by the process or one agent actor.

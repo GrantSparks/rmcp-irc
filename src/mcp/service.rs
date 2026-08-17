@@ -41,16 +41,17 @@ use crate::{
         journal::{EventClass, EventCursor, EventFilter, EventOrigin},
     },
     dcc::session::{DccDirection, DccSession, DccSessionId, DccState},
-    error::GatewayError,
+    error::{ErrorKind, GatewayError},
     gateway::{ConnectRequest, ConversationWindow, Gateway},
     irc::{
         capabilities::CapabilityStatus,
         correlation::{CommandOutcome, CommandResult},
+        registration::{NickConflictPolicy, Nickname},
         wire::{OutboundMessage, Tag},
     },
     mcp::{
         authorization::{CallerPolicy, OwnerId},
-        dcc_accept,
+        confirm_action, connect_nickname, dcc_accept, join_key,
         mrtr::OriginatingOperation,
         progress::ProgressReporter,
         request_profile::RequestProfile,
@@ -114,7 +115,11 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_202
 /// its own request, and a task handle would replace a result the caller can use
 /// with a poll for one it already has. Its long wait is narrated with progress
 /// notifications instead.
-const TASK_AUGMENTED_TOOLS: &[&str] = &["irc.dcc.send", "irc.dcc.accept"];
+const TASK_AUGMENTED_TOOLS: &[&str] = &["irc.dcc.send", DCC_ACCEPT_TOOL];
+
+/// The one task-augmented tool that can also ask its caller a question, and so
+/// has to settle it before a task is created.
+const DCC_ACCEPT_TOOL: &str = "irc.dcc.accept";
 
 /// Status message a task-augmented DCC call starts with, before its session
 /// exists to describe.
@@ -216,7 +221,15 @@ impl IrcMcpService {
         vec![PromptMessage::new_text(
             Role::User,
             format!(
-                "Establish a new IRC collaboration session. {nickname} Call `irc.connect`, then read and follow the returned MOTD before participating. Read the auto-joined channel topic, announce a concise hello with real task/worktree scope, and preserve the returned `agent_id` and native resource links for subsequent operations. Do not invent account registration for an ephemeral guest."
+                "Establish a new IRC collaboration session. {nickname} Call `irc.connect`, then \
+                 read and follow the returned MOTD before participating. If you want to choose the \
+                 replacement yourself when the server refuses a name, pass \
+                 `nick_conflict_policy: \"elicit\"`: the call then returns an `input_required` \
+                 question instead of connecting, and you answer it and re-send the same call. \
+                 Otherwise the default bounded suffixing applies. Read the auto-joined channel \
+                 topic, announce a concise hello with real task/worktree scope, and preserve the \
+                 returned `agent_id` and native resource links for subsequent operations. Do not \
+                 invent account registration for an ephemeral guest."
             ),
         )]
     }
@@ -273,7 +286,14 @@ impl IrcMcpService {
         vec![PromptMessage::new_text(
             Role::User,
             format!(
-                "Using IRC agent `{}`, call `irc.join` for `{}`. Follow the returned native channel resource link, read the topic before sending messages, and treat it as channel-specific instruction. Read the recent transcript/history and known members to avoid duplicating active work, then announce relevant intent and subscribe to the channel's live resources when supported.",
+                "Using IRC agent `{}`, call `irc.join` for `{}`. If the channel is keyed, the call \
+                 comes back as an `input_required` question asking for the key rather than as a \
+                 failure: answer it and re-send the same call, or decline to leave the channel \
+                 unjoined. Follow the returned native channel resource link, read the topic before \
+                 sending messages, and treat it as channel-specific instruction. Read the recent \
+                 transcript/history and known members to avoid duplicating active work, then \
+                 announce relevant intent and subscribe to the channel's live resources when \
+                 supported.",
                 input.agent_id, input.channel
             ),
         )]
@@ -307,7 +327,10 @@ impl IrcMcpService {
     /// Register a guest and return the complete server MOTD before publishing its handle.
     #[tool(
         name = "irc.connect",
-        description = "Connect one mythologically named guest to the configured Ergo server.",
+        description = "Connect one mythologically named guest to the configured Ergo server. \
+                       With `nick_conflict_policy: \"elicit\"`, a nickname the server refuses \
+                       abandons the attempt and returns an input_required question asking which \
+                       name to register instead; answering and retrying makes a fresh attempt.",
         output_schema = schema_for_output::<ConnectOutput>(),
         annotations(
             title = "Connect IRC guest",
@@ -320,16 +343,49 @@ impl IrcMcpService {
         &self,
         Parameters(input): Parameters<ConnectInput>,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+        RequestState(request_state): RequestState,
+        InputResponses(responses): InputResponses,
+    ) -> Result<CallToolResponse, McpError> {
         let owner = self.callers.identify(&context)?;
+        let profile = RequestProfile::from_context(&context);
         let result_detail = input.result_detail;
-        let request = match connect_request(input) {
-            Ok(request) => request,
-            Err(error) => return Ok(tool_error(error)),
+        let asks = input.nick_conflict_policy == NickConflictPolicy::Elicit;
+        // Bound to the arguments as they arrived, so a retry that changed any of
+        // them is a different registration and cannot redeem this exchange.
+        let operation = OriginatingOperation::for_tool("irc.connect", &input.salient());
+
+        let chosen = match request_state.as_deref() {
+            Some(sealed) => match self.open_nickname_choice(
+                &owner,
+                &operation,
+                sealed,
+                responses.as_ref(),
+                &input,
+            )? {
+                Resolution::Ready(nickname) => Some(nickname),
+                Resolution::NeedsInput(request) => return Ok(request.into()),
+                Resolution::Settled(result) => return Ok(result.into()),
+            },
+            None => None,
         };
+        // A policy whose whole behavior is "ask" cannot be honored by a request
+        // that declared no way to answer, and quietly falling back to `suffix`
+        // would register a different identity than the caller asked for. Said
+        // before connecting, because there is nothing to undo yet.
+        if chosen.is_none() && asks && !profile.supports_form_elicitation() {
+            return Ok(refusal(
+                ErrorKind::Validation.as_str(),
+                "nick_conflict_policy \"elicit\" needs a request that declares form elicitation; \
+                 use \"suffix\" or \"fail\", or declare the elicitation capability",
+                false,
+            )
+            .into());
+        }
+
+        let request = connect_request(&input, chosen);
         Ok(
             match self
-                .connect_reporting_progress(owner, request, &context)
+                .connect_reporting_progress(owner.clone(), request, &context)
                 .await
             {
                 Ok(connected) => {
@@ -354,9 +410,24 @@ impl IrcMcpService {
                         )
                     };
                     let content = agent_resource_links(&output.resources);
-                    tool_success_with_content(summary, &output, content)
+                    tool_success_with_content(summary, &output, content).into()
                 }
-                Err(error) => tool_error(error),
+                // The one registration failure a caller can fix by answering.
+                // Nothing was published: the actor released its capacity permit
+                // and stopped when the attempt failed, so the retry starts from
+                // a clean gateway rather than resuming anything.
+                Err(GatewayError::NicknameUnavailable {
+                    message,
+                    attempted_nicknames,
+                }) if asks && profile.supports_form_elicitation() => {
+                    let pending = connect_nickname::PendingNickname {
+                        attempted: attempted_nicknames,
+                        detail: message,
+                    };
+                    self.ask_for_a_nickname(&owner, &operation, &pending, &input)?
+                        .into()
+                }
+                Err(error) => tool_error(error).into(),
             },
         )
     }
@@ -517,7 +588,10 @@ impl IrcMcpService {
     /// Join one channel and wait for a definitive reply when available.
     #[tool(
         name = "irc.join",
-        description = "Join one channel using the actor's correlated IRC command path.",
+        description = "Join one channel using the actor's correlated IRC command path. A join \
+                       refused by ERR_BADCHANNELKEY (475) with no `key` supplied returns an \
+                       input_required question asking for the key when the request declared form \
+                       elicitation; every other rejection is the ordinary structured result.",
         output_schema = schema_for_output::<JoinOutput>(),
         annotations(
             title = "Join channel",
@@ -526,13 +600,41 @@ impl IrcMcpService {
             open_world_hint = true
         )
     )]
-    async fn irc_join(&self, Parameters(input): Parameters<JoinInput>) -> CallToolResult {
+    async fn irc_join(
+        &self,
+        Parameters(input): Parameters<JoinInput>,
+        context: RequestContext<RoleServer>,
+        RequestState(request_state): RequestState,
+        InputResponses(responses): InputResponses,
+    ) -> Result<CallToolResponse, McpError> {
+        let owner = self.callers.identify(&context)?;
+        let profile = RequestProfile::from_context(&context);
         let result_detail = input.result_detail;
         if let Err(error) = validate_irc_atom(input.channel.as_str(), "channel") {
-            return tool_error(error);
+            return Ok(tool_error(error).into());
         }
+        // Bound to the arguments as they arrived — including the absent `key`
+        // that made the question necessary.
+        let operation = OriginatingOperation::for_tool("irc.join", &input.salient());
+
+        let key = match request_state.as_deref() {
+            Some(sealed) => {
+                match self.open_channel_key(
+                    &owner,
+                    &operation,
+                    sealed,
+                    responses.as_ref(),
+                    &input,
+                )? {
+                    Resolution::Ready(key) => Some(key),
+                    Resolution::NeedsInput(request) => return Ok(request.into()),
+                    Resolution::Settled(result) => return Ok(result.into()),
+                }
+            }
+            None => input.key.clone(),
+        };
         let mut params = vec![input.channel.to_string()];
-        if let Some(key) = input.key {
+        if let Some(key) = key.clone() {
             params.push(key);
         }
         match self
@@ -545,6 +647,17 @@ impl IrcMcpService {
             .await
         {
             Ok(result) => {
+                // One rejection, and only one, is answerable: the channel wants
+                // a key this call did not carry. Everything else is a decision
+                // about the guest that no answer would change, and is returned
+                // exactly as it always was.
+                if join_key::needs_key(&result, key.is_some())
+                    && profile.supports_form_elicitation()
+                {
+                    return Ok(self
+                        .ask_for_a_channel_key(&owner, &operation, &input, &result)?
+                        .into());
+                }
                 let failure = is_failure_outcome(result.outcome).then_some(result.outcome);
                 let outcome = result.outcome;
                 let result = command_result_for_detail(result, result_detail);
@@ -557,14 +670,15 @@ impl IrcMcpService {
                     output.resource.clone(),
                     output.channel.as_str(),
                 )];
-                command_tool_result_with_content(
+                Ok(command_tool_result_with_content(
                     format!("JOIN {}: {outcome:?}.", output.channel),
                     &output,
                     failure,
                     content,
                 )
+                .into())
             }
-            Err(error) => tool_error(error),
+            Err(error) => Ok(tool_error(error).into()),
         }
     }
 
@@ -1080,7 +1194,9 @@ impl IrcMcpService {
     /// Remove one member from a channel.
     #[tool(
         name = "irc.kick",
-        description = "Remove one nickname from a channel through a stable typed mutation.",
+        description = "Remove one nickname from a channel through a stable typed mutation. Where \
+                       `mcp.confirm_destructive` is enabled, the call first returns an \
+                       input_required confirmation and applies nothing until it is answered.",
         output_schema = schema_for_output::<KickOutput>(),
         annotations(
             title = "Kick channel member",
@@ -1089,7 +1205,28 @@ impl IrcMcpService {
             open_world_hint = true
         )
     )]
-    async fn irc_kick(&self, Parameters(input): Parameters<KickInput>) -> CallToolResult {
+    async fn irc_kick(
+        &self,
+        Parameters(input): Parameters<KickInput>,
+        context: RequestContext<RoleServer>,
+        RequestState(request_state): RequestState,
+        InputResponses(responses): InputResponses,
+    ) -> Result<CallToolResponse, McpError> {
+        let owner = self.callers.identify(&context)?;
+        let profile = RequestProfile::from_context(&context);
+        match self.confirm_destructive(
+            &owner,
+            &profile,
+            &OriginatingOperation::for_tool("irc.kick", &input.salient()),
+            &input.action(),
+            request_state.as_deref(),
+            responses.as_ref(),
+        )? {
+            Resolution::Ready(()) => {}
+            Resolution::NeedsInput(request) => return Ok(request.into()),
+            Resolution::Settled(result) => return Ok(result.into()),
+        }
+
         let channel = input.channel;
         let nickname = input.nickname;
         let resource = ResourceUris::channel(&input.agent_id, channel.as_str());
@@ -1118,14 +1255,15 @@ impl IrcMcpService {
                     resource: resource.clone(),
                     result: command_result_for_detail(result, input.result_detail),
                 };
-                command_tool_result_with_content(
+                Ok(command_tool_result_with_content(
                     format!("KICK: {outcome:?}."),
                     &output,
                     failure,
                     vec![channel_resource_link(resource, output.channel.as_str())],
                 )
+                .into())
             }
-            Err(error) => tool_error(error),
+            Err(error) => Ok(tool_error(error).into()),
         }
     }
 
@@ -1422,7 +1560,10 @@ impl IrcMcpService {
     /// Redact one message after exact capability negotiation.
     #[tool(
         name = "irc.message.redact",
-        description = "Redact one server-identified message through negotiated IRCv3 message redaction.",
+        description = "Redact one server-identified message through negotiated IRCv3 message \
+                       redaction. Where `mcp.confirm_destructive` is enabled, the call first \
+                       returns an input_required confirmation and applies nothing until it is \
+                       answered.",
         output_schema = schema_for_output::<MessageRedactOutput>(),
         annotations(
             title = "Redact IRC message",
@@ -1434,21 +1575,41 @@ impl IrcMcpService {
     async fn irc_message_redact(
         &self,
         Parameters(input): Parameters<MessageRedactInput>,
-    ) -> CallToolResult {
+        context: RequestContext<RoleServer>,
+        RequestState(request_state): RequestState,
+        InputResponses(responses): InputResponses,
+    ) -> Result<CallToolResponse, McpError> {
+        let owner = self.callers.identify(&context)?;
+        let profile = RequestProfile::from_context(&context);
         if let Err(error) = validate_irc_atom(&input.message_id, "message_id") {
-            return tool_error(error);
+            return Ok(tool_error(error).into());
         }
         let snapshot = match self.gateway.snapshot(&input.agent_id).await {
             Ok(snapshot) => snapshot,
-            Err(error) => return tool_error(error),
+            Err(error) => return Ok(tool_error(error).into()),
         };
         for (capability, operation) in [
             ("message-tags", "IRCv3 message redaction"),
             ("message-redaction", "IRCv3 message redaction"),
         ] {
             if let Err(error) = require_capability(&snapshot, capability, operation) {
-                return tool_error(error);
+                return Ok(tool_error(error).into());
             }
+        }
+        // After validation, so nobody is asked to approve a call that was never
+        // going to reach the server, and the confirmed arguments are the ones
+        // already checked.
+        match self.confirm_destructive(
+            &owner,
+            &profile,
+            &OriginatingOperation::for_tool("irc.message.redact", &input.salient()),
+            &input.action(),
+            request_state.as_deref(),
+            responses.as_ref(),
+        )? {
+            Resolution::Ready(()) => {}
+            Resolution::NeedsInput(request) => return Ok(request.into()),
+            Resolution::Settled(result) => return Ok(result.into()),
         }
 
         let target = input.target;
@@ -1475,9 +1636,14 @@ impl IrcMcpService {
                     reason,
                     result: command_result_for_detail(result, input.result_detail),
                 };
-                command_tool_result(format!("Message redaction: {outcome:?}."), &output, failure)
+                Ok(command_tool_result(
+                    format!("Message redaction: {outcome:?}."),
+                    &output,
+                    failure,
+                )
+                .into())
             }
-            Err(error) => tool_error(error),
+            Err(error) => Ok(tool_error(error).into()),
         }
     }
 
@@ -2232,7 +2398,20 @@ impl ServerHandler for IrcMcpService {
         let owner = self.callers.identify(&context)?;
         self.authorize_handles(&owner, &request).await?;
 
-        if runs_as_task(&request.name, &RequestProfile::from_context(&context)) {
+        let profile = RequestProfile::from_context(&context);
+        if runs_as_task(&request.name, &profile) {
+            // Input first, task second. The tasks extension says MRTR
+            // exchanges are resolved synchronously *before* a `CreateTaskResult`
+            // is returned, and the reason is plain here: a task handle is
+            // returned once the originating stream has closed, so a question
+            // discovered afterwards has nowhere to be asked and the caller holds
+            // a handle for work that will never start.
+            if let Some(settled) = self
+                .settle_input_before_task(&owner, &profile, &request)
+                .await?
+            {
+                return Ok(settled);
+            }
             let service = self.clone();
             let context = context.clone();
             let task =
@@ -2755,6 +2934,285 @@ impl IrcMcpService {
         }
     }
 
+    /// Settle any input round trip a task-augmented call still owes, before a
+    /// task exists to hide it.
+    ///
+    /// Returns `None` when the call is ready to run — the ordinary case — and
+    /// the response to send back otherwise. The tool re-resolves the same
+    /// question inside the task, deterministically reaching the same answer from
+    /// the same request fields; running it here first is what keeps a question
+    /// on the request that can still carry one.
+    async fn settle_input_before_task(
+        &self,
+        owner: &OwnerId,
+        profile: &RequestProfile,
+        request: &CallToolRequestParams,
+    ) -> Result<Option<CallToolResponse>, McpError> {
+        if request.name != DCC_ACCEPT_TOOL {
+            return Ok(None);
+        }
+        let arguments = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
+        let Ok(input) = serde_json::from_value::<DccAcceptInput>(arguments) else {
+            // Malformed arguments are the router's error to report, in the one
+            // place that phrases them; this decides only about input requests.
+            return Ok(None);
+        };
+        Ok(
+            match self
+                .plan_dcc_accept(
+                    owner,
+                    profile,
+                    &input,
+                    request.request_state.as_deref(),
+                    request.input_responses.as_ref(),
+                )
+                .await?
+            {
+                DccAcceptResolution::Ready(_) => None,
+                DccAcceptResolution::NeedsInput(needed) => Some(needed.into()),
+                DccAcceptResolution::Settled(result) => Some(result.into()),
+            },
+        )
+    }
+
+    /// Read a caller's answer to the nickname question, or ask it again.
+    ///
+    /// Every refusal is in band and leaves nothing connected: a state minted for
+    /// another caller or another call, an expired one, a declined answer, and a
+    /// name that is not a nickname all produce an ordinary tool result with
+    /// `isError`, because the model that issued the call is the one that has to
+    /// react.
+    fn open_nickname_choice(
+        &self,
+        owner: &OwnerId,
+        operation: &OriginatingOperation,
+        sealed: &str,
+        responses: Option<&rmcp::model::InputResponses>,
+        input: &ConnectInput,
+    ) -> Result<Resolution<Nickname>, McpError> {
+        let pending: connect_nickname::PendingNickname =
+            match self.gateway.request_states().open(sealed, owner, operation) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    return Ok(Resolution::Settled(refusal(
+                        ErrorKind::Validation.as_str(),
+                        error.message,
+                        false,
+                    )));
+                }
+            };
+        Ok(match connect_nickname::read_answer(responses)? {
+            // A round that answered nothing is asked again rather than refused,
+            // which is what the specification requires of a partial response.
+            connect_nickname::Answer::Missing => {
+                Resolution::NeedsInput(self.ask_for_a_nickname(owner, operation, &pending, input)?)
+            }
+            connect_nickname::Answer::Declined => Resolution::Settled(declined(format!(
+                "The nickname choice for {} was declined; no guest was connected.",
+                input.nickname
+            ))),
+            connect_nickname::Answer::Chosen(chosen) => match Nickname::new(chosen) {
+                Ok(nickname) => Resolution::Ready(nickname),
+                Err(error) => Resolution::Settled(refusal(
+                    ErrorKind::Validation.as_str(),
+                    format!("the chosen nickname is not usable: {error}"),
+                    false,
+                )),
+            },
+        })
+    }
+
+    /// Ask which nickname to register, sealing what the question was about.
+    ///
+    /// Suggestions are built from the name the server refused last rather than
+    /// from the one the call originally asked for, so a second round after a
+    /// chosen name also collided proposes variations of *that* name instead of
+    /// circling back to the first.
+    fn ask_for_a_nickname(
+        &self,
+        owner: &OwnerId,
+        operation: &OriginatingOperation,
+        pending: &connect_nickname::PendingNickname,
+        input: &ConnectInput,
+    ) -> Result<InputRequiredResult, McpError> {
+        let base = pending
+            .attempted
+            .last()
+            .and_then(|refused| Nickname::new(refused.clone()).ok())
+            .unwrap_or_else(|| input.nickname.clone());
+        let suggestions = connect_nickname::suggestions(
+            &base,
+            &pending.attempted,
+            self.gateway.config().onboarding.nickname_attempts,
+        );
+        let requests = connect_nickname::nickname_requests(pending, &suggestions)?;
+        let sealed = self
+            .gateway
+            .request_states()
+            .seal(owner, operation, pending)?;
+        Ok(InputRequiredResult::new(Some(requests), Some(sealed)))
+    }
+
+    /// Read a caller's answer to the channel-key question, or ask it again.
+    ///
+    /// Refusals are in band and leave the channel unjoined, which is exactly
+    /// what a join that was never re-issued means.
+    fn open_channel_key(
+        &self,
+        owner: &OwnerId,
+        operation: &OriginatingOperation,
+        sealed: &str,
+        responses: Option<&rmcp::model::InputResponses>,
+        input: &JoinInput,
+    ) -> Result<Resolution<String>, McpError> {
+        let channel = input.channel.to_string();
+        let pending: join_key::PendingJoin =
+            match self.gateway.request_states().open(sealed, owner, operation) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    return Ok(Resolution::Settled(refusal(
+                        ErrorKind::Validation.as_str(),
+                        error.message,
+                        false,
+                    )));
+                }
+            };
+        if !pending.matches(&channel) {
+            return Ok(Resolution::Settled(refusal(
+                ErrorKind::Validation.as_str(),
+                "this channel key was supplied for a different channel",
+                false,
+            )));
+        }
+        Ok(match join_key::read_answer(responses)? {
+            // A round that answered nothing is asked again rather than refused,
+            // which is what the specification requires of a partial response.
+            join_key::Answer::Missing => {
+                Resolution::NeedsInput(self.ask_for_a_key(owner, operation, &channel, None)?)
+            }
+            join_key::Answer::Declined => Resolution::Settled(declined(format!(
+                "The key for {channel} was declined; the channel was not joined."
+            ))),
+            join_key::Answer::Chosen(key) => Resolution::Ready(key),
+        })
+    }
+
+    /// Ask for one channel's key after the server refused the join without it.
+    fn ask_for_a_channel_key(
+        &self,
+        owner: &OwnerId,
+        operation: &OriginatingOperation,
+        input: &JoinInput,
+        result: &CommandResult,
+    ) -> Result<InputRequiredResult, McpError> {
+        self.ask_for_a_key(
+            owner,
+            operation,
+            &input.channel.to_string(),
+            join_key::rejection_detail(result).as_deref(),
+        )
+    }
+
+    /// Ask for one channel's key, sealing which channel it is for.
+    fn ask_for_a_key(
+        &self,
+        owner: &OwnerId,
+        operation: &OriginatingOperation,
+        channel: &str,
+        detail: Option<&str>,
+    ) -> Result<InputRequiredResult, McpError> {
+        let requests = join_key::key_requests(channel, detail)?;
+        let sealed = self.gateway.request_states().seal(
+            owner,
+            operation,
+            &join_key::PendingJoin {
+                channel: channel.to_owned(),
+            },
+        )?;
+        Ok(InputRequiredResult::new(Some(requests), Some(sealed)))
+    }
+
+    /// Require a human confirmation for one destructive mutation, when the
+    /// deployment asked for one.
+    ///
+    /// Called before anything is written, so every outcome but `Ready` leaves
+    /// the channel exactly as it was. A request that cannot be asked is refused
+    /// rather than served: the setting exists because somebody decided a model
+    /// may not do this alone, and proceeding silently would delete that policy
+    /// while appearing to honor it.
+    fn confirm_destructive(
+        &self,
+        owner: &OwnerId,
+        profile: &RequestProfile,
+        operation: &OriginatingOperation,
+        action: &str,
+        request_state: Option<&str>,
+        responses: Option<&rmcp::model::InputResponses>,
+    ) -> Result<Resolution<()>, McpError> {
+        if !self.gateway.config().mcp.confirm_destructive {
+            return Ok(Resolution::Ready(()));
+        }
+        let Some(sealed) = request_state else {
+            if !profile.supports_form_elicitation() {
+                return Ok(Resolution::Settled(refusal(
+                    CONFIRMATION_REQUIRED,
+                    format!(
+                        "this gateway requires a confirmed decision before it will {action}, and \
+                         this request declared no form elicitation to ask through; nothing was \
+                         applied"
+                    ),
+                    false,
+                )));
+            }
+            return Ok(Resolution::NeedsInput(
+                self.ask_for_confirmation(owner, operation, action)?,
+            ));
+        };
+        let pending: confirm_action::PendingConfirmation =
+            match self.gateway.request_states().open(sealed, owner, operation) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    return Ok(Resolution::Settled(refusal(
+                        CONFIRMATION_REQUIRED,
+                        error.message,
+                        false,
+                    )));
+                }
+            };
+        if !pending.matches(action) {
+            return Ok(Resolution::Settled(refusal(
+                CONFIRMATION_REQUIRED,
+                "this confirmation was given for a different action",
+                false,
+            )));
+        }
+        Ok(match confirm_action::read_answer(responses)? {
+            confirm_action::Answer::Confirmed => Resolution::Ready(()),
+            confirm_action::Answer::Refused => Resolution::Settled(declined(format!(
+                "The request to {action} was not confirmed; nothing was applied."
+            ))),
+            confirm_action::Answer::Missing => {
+                Resolution::NeedsInput(self.ask_for_confirmation(owner, operation, action)?)
+            }
+        })
+    }
+
+    /// Ask a caller to confirm one exact action, sealing the action with it.
+    fn ask_for_confirmation(
+        &self,
+        owner: &OwnerId,
+        operation: &OriginatingOperation,
+        action: &str,
+    ) -> Result<InputRequiredResult, McpError> {
+        let requests = confirm_action::confirmation_requests(action)?;
+        let sealed = self.gateway.request_states().seal(
+            owner,
+            operation,
+            &confirm_action::PendingConfirmation::for_action(action),
+        )?;
+        Ok(InputRequiredResult::new(Some(requests), Some(sealed)))
+    }
+
     /// Decide what an `irc.dcc.accept` call still needs, or produce the
     /// validated plan it will run.
     ///
@@ -2887,12 +3345,14 @@ impl IrcMcpService {
         let call = ToolCallContext::new(self, request, context);
         let started = match self.tool_router.call(call).await? {
             CallToolResponse::Complete(result) => result,
-            // A task must not carry an unanswered question. The specification is
-            // explicit that input exchanges are resolved *before* a task handle
-            // is returned, and by this point the handle is already in the
-            // client's hands and the originating stream is closed, so there is
-            // nowhere to ask. Failing deterministically with the reason is the
-            // honest answer; the fix is to resolve the input first, not here.
+            // A task must not carry an unanswered question, and `call_tool`
+            // settles every one it can see before creating this task. Reaching
+            // here means the answer stopped being valid in between — a request
+            // state that expired between the two resolutions is the only way —
+            // and by now the handle is in the client's hands with its stream
+            // closed, so there is nowhere left to ask. Failing deterministically
+            // with the reason is the honest answer; the recovery is to call the
+            // tool again and answer the question it returns.
             CallToolResponse::InputRequired(_) => {
                 return Err(TaskExit::Error(McpError::invalid_request(
                     "this operation needs its input resolved before it can run as a task: answer \
@@ -3002,53 +3462,73 @@ impl IrcMcpService {
     }
 }
 
-/// What one `irc.dcc.accept` call resolved to before anything was accepted.
+/// What one round of an input-gated tool call resolved to.
+///
+/// The three outcomes are the whole vocabulary of an MRTR exchange, and they are
+/// the same for every question this server asks: run it, ask, or stop. Sharing
+/// one type keeps the tools that use it from inventing different answers to the
+/// same situation.
 #[derive(Debug)]
-pub(crate) enum DccAcceptResolution {
-    /// Accept the offer with these validated arguments.
-    Ready(dcc_accept::AcceptPlan),
-    /// Ask the caller to choose, then let it retry the same call.
+pub(crate) enum Resolution<T> {
+    /// Every argument is settled; run the operation with this.
+    Ready(T),
+    /// Ask the caller, then let it retry the same call.
     NeedsInput(InputRequiredResult),
-    /// Nothing further will happen; report this. The offer stays pending.
+    /// Nothing further will happen; report this. Nothing was applied.
     Settled(CallToolResult),
 }
 
-/// Refuse an acceptance whose destination cannot be settled.
-fn destination_refusal(message: impl Into<String>) -> CallToolResult {
+/// What one `irc.dcc.accept` call resolved to before anything was accepted.
+pub(crate) type DccAcceptResolution = Resolution<dcc_accept::AcceptPlan>;
+
+/// Error kind of a mutation a deployment requires a person to approve.
+const CONFIRMATION_REQUIRED: &str = "confirmation_required";
+
+/// Refuse a call in band, leaving whatever it would have changed untouched.
+///
+/// Never a JSON-RPC error: the call was well formed and reached the tool, so the
+/// answer belongs in a result the model can read and act on.
+fn refusal(kind: &str, message: impl Into<String>, retriable: bool) -> CallToolResult {
     let message = message.into();
     structured_result(
         message.clone(),
         &ToolErrorOutput {
-            kind: GatewayError::Dcc(String::new()).kind().as_str().into(),
+            kind: kind.into(),
             message,
-            retriable: false,
+            retriable,
         },
         true,
+    )
+}
+
+/// Report that the caller was asked and refused.
+///
+/// A refusal is not a failure and not a success either: nothing happened, and
+/// the operation is still there to start again. Saying so as an error result is
+/// what stops a model from reading silence as completion. Retriable, because
+/// calling again and answering is the recovery.
+fn declined(message: impl Into<String>) -> CallToolResult {
+    refusal("declined", message, true)
+}
+
+/// Refuse an acceptance whose destination cannot be settled.
+fn destination_refusal(message: impl Into<String>) -> CallToolResult {
+    refusal(
+        GatewayError::Dcc(String::new()).kind().as_str(),
+        message,
+        false,
     )
 }
 
 /// Report that the caller was asked where the file should go and refused.
 ///
-/// A refusal is not a failure of the transfer and not a success either: nothing
-/// was written, and the offer is still there to accept until its own TTL retires
-/// it. Saying so as an error result is what stops a model from reading silence as
-/// completion.
+/// The offer is still there to accept until its own TTL retires it.
 fn declined_destination(offer: &DccSession) -> CallToolResult {
-    let message = format!(
+    declined(format!(
         "The destination choice for {} from {} was declined; the offer is still pending.",
         offer.filename.as_deref().unwrap_or("this transfer"),
         offer.peer
-    );
-    structured_result(
-        message.clone(),
-        &ToolErrorOutput {
-            kind: "declined".into(),
-            message,
-            // Calling again and answering is the recovery.
-            retriable: true,
-        },
-        true,
-    )
+    ))
 }
 
 /// Refuse an acceptance whose root the caller must name explicitly.
@@ -3211,18 +3691,26 @@ fn watch_resource_entry(watch: &WatchDescriptor) -> Resource {
         )
 }
 
-fn connect_request(input: ConnectInput) -> Result<ConnectRequest, GatewayError> {
-    let nickname = input.nickname;
-    let nickname_fallbacks = input.nickname_fallbacks;
-    let channels: BTreeSet<_> = input.channels.into_iter().collect();
-    Ok(ConnectRequest {
+/// The registration one `irc.connect` round will attempt.
+///
+/// A `chosen` nickname replaces the whole candidate list rather than joining it:
+/// it is the answer to a question about names the server already refused, so
+/// re-offering those names would spend attempts on known collisions and could
+/// register one of them after all. The policy is carried through unchanged, so a
+/// chosen name that collides in turn asks again.
+fn connect_request(input: &ConnectInput, chosen: Option<Nickname>) -> ConnectRequest {
+    let (nickname, nickname_fallbacks) = match chosen {
+        Some(nickname) => (nickname, Vec::new()),
+        None => (input.nickname.clone(), input.nickname_fallbacks.clone()),
+    };
+    ConnectRequest {
         nickname,
         nickname_fallbacks,
         nick_conflict_policy: input.nick_conflict_policy,
-        username: input.username,
-        real_name: input.real_name,
-        channels,
-    })
+        username: input.username.clone(),
+        real_name: input.real_name.clone(),
+        channels: input.channels.iter().cloned().collect::<BTreeSet<_>>(),
+    }
 }
 
 fn query_message(query: Query) -> Result<OutboundMessage, GatewayError> {
@@ -4519,7 +5007,7 @@ mod tests {
             (
                 "irc.connect",
                 "nick_conflict_policy",
-                &["suffix", "fail"][..],
+                &["suffix", "fail", "elicit"][..],
             ),
             (
                 "irc.send",

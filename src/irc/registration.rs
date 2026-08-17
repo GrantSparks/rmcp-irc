@@ -127,6 +127,14 @@ pub enum NickConflictPolicy {
     Suffix,
     /// Return the first collision as a terminal tool error.
     Fail,
+    /// Abandon the attempt and ask the caller which name to register instead.
+    ///
+    /// Generates no candidates of its own, exactly like [`Self::Fail`]: the
+    /// point is to stop at the first name the server refuses rather than to
+    /// invent a substitute. What the caller does with that — answering an
+    /// `input_required` question on `irc.connect` — belongs to the MCP layer,
+    /// because a registration attempt has no client to ask.
+    Elicit,
 }
 
 /// Bounded, ordered plan for acquiring a nickname during registration.
@@ -217,7 +225,6 @@ impl NicknamePlan {
     }
 
     /// Ordered candidates this plan will try.
-    #[cfg(test)]
     pub fn candidates(&self) -> &[Nickname] {
         &self.candidates
     }
@@ -410,6 +417,23 @@ mod tests {
         let plan = NicknamePlan::new(&nick("Athena"), &[], NickConflictPolicy::Fail, 30, 8);
         assert_eq!(plan.candidates().len(), 1);
         assert_eq!(plan.candidates()[0].as_str(), "Athena");
+    }
+
+    #[test]
+    fn an_asking_policy_invents_no_candidate_of_its_own() {
+        // Whoever is going to be asked must be asked about the name the server
+        // actually refused, not about the last of several substitutes the
+        // gateway chose without saying so. Explicit fallbacks are still the
+        // caller's own list and are still tried.
+        let plan = NicknamePlan::new(
+            &nick("Athena"),
+            &[nick("Pallas")],
+            NickConflictPolicy::Elicit,
+            30,
+            8,
+        );
+        let candidates: Vec<&str> = plan.candidates().iter().map(Nickname::as_str).collect();
+        assert_eq!(candidates, ["Athena", "Pallas"]);
     }
 
     #[test]

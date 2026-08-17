@@ -50,7 +50,7 @@ use crate::{
         },
         history::HistoryReference,
         isupport::IsupportRegistry,
-        registration::{Nickname, NicknamePlan, NicknameRejection},
+        registration::{NickConflictPolicy, Nickname, NicknamePlan, NicknameRejection},
         semantic::project,
         target::ChannelName,
         wire::{LineBudget, OutboundMessage, WireMessage},
@@ -85,7 +85,7 @@ pub struct RegistrationRequest {
     /// Ordered caller-supplied alternatives.
     pub nickname_fallbacks: Vec<Nickname>,
     /// Collision behavior after explicit candidates.
-    pub nick_conflict_policy: crate::irc::registration::NickConflictPolicy,
+    pub nick_conflict_policy: NickConflictPolicy,
     /// USER username.
     pub username: String,
     /// USER real-name field.
@@ -596,6 +596,10 @@ fn connection_failure_detail(error: &GatewayError) -> String {
         GatewayError::Registration {
             attempted_nicknames,
             ..
+        }
+        | GatewayError::NicknameUnavailable {
+            attempted_nicknames,
+            ..
         } if !attempted_nicknames.is_empty() => format!(
             "{error} (attempted nicknames: {})",
             attempted_nicknames.join(", ")
@@ -951,11 +955,25 @@ impl AgentActor {
                     .await?;
                     continue;
                 }
+                let detail = message
+                    .trailing
+                    .clone()
+                    .unwrap_or_else(|| format!("nickname rejected with {rejection:?}"));
+                // A name the server says is taken is answerable, and one policy
+                // exists to answer it. Reporting that case distinctly is what
+                // lets `irc.connect` ask for another name instead of guessing
+                // one; every other registration failure stays terminal, because
+                // no nickname would fix it.
+                if rejection.is_retriable()
+                    && self.registration.nick_conflict_policy == NickConflictPolicy::Elicit
+                {
+                    return Err(GatewayError::NicknameUnavailable {
+                        message: detail,
+                        attempted_nicknames: attempted,
+                    });
+                }
                 return Err(GatewayError::Registration {
-                    message: message
-                        .trailing
-                        .clone()
-                        .unwrap_or_else(|| format!("nickname rejected with {rejection:?}")),
+                    message: detail,
                     attempted_nicknames: attempted,
                 });
             }

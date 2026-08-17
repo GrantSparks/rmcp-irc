@@ -1634,7 +1634,11 @@ async fn one_callers_handles_are_invisible_and_unusable_to_another() {
 /// Loopback peers are permitted because the peer in these tests is a real socket
 /// in this process, which is exactly the case the production refusal exists to
 /// keep out.
-fn config_with_receive_roots(fake: &FakeErgo, base: &std::path::Path, names: &[&str]) -> Config {
+pub(super) fn config_with_receive_roots(
+    fake: &FakeErgo,
+    base: &std::path::Path,
+    names: &[&str],
+) -> Config {
     let mut config = fake.config();
     config.dcc.allow_private_addresses = true;
     config.dcc.receive_roots = names
@@ -1650,7 +1654,7 @@ fn config_with_receive_roots(fake: &FakeErgo, base: &std::path::Path, names: &[&
 
 /// Have the fixture push one inbound DCC SEND offer and wait for the actor to
 /// retain it.
-async fn offered_transfer(
+pub(super) async fn offered_transfer(
     gateway: &Gateway,
     agent_id: &AgentId,
     endpoint: SocketAddr,
