@@ -116,11 +116,19 @@ pub struct ActivityHint {
     /// appear, and only records the agent did not send itself. At most eight
     /// entries: the busiest targets win, ties broken by name.
     pub unread: BTreeMap<String, u64>,
-    /// Records after `anchor` across every watched target, including any target
-    /// dropped from `unread`. Unaffected by the cap, so it is always the honest
-    /// total.
+    /// Every record after `anchor` the watches selected, whether or not it
+    /// could be keyed into `unread`.
+    ///
+    /// It counts targets the cap dropped, and it also counts records that have
+    /// no target at all: a peer quitting or going away is conversational and is
+    /// selected, but IRC gives it no channel or nickname to file it under. So
+    /// `total` can exceed the sum of `unread` for two different reasons, and
+    /// `{"total": 1, "unread": {}, "truncated": false}` is a legitimate hint
+    /// meaning "one thing you are watching happened, and it was not addressed
+    /// to any one conversation" — not a lost count.
     pub total: u64,
     /// Whether `unread` dropped targets at the cap. `total` still counts them.
+    /// It is not the only reason `total` can exceed `unread`; see `total`.
     pub truncated: bool,
     /// Live watches these counts were drawn from. Zero means this agent holds
     /// no watches, which is why `unread` is empty — create one with

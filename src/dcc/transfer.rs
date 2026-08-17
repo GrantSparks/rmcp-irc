@@ -279,17 +279,24 @@ where
         }
     };
 
-    file.flush().await.map_err(|source| TransferError::Io {
-        operation: "flush DCC destination",
-        source,
-    })?;
-    file.sync_data().await.map_err(|source| TransferError::Io {
-        operation: "sync DCC destination",
-        source,
-    })?;
+    // Everything from here on can still fail — the flush, the sync, and the
+    // commit rename — and each of those failures leaves a fully streamed
+    // temporary that nothing will ever finish. They are settled together so one
+    // cleanup covers all of them: the caller sees the original error, and the
+    // receive root does not accumulate `.part` files whose transfer is over.
+    let durable = flush_to_disk(&mut file).await;
     drop(file);
-    if let Some(temporary) = temporary {
-        commit_temporary(&destination, &temporary, options.conflict).await?;
+    let committed = match (durable, temporary.as_deref()) {
+        (Ok(()), Some(temporary)) => {
+            commit_temporary(&destination, temporary, options.conflict).await
+        }
+        (result, _) => result,
+    };
+    if let Err(error) = committed {
+        if let Some(temporary) = temporary.as_deref() {
+            let _ = destination.remove(temporary).await;
+        }
+        return Err(error);
     }
     Ok(ReceivedFile {
         path: destination.path(),
@@ -474,16 +481,50 @@ async fn available_sibling(destination: &ReceiveDestination) -> Result<String, T
     Err(TransferError::RenameExhausted(destination.path()))
 }
 
+/// Get every received byte onto the disk before the name is claimed.
+async fn flush_to_disk(file: &mut File) -> Result<(), TransferError> {
+    file.flush().await.map_err(|source| TransferError::Io {
+        operation: "flush DCC destination",
+        source,
+    })?;
+    file.sync_data().await.map_err(|source| TransferError::Io {
+        operation: "sync DCC destination",
+        source,
+    })
+}
+
 fn temporary_name(file_name: &str) -> String {
     format!(".{file_name}.{}.part", Uuid::new_v4())
 }
 
+/// Move the streamed temporary onto the name this transfer settled on.
+///
+/// `fail` commits exclusively. Its destination was probed before a single byte
+/// arrived, and on a large transfer the commit is minutes later: an ordinary
+/// rename replaces anything that took the name in between, which would turn the
+/// one conflict behavior that promises never to touch an existing file into a
+/// silent overwrite. The refusal is therefore reported as the same conflict the
+/// probe produces, whichever of the two noticed.
 async fn commit_temporary(
     destination: &ReceiveDestination,
     temporary: &str,
     conflict: DestinationConflict,
 ) -> Result<(), TransferError> {
     let committed = destination.file_name();
+    if conflict == DestinationConflict::Fail {
+        return destination
+            .rename_within_new(temporary, committed)
+            .await
+            .map_err(|source| match source.kind() {
+                ErrorKind::AlreadyExists => TransferError::DestinationExists(destination.path()),
+                _ => TransferError::Io {
+                    operation: "commit DCC destination",
+                    source,
+                },
+            });
+    }
+    // `rename` already chose a name that was free, and `replace` is asking for
+    // exactly the replacement below.
     if conflict != DestinationConflict::Replace {
         return destination
             .rename_within(temporary, committed)
@@ -799,6 +840,86 @@ mod tests {
                 .await
                 .expect("metadata")
                 .is_symlink()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_destination_taken_while_the_transfer_ran_is_refused_and_leaves_nothing_behind() {
+        // The probe that cleared this destination happened before the first
+        // byte arrived. On a real transfer the commit is minutes later, and a
+        // plain rename would replace whatever claimed the name in between —
+        // turning the one conflict behavior that promises never to touch an
+        // existing file into a silent overwrite.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().join("downloads");
+        let destination = destination(&root, "report.txt").await;
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (streaming, streamed) = tokio::sync::oneshot::channel();
+        let (occupy, occupied) = tokio::sync::oneshot::channel();
+        let send = tokio::spawn(async move {
+            let mut acknowledgement = [0_u8; 4];
+            sender.write_all(b"pe").await.expect("write");
+            sender
+                .read_exact(&mut acknowledgement)
+                .await
+                .expect("acknowledgement");
+            // The transfer is under way and its temporary exists.
+            streaming.send(()).expect("report streaming");
+            occupied.await.expect("destination occupied");
+            sender.write_all(b"er").await.expect("write");
+            sender
+                .read_exact(&mut acknowledgement)
+                .await
+                .expect("acknowledgement");
+        });
+        let receive = tokio::spawn(receive_file(
+            receiver,
+            DccSessionId::new(),
+            destination,
+            ReceiveOptions {
+                conflict: DestinationConflict::Fail,
+                expected_size: Some(4),
+                max_bytes: 16,
+                transfer: TransferOptions {
+                    resume_offset: 0,
+                    buffer_bytes: 16,
+                    idle_timeout: Duration::from_secs(1),
+                    progress: None,
+                },
+            },
+        ));
+
+        streamed.await.expect("streaming");
+        tokio::fs::write(root.join("report.txt"), b"not mine")
+            .await
+            .expect("occupy the destination");
+        occupy.send(()).expect("release the sender");
+        let error = receive
+            .await
+            .expect("receive task")
+            .expect_err("an occupied destination must refuse");
+        send.await.expect("sender");
+
+        assert!(
+            matches!(error, TransferError::DestinationExists(_)),
+            "a name taken during the transfer is the same conflict the probe \
+             reports: {error}"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join("report.txt"))
+                .await
+                .expect("read destination"),
+            b"not mine"
+        );
+        let mut entries = tokio::fs::read_dir(&root).await.expect("read root");
+        let mut remaining = Vec::new();
+        while let Some(entry) = entries.next_entry().await.expect("entry") {
+            remaining.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(
+            remaining,
+            vec!["report.txt".to_owned()],
+            "a commit that failed must not leave its temporary behind"
         );
     }
 

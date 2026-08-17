@@ -70,6 +70,14 @@ pub enum ConfinementError {
     /// temporary and committed files.
     #[error("DCC destination must be valid UTF-8: {0}")]
     NotUtf8(PathBuf),
+    /// A component of the destination is a name this gateway will not create.
+    #[error("DCC destination component {component:?} is refused: {reason}")]
+    UnsafeComponent {
+        /// The offending path component, as offered.
+        component: String,
+        /// Why it cannot be created.
+        reason: &'static str,
+    },
     /// A component of the destination is a symbolic link, so following it would
     /// place the file wherever the link points instead of beneath the root.
     #[error("DCC destination component is a link out of the receive root: {0}")]
@@ -214,8 +222,22 @@ impl ReceiveDestination {
     ///
     /// Both ends name entries in the same held descriptor, so the commit cannot
     /// be re-routed by anything that changed the path it was resolved from.
+    /// Replaces `to` if it exists; use [`Self::rename_within_new`] when it must
+    /// not.
     pub async fn rename_within(&self, from: &str, to: &str) -> io::Result<()> {
         self.directory.rename_within(from, to).await
+    }
+
+    /// Rename one name to another inside the held directory, failing with
+    /// [`io::ErrorKind::AlreadyExists`] rather than replacing an occupied `to`.
+    ///
+    /// A transfer probes its destination before it streams and commits after,
+    /// which are minutes apart on a large file: an ordinary rename replaces
+    /// whatever took the name in between, and a caller that asked for
+    /// `conflict: fail` would have its refusal turned into a silent overwrite.
+    /// The exclusion therefore has to happen at the commit itself.
+    pub async fn rename_within_new(&self, from: &str, to: &str) -> io::Result<()> {
+        self.directory.rename_within_new(from, to).await
     }
 
     /// Remove `name` inside the held directory.
@@ -248,10 +270,13 @@ fn split_relative(relative: &Path) -> Result<(Vec<&str>, &str), ConfinementError
     for component in relative.components() {
         match component {
             Component::CurDir => {}
-            Component::Normal(part) => parts.push(
-                part.to_str()
-                    .ok_or_else(|| ConfinementError::NotUtf8(relative.to_path_buf()))?,
-            ),
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or_else(|| ConfinementError::NotUtf8(relative.to_path_buf()))?;
+                check_component(part)?;
+                parts.push(part);
+            }
             Component::RootDir | Component::Prefix(_) | Component::ParentDir => {
                 return Err(ConfinementError::NotRelative(relative.to_path_buf()));
             }
@@ -261,6 +286,61 @@ fn split_relative(relative: &Path) -> Result<(Vec<&str>, &str), ConfinementError
         .pop()
         .ok_or_else(|| ConfinementError::NoFileName(relative.to_path_buf()))?;
     Ok((parts, file_name))
+}
+
+/// Names this gateway refuses to create, on every platform.
+///
+/// These are the shapes whose meaning is not the name itself. `a.txt:hidden`
+/// addresses an NTFS alternate data stream rather than a file called
+/// `a.txt:hidden`; `report.` and `report ` are silently trimmed to `report` when
+/// created on Windows, so the file that is written is not the file that was
+/// named; `nul.txt` opens a device, not a file; and an embedded newline or NUL
+/// truncates or forges the name in every log, listing, and protocol line that
+/// later carries it. A Unix host would accept most of them literally, which is
+/// precisely the problem: a peer-supplied filename that means one thing here and
+/// another on the operator's other machine has no single correct
+/// interpretation, so the policy is one policy everywhere and the refusal says
+/// which rule was hit.
+fn check_component(part: &str) -> Result<(), ConfinementError> {
+    let refuse = |reason| {
+        Err(ConfinementError::UnsafeComponent {
+            component: part.to_owned(),
+            reason,
+        })
+    };
+    if part.contains(':') {
+        return refuse("a colon names an alternate data stream rather than a file");
+    }
+    if part.contains(['\r', '\n', '\0']) {
+        return refuse("a line break or NUL cannot be part of a file name");
+    }
+    if part.ends_with('.') || part.ends_with(' ') {
+        return refuse("a trailing dot or space is silently trimmed on some hosts");
+    }
+    let stem = part.split('.').next().unwrap_or(part);
+    if is_reserved_device_name(stem) {
+        return refuse("this name is a reserved device on some hosts");
+    }
+    Ok(())
+}
+
+/// Whether a name's stem is a DOS device name, whatever its case.
+fn is_reserved_device_name(stem: &str) -> bool {
+    const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    if RESERVED
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    {
+        return true;
+    }
+    // COM1-COM9 and LPT1-LPT9. The digit is the whole remainder, so `COM10`,
+    // which no host reserves, stays available.
+    let bytes = stem.as_bytes();
+    let [device @ .., digit] = bytes else {
+        return false;
+    };
+    (device.eq_ignore_ascii_case(b"COM") || device.eq_ignore_ascii_case(b"LPT"))
+        && matches!(digit, b'1'..=b'9')
 }
 
 #[cfg(unix)]
@@ -432,6 +512,15 @@ mod platform {
             .await
         }
 
+        /// Rename one name to another inside this directory without replacing
+        /// an existing target.
+        pub async fn rename_within_new(&self, from: &str, to: &str) -> io::Result<()> {
+            let handle = Arc::clone(&self.handle);
+            let from = from.to_owned();
+            let to = to.to_owned();
+            blocking(move || rename_new_blocking(&handle, &from, &to)).await
+        }
+
         /// Remove `name` inside this directory.
         pub async fn remove(&self, name: &str) -> io::Result<()> {
             let handle = Arc::clone(&self.handle);
@@ -442,6 +531,55 @@ mod platform {
             })
             .await
         }
+    }
+
+    /// Rename without replacing, against a held descriptor.
+    ///
+    /// `RENAME_NOREPLACE` makes the exclusion atomic: the kernel refuses with
+    /// `EEXIST` rather than unlinking whatever held the name. It is a
+    /// `renameat2` flag, though, and a filesystem that does not implement it
+    /// answers `EINVAL` (an older kernel, `ENOSYS`) — a refusal of the *flag*,
+    /// not of the rename, so retrying without it would silently restore the
+    /// clobber. The fallback says the same thing the older way: `linkat` fails
+    /// with `EEXIST` when the name is taken, so the destination is created
+    /// exclusively and the temporary is unlinked only once it exists.
+    fn rename_new_blocking(parent: &OwnedFd, from: &str, to: &str) -> io::Result<()> {
+        if let Some(result) = rename_noreplace(parent, from, to) {
+            return result;
+        }
+        rustix::fs::linkat(parent, from, parent, to, AtFlags::empty())?;
+        if let Err(error) = rustix::fs::unlinkat(parent, from, AtFlags::empty()) {
+            // The destination is in place, so the transfer did commit. Failing
+            // here would tell the caller its completed file is missing over a
+            // leftover temporary.
+            tracing::warn!(
+                temporary = from,
+                %error,
+                "committed a DCC destination but could not remove its temporary"
+            );
+        }
+        Ok(())
+    }
+
+    /// `renameat2` with `RENAME_NOREPLACE`, or `None` where it is unavailable.
+    #[cfg(any(target_os = "android", target_os = "linux", target_vendor = "apple"))]
+    fn rename_noreplace(parent: &OwnedFd, from: &str, to: &str) -> Option<io::Result<()>> {
+        use rustix::{fs::RenameFlags, io::Errno};
+
+        match rustix::fs::renameat_with(parent, from, parent, to, RenameFlags::NOREPLACE) {
+            Err(error)
+                if error == Errno::INVAL || error == Errno::NOSYS || error == Errno::NOTSUP =>
+            {
+                None
+            }
+            other => Some(other.map_err(io::Error::from)),
+        }
+    }
+
+    /// Platforms with no `renameat2` at all take the link-and-unlink path.
+    #[cfg(not(any(target_os = "android", target_os = "linux", target_vendor = "apple")))]
+    fn rename_noreplace(_parent: &OwnedFd, _from: &str, _to: &str) -> Option<io::Result<()>> {
+        None
     }
 
     /// Create and open one child directory relative to a held descriptor.
@@ -584,6 +722,25 @@ mod platform {
         /// Rename one name to another inside this directory.
         pub async fn rename_within(&self, from: &str, to: &str) -> io::Result<()> {
             tokio::fs::rename(self.path.join(from), self.path.join(to)).await
+        }
+
+        /// Rename one name to another inside this directory, best-effort
+        /// exclusive.
+        ///
+        /// There is no no-replace rename here, so the exclusion is a probe
+        /// immediately before the rename rather than part of it. That closes
+        /// the long window a transfer opens — the minutes between the
+        /// pre-transfer probe and the commit — and leaves a residual one: an
+        /// entry created between this probe and the rename below is still
+        /// replaced.
+        pub async fn rename_within_new(&self, from: &str, to: &str) -> io::Result<()> {
+            if self.occupant(to).await?.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{to} already exists"),
+                ));
+            }
+            self.rename_within(from, to).await
         }
 
         /// Remove `name` inside this directory.
@@ -765,6 +922,101 @@ mod tests {
         destination.remove("report.txt").await.expect("remove");
         assert_eq!(
             destination.occupant("report.txt").await.expect("gone"),
+            None
+        );
+    }
+
+    #[test]
+    fn names_whose_meaning_is_not_the_name_are_refused_everywhere() {
+        // One policy on every host: a peer-supplied name that means one thing
+        // on this machine and another on the operator's other one has no
+        // correct interpretation, so it is refused here rather than resolved
+        // differently there.
+        for (rejected, expected) in [
+            ("report.txt:hidden", "alternate data stream"),
+            ("nested:stream/report.txt", "alternate data stream"),
+            ("report\r\n.txt", "line break or NUL"),
+            ("report\u{0}.txt", "line break or NUL"),
+            ("report.", "trailing dot or space"),
+            ("report ", "trailing dot or space"),
+            ("nested./report.txt", "trailing dot or space"),
+            ("NUL", "reserved device"),
+            ("nul.txt", "reserved device"),
+            ("CoM1.log", "reserved device"),
+            ("lpt9", "reserved device"),
+            ("aux/report.txt", "reserved device"),
+        ] {
+            let error = split_relative(Path::new(rejected))
+                .err()
+                .unwrap_or_else(|| panic!("{rejected} must be refused"));
+            assert!(
+                matches!(&error, ConfinementError::UnsafeComponent { component, .. }
+                    if rejected.contains(component.as_str())),
+                "{rejected} was refused as something else: {error}"
+            );
+            assert!(
+                error.to_string().contains(expected),
+                "the refusal must say which rule {rejected} hit: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_names_that_merely_resemble_a_hazard_are_still_accepted() {
+        for accepted in [
+            "reports/august/report.txt",
+            // Reserved only up to nine, and only as the whole stem.
+            "com10.log",
+            "console.txt",
+            "nulls.txt",
+            "report.txt.part",
+            ".hidden",
+        ] {
+            assert!(
+                split_relative(Path::new(accepted)).is_ok(),
+                "{accepted} is an ordinary name"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exclusive_commit_refuses_a_name_taken_since_it_was_probed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root_path = directory.path().join("downloads");
+        let destination = ReceiveDestination::resolve(&root(&root_path), Path::new("report.txt"))
+            .await
+            .expect("resolve");
+        destination.create_new("temporary").await.expect("create");
+        // Whatever took the name after the probe: another transfer, another
+        // process, the operator.
+        tokio::fs::write(root_path.join("report.txt"), b"not mine")
+            .await
+            .expect("occupy the destination");
+
+        assert_eq!(
+            destination
+                .rename_within_new("temporary", "report.txt")
+                .await
+                .expect_err("an occupied destination must refuse")
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            tokio::fs::read(root_path.join("report.txt"))
+                .await
+                .expect("read destination"),
+            b"not mine",
+            "the occupant must survive the refused commit"
+        );
+
+        // The same call is an ordinary commit when the name is free.
+        destination.remove("report.txt").await.expect("remove");
+        destination
+            .rename_within_new("temporary", "report.txt")
+            .await
+            .expect("commit");
+        assert_eq!(
+            destination.occupant("temporary").await.expect("occupant"),
             None
         );
     }

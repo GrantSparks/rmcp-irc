@@ -11,7 +11,7 @@ use std::{
 use crate::{
     agent::{
         AgentId,
-        actor::CompletionMode,
+        actor::{CompletionMode, ConnectMilestone},
         journal::{EventClass, EventDirection, EventFilter},
     },
     config::{Config, DccReceiveRoot},
@@ -679,6 +679,143 @@ async fn reconnect_keeps_the_stream_refreshes_motd_and_requests_history_after_th
         .disconnect(&connected.agent_id, None)
         .await
         .expect("disconnect");
+}
+
+/// A connect that authenticates reports the same stage set as one that does
+/// not, and reports each stage once.
+///
+/// The channel this drains is sized for the sequence — `ConnectMilestone::TOTAL`
+/// — precisely so a caller that is slow to read cannot lose a stage. That
+/// guarantee only holds if the actor emits each stage once: a SASL connect
+/// settles capability negotiation twice, once to authenticate and once to end,
+/// and the duplicate would overrun the channel and drop whichever stage came
+/// last. The last stage is the one that says the guest is finally present in its
+/// channels, so nothing is read here until the connect has finished, which is
+/// the worst case the sizing claims to cover.
+#[tokio::test]
+async fn a_sasl_connect_reports_each_stage_exactly_once_and_ends_at_the_last_one() {
+    let fake = FakeErgo::spawn().await;
+    let mut config = fake.config();
+    config.irc.sasl = Some(crate::tests::fake_ergo::sasl_config());
+    let gateway = Gateway::new(config);
+    let (milestones, mut reached) =
+        tokio::sync::mpsc::channel(crate::agent::actor::ConnectMilestone::TOTAL as usize);
+
+    let connected = gateway
+        .connect_as(
+            OwnerId::local(),
+            connect_request("Ariadne"),
+            Some(milestones),
+        )
+        .await
+        .expect("an authenticated connect");
+
+    let mut reported = Vec::new();
+    while let Ok(milestone) = reached.try_recv() {
+        reported.push(milestone);
+    }
+    let steps: Vec<u32> = reported.iter().map(|stage| stage.step()).collect();
+    assert!(
+        steps.windows(2).all(|pair| pair[0] < pair[1]),
+        "stages are ordinals reported in order, never repeated: {reported:?}"
+    );
+    for stage in [
+        ConnectMilestone::Connecting,
+        ConnectMilestone::TransportReady { encrypted: false },
+        ConnectMilestone::CapabilitiesNegotiated,
+        ConnectMilestone::Authenticated,
+        ConnectMilestone::Registered,
+        ConnectMilestone::MotdComplete,
+        ConnectMilestone::AutojoinSynchronized,
+    ] {
+        assert_eq!(
+            reported.iter().filter(|seen| **seen == stage).count(),
+            1,
+            "{stage:?} was reported {} times: {reported:?}",
+            reported.iter().filter(|seen| **seen == stage).count()
+        );
+    }
+    assert_eq!(
+        steps.last().copied(),
+        Some(ConnectMilestone::TOTAL),
+        "the stage saying the guest is present in its channels must survive: {reported:?}"
+    );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+/// A bounded wait is bounded by what the caller asked for, not by how long the
+/// relay happens to be offline.
+///
+/// Reads park inside the actor and are expired by its housekeeping tick. That
+/// tick only ran in the connected loop, so a read issued during reconnect
+/// backoff waited out the whole backoff — a caller that asked for half a second
+/// and got the reconnect delay instead, with no way to tell the two apart.
+#[tokio::test]
+async fn a_bounded_read_returns_on_its_own_deadline_while_the_relay_is_reconnecting() {
+    let fake = FakeErgo::spawn().await;
+    let mut config = fake.config();
+    // Long enough that a read waiting out the backoff is unmistakable.
+    config.reconnect.initial_delay_ms = 30_000;
+    config.reconnect.max_delay_ms = 30_000;
+    config.reconnect.jitter = 0.0;
+    let gateway = Gateway::new(config);
+    let connected = gateway
+        .connect(connect_request("Nyx"))
+        .await
+        .expect("connect");
+    gateway
+        .execute(
+            &connected.agent_id,
+            OutboundMessage::new("DROPME", Vec::new()),
+            CompletionMode::FireAndForget,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("drop trigger");
+
+    // Park the read from inside the backoff, and from the position the loss
+    // itself left behind, so nothing already journaled can answer it early.
+    let parked = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = gateway
+                .snapshot(&connected.agent_id)
+                .await
+                .expect("snapshot");
+            if snapshot.state.connection_state == crate::agent::state::ConnectionState::Reconnecting
+            {
+                return snapshot.journal.latest;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the relay must enter backoff");
+
+    let started = std::time::Instant::now();
+    let page = tokio::time::timeout(
+        Duration::from_secs(5),
+        gateway.read_events(
+            &connected.agent_id,
+            Some(parked),
+            10,
+            Duration::from_millis(300),
+            EventFilter::default(),
+        ),
+    )
+    .await
+    .expect("a bounded read must not wait out the backoff")
+    .expect("read events");
+
+    assert!(page.events.is_empty(), "nothing arrived while offline");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the read returned after {:?}, which is the backoff rather than its own deadline",
+        started.elapsed()
+    );
 }
 
 /// Journal pressure has to reach the caller as relay state, not only as a

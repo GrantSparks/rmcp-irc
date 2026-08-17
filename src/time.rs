@@ -11,9 +11,24 @@ use serde::{Deserialize, Serialize};
 pub struct Timestamp(DateTime<Utc>);
 
 impl Timestamp {
+    /// The furthest instant this representation can carry.
+    ///
+    /// A sentinel for a deadline that a configured duration pushed past the end
+    /// of the calendar. Adding an unbounded duration to `now` is the kind of
+    /// arithmetic chrono answers with a panic, and no configuration value is
+    /// worth aborting a connection over: a deadline that far away is never
+    /// reached, which is exactly what an absurd configured delay asked for.
+    pub const MAX: Self = Self(DateTime::<Utc>::MAX_UTC);
+
     /// Current UTC time.
     pub fn now() -> Self {
         Self(Utc::now())
+    }
+
+    /// This instant advanced by `delta`, clamped to [`Self::MAX`] rather than
+    /// overflowing.
+    pub fn saturating_add(self, delta: chrono::TimeDelta) -> Self {
+        self.0.checked_add_signed(delta).map_or(Self::MAX, Self)
     }
 
     /// Wrap an existing instant.

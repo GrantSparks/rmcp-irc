@@ -2931,11 +2931,28 @@ impl ServerHandler for IrcMcpService {
             .map_err(|error| McpError::internal_error(error, None))
     }
 
+    /// Acknowledge only the subscriptions this server can ever fulfil.
+    ///
+    /// The SDK intersects what is returned here with the request and with the
+    /// advertised capabilities before acknowledging it, so narrowing is how one
+    /// URI is declined without failing the whole stream: the acknowledgment
+    /// then tells the caller exactly which of its subscriptions are live.
+    ///
+    /// One form is declined that way. `irc://watches/{id}/events/after/...` is
+    /// a *position*, a different URI for every read, and nothing ever publishes
+    /// an update for one — a subscription to it could not fire, and
+    /// acknowledging it would promise a wake-up that never comes. The
+    /// descriptor, `irc://watches/{id}`, is the subscribable form and is what
+    /// the watch's own instructions name.
     fn accepted_subscription_filter(
         &self,
         requested: &SubscriptionFilter,
     ) -> Option<SubscriptionFilter> {
-        Some(requested.supported_by(&self.get_info().capabilities))
+        let mut accepted = requested.supported_by(&self.get_info().capabilities);
+        if let Some(uris) = accepted.resource_subscriptions.as_mut() {
+            uris.retain(|uri| is_subscribable_resource(uri));
+        }
+        Some(accepted)
     }
 
     async fn listen(&self, context: SubscriptionContext) -> Result<(), McpError> {
@@ -2952,7 +2969,7 @@ impl ServerHandler for IrcMcpService {
                     Ok(uri) if uri == "irc://agents" => {
                         let _ = context.sink().notify_resource_list_changed().await;
                     }
-                    Ok(uri) if self.owner_may_observe_resource(&owner, &uri).await => {
+                    Ok(uri) if self.may_deliver(&owner, context.accepted(), &uri).await => {
                         let _ = context.sink().notify_resource_updated(uri).await;
                     }
                     Ok(_) => {}
@@ -3009,6 +3026,29 @@ impl IrcMcpService {
             }
         }
         Ok(())
+    }
+
+    /// Whether one broadcast may go out on this subscription.
+    ///
+    /// There are two ways to qualify. A URI this subscription already holds was
+    /// authorized when the stream was established, and handles are UUIDs that
+    /// are never reused, so it cannot later come to name somebody else's
+    /// resource. Anything else is checked against the caller's ownership again,
+    /// per broadcast, so a shared gateway never leaks another owner's activity.
+    ///
+    /// The distinction matters for exactly one message. When a watch handle
+    /// expires, the registry publishes its descriptor URI one last time so the
+    /// subscriber re-reads, is told the handle is unknown, and creates a
+    /// replacement — and by then the handle resolves to no owner at all.
+    /// Re-checking ownership would drop that message and leave the subscriber
+    /// holding a live subscription to a resource that has quietly stopped
+    /// existing, which is the silence this whole path exists to prevent.
+    async fn may_deliver(&self, owner: &OwnerId, accepted: &SubscriptionFilter, uri: &str) -> bool {
+        let subscribed = accepted
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|uris| uris.iter().any(|held| held == uri));
+        subscribed || self.owner_may_observe_resource(owner, uri).await
     }
 
     /// Whether one caller may receive an update for a stable resource URI.
@@ -3973,6 +4013,22 @@ fn gateway_read_error(error: GatewayError) -> McpError {
         }
         other => McpError::internal_error(other.to_string(), None),
     }
+}
+
+/// Whether this server ever publishes an update for a URI.
+///
+/// Only the positioned watch window is excluded, and only because a position is
+/// not a thing that changes: the same URI always answers with the same window,
+/// and a new one is minted for every read. Everything else addressable here is
+/// a stable URI whose contents can change under a subscriber.
+fn is_subscribable_resource(uri: &str) -> bool {
+    !matches!(
+        WatchUri::from_str(uri),
+        Ok(WatchUri {
+            target: WatchTarget::EventsAfter(_),
+            ..
+        })
+    )
 }
 
 /// Catalog entry for one watch handle.

@@ -7,3 +7,4 @@ mod gateway_integration;
 mod irc_protocol;
 mod output_schema;
 mod streamable_http;
+mod subscriptions;

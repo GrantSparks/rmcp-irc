@@ -3,9 +3,18 @@
 This document is the normative asynchronous-delivery and state-reduction
 contract. IRC is a long-lived event protocol; MCP resource notifications only
 signal that something changed. Ordered delivery therefore comes from explicit
-positions over each agent's bounded in-memory journal. Watches hold immutable
-selections, never positions; callers own every ordinary cursor, including those
-used through `irc.events.read`.
+positions over each agent's bounded in-memory journal, and every one of those
+positions is wholly the caller's own: nothing on the server holds a position on
+anyone's behalf, so no read can consume what another reader — or a host
+refreshing a view — has not yet seen.
+
+A watch is a filter and a notification target, never a queue. It decides *when*
+you are woken and *what* wakes you; it stores no position at all. The two
+consumption paths both carry the position with them: `irc.events.read`, which
+takes the cursor you persisted and can long poll, and
+`irc://watches/{watch_id}/events/after/{stream_id}/{sequence}`, which carries it
+in the path. Both are idempotent, so re-reading a position you already hold
+returns the same window and costs nothing.
 
 ## Event production rule
 
@@ -436,9 +445,17 @@ lost. Positions are therefore wholly caller-owned:
 - both paths report `status`, which is `current` unless records were lost, in
   which case the reader is told explicitly rather than silently restarted, and
   recovery is an ordinary read from the `next_cursor` the report handed back;
-- a caller may hold `limits.max_watches_per_owner` watches, and a watch nobody
-  reads lapses after `limits.watch_ttl_ms`; any read refreshes it and the
-  descriptor publishes `expires_at`;
+- a caller may hold `limits.max_watches_per_owner` watches, and a watch lapses
+  after `limits.watch_ttl_ms` of being unused; any read refreshes it, and so
+  does delivering a match, so a watch that is quiet only because its selection
+  is narrow does not lapse under a subscriber that is still listening;
+- a watch that does lapse emits one final `notifications/resources/updated` for
+  its descriptor URI, so the subscriber re-reads, learns the handle is unknown,
+  and creates a replacement rather than waiting forever on a dead resource; the
+  descriptor publishes `expires_at` throughout;
+- the descriptor URI is the only subscribable form: the positioned window is a
+  different URI per position, is never published as changed, and is dropped from
+  the acknowledged filter rather than acknowledged and then left silent;
 - `irc.watch.close` releases the handle.
 
 Because both paths are idempotent, a lost response is recovered by presenting

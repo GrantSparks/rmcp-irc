@@ -21,6 +21,16 @@
 //!
 //! Both are idempotent: the same position always returns the same window, and
 //! the cursor they hand back advances only over events they actually returned.
+//!
+//! The descriptor URI is also the only subscribable form. The positioned window
+//! is a different URI for every position, is never published as changed, and is
+//! excluded from the accepted subscription filter for that reason: subscribe to
+//! `irc://watches/{id}`, and read the position you hold when it wakes you.
+//!
+//! A handle expires when nobody is using it, where "in use" covers both a
+//! caller reading it and the watch delivering a match — and an expiry announces
+//! itself on the resource-update channel rather than letting a subscriber wait
+//! on a handle that has quietly stopped existing. See [`WatchRegistry`].
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -31,6 +41,7 @@ use std::{
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
@@ -296,8 +307,9 @@ pub struct WatchDescriptor {
     /// Stable resource URI for this watch.
     pub uri: String,
     /// When an unused handle stops working. Reading either consumption path or
-    /// the descriptor itself pushes this out again, so a watch expires only
-    /// after nobody has used it for the configured window.
+    /// the descriptor itself pushes this out again, and so does delivering a
+    /// match to this watch's subscribers, so a watch expires only after it has
+    /// gone the configured window with nothing to say and nobody asking.
     pub expires_at: Timestamp,
 }
 
@@ -432,8 +444,10 @@ impl WatchEventsResource {
 
 /// The single delivery loop a caller should implement, published from the
 /// descriptor resource and from `irc.watch.create` so both say the same thing.
-pub const WATCH_INSTRUCTIONS: &str = "Merge this watch's URI into resourceSubscriptions on the \
-     client's one subscriptions/listen stream. On each notification, read irc.events.read with this watch_id and the \
+pub const WATCH_INSTRUCTIONS: &str = "Merge this watch's own irc://watches/{watch_id} into \
+     resourceSubscriptions on the client's one subscriptions/listen stream; that descriptor is \
+     the only subscribable form, and a positioned events/after URI is read rather than subscribed \
+     to. On each notification, read irc.events.read with this watch_id and the \
      cursor you last persisted, or fetch \
      irc://watches/{watch_id}/events/after/{stream_id}/{sequence} for the compact window. Persist \
      the next_cursor each read returns; nothing on the server moves, so re-reading a cursor is \
@@ -576,7 +590,9 @@ pub struct WatchLimits {
     /// Watches one caller may hold at once, across all of its agents.
     pub max_per_owner: usize,
     /// How long a watch survives without being used. Refreshed whenever a
-    /// caller resolves the handle, so an actively consumed watch never expires.
+    /// caller resolves the handle and whenever the watch delivers a match, so
+    /// a watch that is being read or being woken never expires under its
+    /// caller.
     pub time_to_live: Duration,
 }
 
@@ -592,18 +608,47 @@ pub struct WatchLimits {
 /// opportunistically — every read treats a lapsed handle as absent and every
 /// write reclaims it — rather than from a timer, which keeps the registry a
 /// plain lock with no task of its own.
+///
+/// # What keeps a watch alive
+///
+/// "In use" means one of two things, and both push the expiry out:
+///
+/// * a caller resolved the handle through [`Self::touch`], which every
+///   consumption path and every descriptor read does;
+/// * the watch delivered a match through [`Self::matching_uris`], because a
+///   notification went out naming this handle and the caller is expected to
+///   come back and read it.
+///
+/// Counting a delivery matters for the watch that is quiet by design. A
+/// mentions-only watch a host subscribed to can go a whole TTL without a match,
+/// and if a match then arrived at a lapsed handle it would be filtered out and
+/// dropped in silence — the subscriber holding a live subscription and hearing
+/// nothing ever again. Traffic that is merely *counted* is deliberately not a
+/// use: see [`Self::filters_for`].
+///
+/// Retirement is announced. When a lapsed handle is reclaimed, its descriptor
+/// URI is published on the same resource-update channel that carries ordinary
+/// notifications, so a subscribed host re-reads the descriptor, is told the
+/// handle is unknown, and can create a replacement instead of waiting on a
+/// resource that will never speak again.
 #[derive(Debug)]
 pub struct WatchRegistry {
     limits: WatchLimits,
     watches: RwLock<BTreeMap<WatchId, Watch>>,
+    /// Where the retirement of a lapsed handle is announced. This is the
+    /// gateway's resource-update channel, so the expiry of a watch reaches a
+    /// subscriber by the same route as an event that matched it.
+    expiry_updates: broadcast::Sender<String>,
 }
 
 impl WatchRegistry {
-    /// Create an empty registry with the bounds it will enforce.
-    pub fn new(limits: WatchLimits) -> Self {
+    /// Create an empty registry with the bounds it will enforce, publishing
+    /// expiries onto `expiry_updates`.
+    pub fn new(limits: WatchLimits, expiry_updates: broadcast::Sender<String>) -> Self {
         Self {
             limits,
             watches: RwLock::new(BTreeMap::new()),
+            expiry_updates,
         }
     }
 
@@ -619,7 +664,7 @@ impl WatchRegistry {
     ) -> Result<WatchDescriptor> {
         let now = Timestamp::now();
         let mut watches = self.watches.write().expect("watch registry lock");
-        watches.retain(|_, watch| watch.expires_at > now);
+        self.retire_expired(&mut watches, now);
         let held = watches
             .values()
             .filter(|watch| watch.owner == owner)
@@ -647,7 +692,7 @@ impl WatchRegistry {
     pub fn close(&self, watch_id: &WatchId) -> bool {
         let now = Timestamp::now();
         let mut watches = self.watches.write().expect("watch registry lock");
-        watches.retain(|_, watch| watch.expires_at > now);
+        self.retire_expired(&mut watches, now);
         watches.remove(watch_id).is_some()
     }
 
@@ -671,13 +716,14 @@ impl WatchRegistry {
 
     /// Describe one live watch and push its expiry out again.
     ///
-    /// Used by the consumption paths, so "in use" means a caller asked for its
-    /// events and not merely that IRC traffic happened to match: otherwise a
-    /// busy channel would keep a watch nobody reads alive forever.
+    /// Used by the consumption paths, so a caller asking for this watch's
+    /// events is the clearest form of "in use". Traffic that merely matched is
+    /// the other form, applied by [`Self::matching_uris`] at the point a
+    /// notification is actually published.
     pub fn touch(&self, watch_id: &WatchId) -> Option<WatchDescriptor> {
         let now = Timestamp::now();
         let mut watches = self.watches.write().expect("watch registry lock");
-        watches.retain(|_, watch| watch.expires_at > now);
+        self.retire_expired(&mut watches, now);
         let watch = watches.get_mut(watch_id)?;
         watch.expires_at = self.expiry_after(now);
         Some(watch.descriptor(watch_id))
@@ -699,9 +745,10 @@ impl WatchRegistry {
     ///
     /// Read-only in every sense: it neither refreshes a watch's time to live nor
     /// tells the registry that anybody consumed anything. Activity hints are
-    /// computed from these on ordinary tool results, and a hint is not a use of
-    /// the handle — keeping a watch alive because unrelated traffic happened to
-    /// be counted is exactly what [`Self::touch`] exists to avoid.
+    /// computed from these on ordinary tool results, and a hint is neither a
+    /// read of the handle nor a delivery to it — it is a tally piggybacked on
+    /// some other call, so a watch whose only trace in the system is having been
+    /// counted here is exactly the abandoned handle expiry exists to reclaim.
     pub fn filters_for(&self, agent_id: &AgentId) -> Vec<WatchFilter> {
         let now = Timestamp::now();
         self.watches
@@ -713,11 +760,20 @@ impl WatchRegistry {
             .collect()
     }
 
-    /// URIs of every live watch on one agent that selects this event.
+    /// URIs of every live watch on one agent that selects this event, pushing
+    /// the expiry of each one out.
     ///
-    /// Called on the actor's own task for each journaled record, so it takes
-    /// the read lock briefly and allocates only for watches that actually
-    /// matched.
+    /// Delivering a match *is* a use of the handle. A watch that is quiet by
+    /// design — mentions only, one rarely used channel — can otherwise sit
+    /// through its whole time to live and lapse a moment before the message it
+    /// exists to catch arrives, and the caller would learn nothing: the
+    /// notification it was subscribed to would simply never come. Refreshing
+    /// here means a watch stays alive for as long as traffic keeps reaching it
+    /// inside one TTL window, and lapses only once both its caller and its
+    /// stream have gone quiet.
+    ///
+    /// Called on the actor's own task for each journaled record, so it holds the
+    /// lock briefly and allocates only for watches that actually matched.
     pub fn matching_uris(
         &self,
         agent_id: &AgentId,
@@ -725,19 +781,39 @@ impl WatchRegistry {
         case_mapping: CaseMapping,
     ) -> Vec<String> {
         let now = Timestamp::now();
-        self.watches
-            .read()
-            .expect("watch registry lock")
-            .iter()
-            .filter(|(_, watch)| watch.agent_id == *agent_id && watch.expires_at > now)
+        let refreshed = self.expiry_after(now);
+        let mut watches = self.watches.write().expect("watch registry lock");
+        self.retire_expired(&mut watches, now);
+        watches
+            .iter_mut()
+            .filter(|(_, watch)| watch.agent_id == *agent_id)
             .filter(|(_, watch)| watch.filter.matches(event, case_mapping))
-            .map(|(watch_id, _)| watch_uri(watch_id))
+            .map(|(watch_id, watch)| {
+                watch.expires_at = refreshed;
+                watch_uri(watch_id)
+            })
             .collect()
+    }
+
+    /// Drop every lapsed handle, announcing each retirement once.
+    ///
+    /// The announcement is the point. Expiry is discovered opportunistically
+    /// rather than on a timer, so this runs at every write, and a subscriber
+    /// that hears its watch's URI, re-reads it, and is told the handle is
+    /// unknown has learned the one thing silence could never tell it.
+    fn retire_expired(&self, watches: &mut BTreeMap<WatchId, Watch>, now: Timestamp) {
+        watches.retain(|watch_id, watch| {
+            if watch.expires_at > now {
+                return true;
+            }
+            let _ = self.expiry_updates.send(watch_uri(watch_id));
+            false
+        });
     }
 
     fn expiry_after(&self, now: Timestamp) -> Timestamp {
         let millis = i64::try_from(self.limits.time_to_live.as_millis()).unwrap_or(i64::MAX);
-        Timestamp::from_datetime(now.as_datetime() + chrono::Duration::milliseconds(millis))
+        now.saturating_add(chrono::Duration::milliseconds(millis))
     }
 }
 
@@ -875,11 +951,28 @@ mod tests {
         }
     }
 
+    /// A registry with the expiry channel nothing in these tests listens on.
     fn registry() -> WatchRegistry {
-        WatchRegistry::new(WatchLimits {
+        registry_with(WatchLimits {
             max_per_owner: 4,
             time_to_live: Duration::from_secs(60),
         })
+        .0
+    }
+
+    /// A registry and the receiver its retirements are announced on.
+    fn registry_with(limits: WatchLimits) -> (WatchRegistry, broadcast::Receiver<String>) {
+        let (updates, receiver) = broadcast::channel(16);
+        (WatchRegistry::new(limits, updates), receiver)
+    }
+
+    /// Every URI announced so far, in order.
+    fn announced(receiver: &mut broadcast::Receiver<String>) -> Vec<String> {
+        let mut seen = Vec::new();
+        while let Ok(uri) = receiver.try_recv() {
+            seen.push(uri);
+        }
+        seen
     }
 
     #[test]
@@ -970,7 +1063,7 @@ mod tests {
 
     #[test]
     fn a_caller_cannot_hold_more_watches_than_its_own_allowance() {
-        let registry = WatchRegistry::new(WatchLimits {
+        let (registry, _updates) = registry_with(WatchLimits {
             max_per_owner: 2,
             time_to_live: Duration::from_secs(60),
         });
@@ -998,7 +1091,7 @@ mod tests {
 
     #[test]
     fn an_unused_watch_expires_and_reading_it_frees_its_slot() {
-        let registry = WatchRegistry::new(WatchLimits {
+        let (registry, _updates) = registry_with(WatchLimits {
             max_per_owner: 1,
             // Already lapsed by the time anything looks at it, which is the
             // same condition an idle handle reaches later.
@@ -1039,6 +1132,99 @@ mod tests {
         assert!(
             refreshed.expires_at >= descriptor.expires_at,
             "using a watch must not shorten its life"
+        );
+    }
+
+    #[test]
+    fn delivering_a_match_pushes_a_quiet_watchs_expiry_out() {
+        // The failure this prevents: a mentions-only watch a host subscribed to
+        // stays quiet for a whole time to live, lapses, and then silently
+        // declines the very message it was created to catch.
+        let registry = registry();
+        let agent = AgentId::new();
+        let descriptor = registry
+            .create(OwnerId::local(), agent.clone(), WatchFilter::default())
+            .expect("create watch");
+        // Timestamps carry milliseconds, so the refresh needs one to land in.
+        std::thread::sleep(Duration::from_millis(2));
+
+        let woken = registry.matching_uris(
+            &agent,
+            &event(Some("#control"), EventClass::MessageChannel, false),
+            CaseMapping::default(),
+        );
+
+        assert_eq!(woken, vec![descriptor.uri.clone()]);
+        let refreshed = registry
+            .describe(&descriptor.watch_id)
+            .expect("a live watch resolves");
+        assert!(
+            refreshed.expires_at > descriptor.expires_at,
+            "delivering a match is a use of the handle: {} did not move past {}",
+            refreshed.expires_at,
+            descriptor.expires_at
+        );
+    }
+
+    #[test]
+    fn traffic_a_watch_declines_does_not_extend_its_life() {
+        // The other half of the definition: only traffic that actually reaches
+        // a subscriber counts, so a busy channel cannot keep a watch nobody
+        // reads and nothing matches alive forever.
+        let registry = registry();
+        let agent = AgentId::new();
+        let descriptor = registry
+            .create(
+                OwnerId::local(),
+                agent.clone(),
+                WatchFilter {
+                    mentions_only: true,
+                    ..WatchFilter::default()
+                },
+            )
+            .expect("create watch");
+        std::thread::sleep(Duration::from_millis(2));
+
+        let woken = registry.matching_uris(
+            &agent,
+            &event(Some("#control"), EventClass::MessageChannel, false),
+            CaseMapping::default(),
+        );
+
+        assert!(woken.is_empty());
+        assert_eq!(
+            registry
+                .describe(&descriptor.watch_id)
+                .expect("a live watch resolves")
+                .expires_at,
+            descriptor.expires_at,
+            "an event this watch declined is not a use of the handle"
+        );
+    }
+
+    #[test]
+    fn retiring_a_lapsed_watch_announces_it_once() {
+        let (registry, mut updates) = registry_with(WatchLimits {
+            max_per_owner: 4,
+            time_to_live: Duration::ZERO,
+        });
+        let agent = AgentId::new();
+        let descriptor = registry
+            .create(OwnerId::local(), agent.clone(), WatchFilter::default())
+            .expect("create watch");
+        assert!(
+            announced(&mut updates).is_empty(),
+            "creating a watch announces nothing about expiry"
+        );
+
+        // Any write reclaims it, and the reclaim is what a subscriber hears.
+        assert!(registry.touch(&descriptor.watch_id).is_none());
+
+        assert_eq!(announced(&mut updates), vec![descriptor.uri.clone()]);
+        assert!(registry.touch(&descriptor.watch_id).is_none());
+        assert!(
+            announced(&mut updates).is_empty(),
+            "a handle is retired, and announced, exactly once"
         );
     }
 

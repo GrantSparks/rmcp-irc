@@ -360,6 +360,7 @@ impl AgentHandle {
             state: state_tx,
             ready: Some(ready_tx),
             milestones,
+            reached_milestones: 0,
             journal: super::journal::EventJournal::new(
                 config.limits.event_count,
                 config.limits.event_bytes,
@@ -642,6 +643,23 @@ fn connection_failure_detail(error: &GatewayError) -> String {
     }
 }
 
+/// When the next reconnect attempt is due, if one is scheduled at all.
+///
+/// A zero delay means the backoff sequence was reset and nothing is pending.
+/// Anything else is `now` plus the delay — computed without overflowing, because
+/// `reconnect.max_delay_ms` is operator-supplied and a delay large enough to run
+/// off the end of the calendar would otherwise panic the actor rather than
+/// merely schedule an attempt nobody lives to see. Such a delay clamps to
+/// [`Timestamp::MAX`], which reports the truth: the relay is waiting, and not
+/// until any date this configuration will reach.
+fn scheduled_attempt_at(now: Timestamp, delay: Duration) -> Option<Timestamp> {
+    if delay.is_zero() {
+        return None;
+    }
+    let millis = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
+    Some(now.saturating_add(chrono::Duration::milliseconds(millis)))
+}
+
 #[derive(Debug)]
 enum DccRuntimeEvent {
     ChatConnected {
@@ -675,6 +693,14 @@ pub struct AgentActor {
     /// them. Dropped once the initial connect settles: a later reconnect has no
     /// request waiting on it, so it has nobody to narrate to.
     milestones: Option<mpsc::Sender<ConnectMilestone>>,
+    /// Stages already published for the connect attempt in progress, one bit
+    /// per [`ConnectMilestone::step`].
+    ///
+    /// A milestone can be *reached* by more than one observation — capability
+    /// negotiation settles on either an authentication or an end — and each
+    /// stage is one report, so the emitting sites are deduplicated here rather
+    /// than each having to know what the others saw.
+    reached_milestones: u32,
     journal: super::journal::EventJournal,
     isupport: IsupportRegistry,
     capabilities: CapabilityNegotiator,
@@ -810,19 +836,34 @@ impl AgentActor {
         self.finish_shutdown();
     }
 
-    /// Publish one connect stage to whoever is awaiting this registration.
+    /// Publish one connect stage, once, to whoever is awaiting this
+    /// registration.
     ///
-    /// Best effort by construction. The channel is bounded and sized for the
-    /// whole sequence, so nothing is dropped in practice, but progress is
-    /// advisory: a caller that stopped reading must lose notifications rather
-    /// than slow the connection down or fail it.
-    fn reach(&self, milestone: ConnectMilestone) {
+    /// Repeats are dropped here so the sequence a caller sees is the sequence
+    /// of stages: several observations can mean "capability negotiation has
+    /// settled", and reporting each of them would emit more stages than exist,
+    /// overrun a channel sized for the whole sequence, and lose the *last*
+    /// stage — the one saying the guest is finally present in its channels.
+    ///
+    /// What remains is best effort by construction. The channel holds every
+    /// stage, so nothing is dropped even if nobody reads until the end, but
+    /// progress is advisory: a caller that stopped reading must lose
+    /// notifications rather than slow the connection down or fail it.
+    fn reach(&mut self, milestone: ConnectMilestone) {
+        let already_reported = 1_u32 << milestone.step();
+        if self.reached_milestones & already_reported != 0 {
+            return;
+        }
+        self.reached_milestones |= already_reported;
         if let Some(milestones) = &self.milestones {
             let _ = milestones.try_send(milestone);
         }
     }
 
     async fn establish(&mut self, source: MotdSource) -> Result<(IrcFramed, RegistrationReceipt)> {
+        // One attempt, one sequence: a reconnect narrates itself from the start
+        // rather than inheriting what the previous attempt already reported.
+        self.reached_milestones = 0;
         self.set_connection_state(ConnectionState::Connecting, None);
         self.reach(ConnectMilestone::Connecting);
         let stream = connect(&self.config.irc).await?;
@@ -1641,12 +1682,27 @@ impl AgentActor {
         self.notify_resources(&["status"]);
     }
 
+    /// Serve what can still be served while waiting out a reconnect delay.
+    ///
+    /// The wait is bounded by the backoff, which a caller has no say in and
+    /// which grows: a long poll parked here must still answer at *its* own
+    /// deadline. So this carries the same housekeeping interval the connected
+    /// loop does, and expires due reads on it. Without that, an
+    /// `irc.events.read` with `wait_ms: 5000` issued a moment after the
+    /// connection dropped would hang for the whole backoff — the caller asked
+    /// for a bounded wait and would get an unbounded one.
     async fn wait_reconnect(&mut self, delay: Duration) -> ReconnectDecision {
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 () = &mut sleep => return ReconnectDecision::Reconnect,
+                // Only the reads: every other pending obligation was already
+                // failed when the connection was lost, and a command that
+                // arrives now is refused immediately below rather than parked.
+                _ = tick.tick() => self.flush_event_reads(true),
                 Some(command) = self.commands.recv() => match command {
                     AgentCommand::Execute { completion, .. } => {
                         let _ = completion.send(Err(GatewayError::NotConnected(self.id.clone())));
@@ -2342,14 +2398,7 @@ impl AgentActor {
         let mut state = self.state.borrow().clone();
         state.reconnect.attempt = attempt;
         state.reconnect.delay_ms = (!delay.is_zero()).then_some(delay.as_millis() as u64);
-        state.reconnect.next_attempt_at = (!delay.is_zero()).then(|| {
-            Timestamp::from_datetime(
-                now.as_datetime()
-                    + chrono::Duration::milliseconds(
-                        i64::try_from(delay.as_millis()).unwrap_or(i64::MAX),
-                    ),
-            )
-        });
+        state.reconnect.next_attempt_at = scheduled_attempt_at(now, delay);
         state.snapshot_at = now;
         let scheduled = state.reconnect.next_attempt_at.map(Timestamp::to_rfc3339);
         tracing::info!(
@@ -3725,6 +3774,26 @@ mod tests {
         let projected = ActiveLineBudget::from(LineBudget::TRADITIONAL);
         assert_eq!(projected.max_body_bytes, 512);
         assert_eq!(projected.max_tag_bytes, 4096);
+    }
+
+    #[test]
+    fn a_reconnect_delay_too_large_to_schedule_clamps_instead_of_panicking() {
+        let now = Timestamp::now();
+        assert_eq!(scheduled_attempt_at(now, Duration::ZERO), None);
+        assert!(
+            scheduled_attempt_at(now, Duration::from_millis(200))
+                .expect("a pending attempt is scheduled")
+                > now
+        );
+        // `reconnect.max_delay_ms` is an operator-supplied u64, so the whole
+        // range has to answer with a timestamp rather than an abort.
+        for absurd in [Duration::from_millis(u64::MAX), Duration::MAX] {
+            assert_eq!(
+                scheduled_attempt_at(now, absurd),
+                Some(Timestamp::MAX),
+                "a delay past the end of the calendar clamps"
+            );
+        }
     }
 
     #[test]

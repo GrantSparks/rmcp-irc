@@ -240,6 +240,13 @@ reader would never see is not unread anything. The agent's own words never count
 in either form they take: the outbound record, and the same message arriving back
 on a server with `echo-message`.
 
+`total` is every selected record, not the sum of `unread`. Two things separate
+them: targets the cap dropped, which `truncated` announces, and selected records
+that have no target at all — a peer quitting or going away is conversational and
+is counted, but IRC gives it no channel or nickname to file it under. A hint
+reading `{"total": 1, "unread": {}, "truncated": false}` is therefore correct
+and means "one thing you watch happened, addressed to no one conversation".
+
 `watches` is how many live watches the counts were drawn from. Zero means this
 agent holds none, which is why `unread` is empty: create one with
 `irc.watch.create` to give the counts a selection. Direct messages are keyed by
@@ -1052,11 +1059,29 @@ other's backlog. Notifications are evaluated against the watch filter, so
 unrelated traffic does not wake it. Start from `latest_cursor` to receive only
 what happens next.
 
+`irc://watches/{watch_id}` — the descriptor — is the only subscribable form.
+The positioned window is a different URI for every position and is never
+published as changed, so naming it in `resourceSubscriptions` is declined: it is
+dropped from the filter the acknowledgment carries back, rather than
+acknowledged and then left silent. Subscribe to the descriptor, and read the
+position you hold when it wakes you.
+
 Handles are bounded and expire. A caller may hold `limits.max_watches_per_owner`
-watches at once, and a watch nobody reads lapses after `limits.watch_ttl_ms`;
-either consumption path or a descriptor read refreshes it, and the descriptor
-publishes `expires_at`. `irc.watch.close` releases the handle and its
-notification state.
+watches at once, and a watch lapses after `limits.watch_ttl_ms` of being
+unused, where "used" means either of two things:
+
+- a caller resolved it — either consumption path, or a descriptor read;
+- the watch delivered a match, because a notification naming this handle went
+  out and its caller is expected to come back and read it.
+
+Counting delivery is what keeps a deliberately quiet watch alive. A
+mentions-only watch can otherwise sit through a whole TTL, lapse, and then
+silently decline the message it was created to catch. A watch that both its
+caller and its stream have gone quiet on does still lapse — and says so: the
+gateway emits one final `notifications/resources/updated` for the descriptor
+URI as the handle is reclaimed, so a subscriber re-reads it, is told the handle
+is unknown, and can create a replacement. The descriptor publishes `expires_at`
+throughout. `irc.watch.close` releases the handle and its notification state.
 
 ### `irc.events.read`
 
@@ -1301,11 +1326,16 @@ resource.
 Contains one positioned compact window that the watch selects:
 `requested_cursor`, `status`, `oldest_available`, `latest`, `events`,
 `next_cursor`, `has_more`, and `next_uri`. The position comes from the path, so
-the same URI always returns the same window. Ordinary watches exclude records
-with no conversational form during selection. Compound attention watches also
-return short summaries for their sparse lifecycle, policy, retention, and DCC
-classes. In either case, `next_cursor` advances over events actually returned;
-use the lossless `irc.events.read` result when wire and protocol detail matters.
+the same URI always returns the same window. Records with no conversational form
+are excluded from the selection rather than dropped after it, which is what
+keeps `next_cursor` a position over events actually returned: ordinary watches
+preselect conversational records, and compound attention watches also return
+short summaries for their sparse lifecycle, policy, retention, and DCC classes.
+Read the lossless wire and protocol detail with `irc.events.read` and this
+`watch_id`. This form is read, never subscribed: every position is a different
+URI, none of them is ever published as changed, and `subscriptions/listen`
+drops one from the filter it acknowledges rather than promising a wake-up that
+could never come. Subscribe to `irc://watches/{watch_id}`.
 
 All catalog entries and native links include MCP annotations. Conversational
 resources target model/user audiences with higher priorities; wire and
@@ -1317,7 +1347,9 @@ when the gateway has an authoritative snapshot timestamp.
 Material changes emit `notifications/resources/updated` for affected stable
 URIs. Watch notifications apply their registered selection before waking a
 subscriber; event-resource notifications remain broader coalescing wake-up
-signals. Terminal DCC transitions and new MOTDs must be signaled promptly.
+signals. Terminal DCC transitions and new MOTDs must be signaled promptly. A
+watch handle that lapses emits one last update for its descriptor URI, so the
+end of a subscribable resource is itself a notification rather than silence.
 Notifications carry no consumption position, and no resource read holds one on a
 caller's behalf: after each signal, read `irc.events.read` with your `watch_id`
 and your own cursor, or the positioned window URI, or the agent's cursor

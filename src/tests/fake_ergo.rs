@@ -17,6 +17,7 @@ use std::{
     sync::Arc,
 };
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -37,6 +38,33 @@ pub(super) const KEYED_CHANNEL: &str = "#locked";
 /// no key at all, which is what makes "wrong key" and "missing key"
 /// distinguishable only by what the call itself carried.
 pub(super) const CHANNEL_KEY: &str = "sesame";
+
+/// SASL identity this server accepts.
+pub(super) const SASL_USERNAME: &str = "ariadne";
+
+/// Environment variable the accepted SASL password is read from, by the server
+/// here and by the configuration under test alike.
+///
+/// A configured SASL password is only ever a reference to an environment
+/// variable, and exporting one from inside a test is `unsafe` in this edition,
+/// which this crate forbids. So the fixture agrees with the configuration on a
+/// variable every process already has rather than on one neither can set.
+pub(super) const SASL_PASSWORD_ENV: &str = "PATH";
+
+/// The password [`SASL_PASSWORD_ENV`] currently names.
+pub(super) fn sasl_password() -> String {
+    std::env::var(SASL_PASSWORD_ENV).unwrap_or_default()
+}
+
+/// The SASL configuration this server authenticates.
+pub(super) fn sasl_config() -> crate::config::SaslConfig {
+    crate::config::SaslConfig {
+        username: SASL_USERNAME.to_owned(),
+        password: crate::config::CredentialRef {
+            env: SASL_PASSWORD_ENV.to_owned(),
+        },
+    }
+}
 
 pub(super) struct FakeErgo {
     pub(super) address: SocketAddr,
@@ -109,6 +137,8 @@ async fn serve_client(
     let mut user_seen = false;
     let mut cap_end_seen = false;
     let mut welcomed = false;
+    // Base64 collected from `AUTHENTICATE` lines, once a mechanism was chosen.
+    let mut sasl_payload = None::<String>;
     loop {
         line.clear();
         let Ok(read) = reader.read_line(&mut line).await else {
@@ -127,7 +157,7 @@ async fn serve_client(
             "CAP" if message.params.first().is_some_and(|value| value == "LS") => {
                 write_line(
                     &mut writer,
-                    ":fake CAP * LS :batch cap-notify draft/chathistory draft/message-redaction draft/read-marker echo-message labeled-response message-tags server-time standard-replies",
+                    ":fake CAP * LS :batch cap-notify draft/chathistory draft/message-redaction draft/read-marker echo-message labeled-response message-tags sasl=PLAIN server-time standard-replies",
                 )
                 .await;
             }
@@ -152,6 +182,53 @@ async fn serve_client(
                     &mut welcomed,
                 )
                 .await;
+            }
+            // SASL PLAIN, in the shape a client actually performs it: the
+            // mechanism, an empty challenge, then the payload in as many
+            // chunks as it takes. Nothing about the connect sequence is
+            // observable without a server that completes this exchange.
+            "AUTHENTICATE" => {
+                let argument = message
+                    .params
+                    .first()
+                    .map(String::as_str)
+                    .or(message.trailing.as_deref())
+                    .unwrap_or_default();
+                let target = nickname.as_deref().unwrap_or("*");
+                if argument.eq_ignore_ascii_case("PLAIN") {
+                    sasl_payload = Some(String::new());
+                    write_line(&mut writer, "AUTHENTICATE +").await;
+                    continue;
+                }
+                let Some(payload) = sasl_payload.as_mut() else {
+                    continue;
+                };
+                // A final chunk is short, and an exactly-full payload is
+                // terminated by a lone `+`.
+                let complete = argument.len() < 400 || argument == "+";
+                if argument != "+" {
+                    payload.push_str(argument);
+                }
+                if !complete {
+                    continue;
+                }
+                let accepted = STANDARD.decode(payload.as_bytes()).is_ok_and(|decoded| {
+                    decoded == format!("\0{SASL_USERNAME}\0{}", sasl_password()).as_bytes()
+                });
+                sasl_payload = None;
+                if accepted {
+                    write_line(
+                        &mut writer,
+                        &format!(":fake 903 {target} :SASL authentication successful"),
+                    )
+                    .await;
+                } else {
+                    write_line(
+                        &mut writer,
+                        &format!(":fake 904 {target} :SASL authentication failed"),
+                    )
+                    .await;
+                }
             }
             "NICK" => {
                 let candidate = message.params.first().cloned().unwrap_or_default();

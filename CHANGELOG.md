@@ -7,6 +7,88 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ## [Unreleased]
 
+### Changed
+
+- The gateway now serves MCP protocol revision `2026-07-28` exclusively. Client
+  identity and capabilities are evaluated per request from `_meta`
+  (`io.modelcontextprotocol/protocolVersion`, `clientCapabilities`); there is no
+  session lifecycle, `Mcp-Session-Id` is never read or minted, and Streamable
+  HTTP enforces the revision's request-metadata and header requirements. On
+  unauthenticated trusted HTTP (loopback, or the explicit network opt-in) all
+  callers share the one local owner; bearer tokens remain the durable principal
+  for shared endpoints. (#10)
+- Watch reads are idempotent and event positions are wholly caller-owned. (#9)
+  `irc://watches/{watch_id}` is now an immutable filter/health descriptor —
+  host-initiated re-reads consume nothing. Events are consumed through
+  `irc.events.read` with the new `watch_id` selector and an explicit cursor, or
+  through the position-bearing
+  `irc://watches/{watch_id}/events/after/{stream_id}/{sequence}` resource
+  template. Event pages report honest `has_more`, watch handles are bounded per
+  owner (`limits.max_watches_per_owner`) and expire when unused
+  (`limits.watch_ttl_ms`), and `irc.watch.create` returns the stream's latest
+  cursor so consumption can start from "now".
+- DCC transfers become MCP tasks by server direction: a request that declares
+  the `io.modelcontextprotocol/tasks` extension in its `_meta` client
+  capabilities receives a task handle for `irc.dcc.send`/`irc.dcc.accept`; the
+  per-call metadata opt-in is gone. One process-wide, owner-bound task ledger
+  backs `tasks/get`/`tasks/update`/`tasks/cancel` across stateless HTTP
+  requests; another owner's task id answers exactly like an unknown one, and
+  tasks do not survive process restart. (#7)
+- Every tool result is one schema-declared envelope discriminated by `ok`:
+  successes carry the tool's output under `result`, failures carry the shared
+  `error` shape (kind, message, retriability, and the correlated command result
+  or DCC root listing when one exists), and each tool's advertised
+  `outputSchema` is a closed `oneOf` of exactly those two branches — so error
+  results now conform to the schema they are returned under. (#5)
+- The delivery-contract documentation states the accurate protocol position:
+  resource notifications and `subscriptions/listen` wake the host application
+  but cannot force or schedule a model turn; server-initiated sampling is
+  deprecated (SEP-2577) and is not implemented; autonomous participation
+  belongs to the host scheduler or a direct LLM integration outside the MCP
+  relay. (#4)
+
+### Added
+
+- Multi round-trip input requests. Where a call needs a time-bounded human
+  decision and the request declared form elicitation, the tool returns
+  `resultType: "input_required"` with a form and an integrity-protected
+  `requestState` (HMAC-bound to the caller, the exact operation and arguments,
+  and a 120-second expiry), and the retried call redeems it: DCC SEND
+  destination (receive root and relative path), nickname choice on collision
+  under the new `elicit` conflict policy, channel key on `ERR_BADCHANNELKEY`,
+  and — when `[mcp] confirm_destructive` is enabled — confirmation of
+  `irc.kick` and `irc.message.redact`. Declining, expiry, or a tampered state
+  refuses in-band and leaves the underlying action unapplied; input is resolved
+  before any task is created. (#6)
+- Named DCC receive roots. `[[dcc.receive_roots]]` declares the directories
+  incoming files may land in; `download_directory` seeds the default root.
+  `irc.dcc.accept` takes a root name plus a relative destination, and
+  confinement is enforced with capability-style directory handles that refuse
+  symlinks at every component, so a write cannot be redirected outside the
+  chosen root even by a check-to-open race. Session snapshots report
+  `receive_root` and `receive_path`. (#11)
+- Progress notifications. `irc.connect` reports seven registration milestones
+  (registration and autojoin synchronization distinct) and `irc.history`
+  reports its phases on the originating request's stream whenever the request
+  carries a `progressToken`. (#7)
+- Bounded activity hints. Successful results of agent-scoped tools carry an
+  optional `activity` digest — per-watched-target unread counts since a
+  caller-owned anchor, the latest cursor, and optionally up to three inlined
+  mention/DM events chosen at connect — computed without touching any watch,
+  cursor, or delivery state. The anchor moves only when `irc.events.read` is
+  called with `set_activity_anchor`. Suppression is explicit configuration
+  (`[mcp] activity_hints`, or the per-agent connect preference), never inferred
+  from a subscription. (#5)
+- Operational relay state instead of the deprecated MCP logging capability:
+  journal eviction accounting (`evicted_events`, `evicted_bytes`,
+  `last_eviction_at`, `oversized_rejections`) in every journal-stats surface, a
+  rate-limited durable `journal.pressure` event that warns before unread
+  events are lost, the scheduled reconnect attempt (`next_attempt_at`) in
+  status, and richer SASL/registration failure detail. (#8)
+- `irc.status` reports the calling request's declared protocol version,
+  extensions, and elicitation support, so capability negotiation is debuggable
+  per request. (#10)
+
 ## [0.2.0] - 2026-08-17
 
 ### Added

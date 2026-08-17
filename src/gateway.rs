@@ -135,12 +135,16 @@ impl Gateway {
             max_per_owner: config.limits.max_watches_per_owner,
             time_to_live: Duration::from_millis(config.limits.watch_ttl_ms),
         };
+        // The registry publishes an expiring handle onto the same channel every
+        // other resource change travels on, so a subscriber learns that its
+        // watch lapsed instead of waiting on one that no longer exists.
+        let watches = Arc::new(WatchRegistry::new(watch_limits, resource_updates.clone()));
         Self {
             config: Arc::new(config),
             agents: RwLock::new(BTreeMap::new()),
             capacity,
             resource_updates,
-            watches: Arc::new(WatchRegistry::new(watch_limits)),
+            watches,
             request_states: RequestStateSealer::generate(),
             redeemed_confirmations: RedeemedConfirmations::default(),
             tasks: TaskLedger::new(),
