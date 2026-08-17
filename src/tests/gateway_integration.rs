@@ -1216,8 +1216,14 @@ async fn event_cursor_pages_carry_the_journal_forward_without_a_tool_call() {
         .expect("disconnect");
 }
 
+/// A watch is a selection, not a queue: reading its resource must change
+/// nothing, and its events must come from a position the caller supplies.
+///
+/// This is the property the old consuming read did not have. A host re-reads
+/// resources at moments the model did not choose, so a read that advanced a
+/// hidden cursor silently discarded events the model never saw.
 #[tokio::test]
-async fn a_watch_delivers_only_what_it_selected_and_advances_past_it() {
+async fn a_watch_descriptor_read_is_pure_and_its_events_are_caller_positioned() {
     let fake = FakeErgo::spawn().await;
     let gateway = Gateway::new(fake.config());
     let connected = gateway
@@ -1225,17 +1231,18 @@ async fn a_watch_delivers_only_what_it_selected_and_advances_past_it() {
         .await
         .expect("connect");
 
-    let watch = gateway
+    let created = gateway
         .create_watch(
             &connected.agent_id,
             WatchFilter {
                 targets: BTreeSet::from(["#agents".to_string()]),
                 ..WatchFilter::default()
             },
-            None,
         )
         .await
         .expect("create watch");
+    let watch_id = created.watch.watch_id.clone();
+    let start = created.latest_cursor.clone();
 
     // The fixture echoes a PRIVMSG back as an inbound line, so this produces
     // traffic on the watched channel and on one the watch must ignore.
@@ -1252,50 +1259,597 @@ async fn a_watch_delivers_only_what_it_selected_and_advances_past_it() {
             .expect("send");
     }
 
-    let first = gateway
-        .read_watch(&watch.watch_id)
+    // Any number of descriptor reads describe the same watch and consume
+    // nothing, which is what makes a host-initiated re-read harmless.
+    let first = gateway.read_watch(&watch_id).await.expect("read watch");
+    let second = gateway.read_watch(&watch_id).await.expect("re-read watch");
+    assert_eq!(first.watch.watch_id, watch_id);
+    assert_eq!(first.consume.events_read_tool, "irc.events.read");
+    assert_eq!(
+        second.consume.from_latest, first.consume.from_latest,
+        "a descriptor read must not move anything"
+    );
+    assert_eq!(second.journal.stream_id, first.journal.stream_id);
+
+    let window = gateway
+        .read_watch_window(&watch_id, start.clone())
         .await
-        .expect("read watch");
-    assert_eq!(first.status, crate::agent::journal::CursorStatus::Current);
+        .expect("positioned window");
+    assert_eq!(window.status, crate::agent::journal::CursorStatus::Current);
+    assert_eq!(window.requested_cursor, start);
     assert!(
-        !first.events.is_empty(),
+        !window.events.is_empty(),
         "a watch on an active channel must deliver something"
     );
     assert!(
-        first
+        window
             .events
             .iter()
             .all(|event| event.target.as_deref() == Some("#agents")),
         "a watch must not deliver targets it did not select: {:?}",
-        first.events
+        window.events
     );
     assert!(
-        first
+        window
             .events
             .iter()
             .any(|event| event.text.as_deref() == Some("thread through the maze")),
         "the watch dropped the message it was created for"
     );
-
-    // The position lives with the watch, so a second read with no argument
-    // continues rather than repeating.
-    let second = gateway
-        .read_watch(&watch.watch_id)
-        .await
-        .expect("second read");
     assert!(
-        second
+        window
             .events
             .iter()
-            .all(|event| event.cursor.sequence > first.next_cursor.sequence),
-        "a watch re-delivered events its previous read had consumed"
+            .all(|event| event.cursor.sequence <= window.next_cursor.sequence),
+        "the position must never run ahead of the events it returned"
+    );
+    assert_eq!(
+        window.next_uri,
+        crate::mcp::watch::watch_events_uri(&watch_id, &window.next_cursor)
     );
 
-    gateway.close_watch(&watch.watch_id).expect("close watch");
+    // The retry a lost response forces: the same position, the same window.
+    let replayed = gateway
+        .read_watch_window(&watch_id, start)
+        .await
+        .expect("replayed window");
+    assert_eq!(
+        replayed.next_cursor, window.next_cursor,
+        "re-reading one position must return one window"
+    );
+    assert_eq!(
+        replayed
+            .events
+            .iter()
+            .map(|event| event.cursor.clone())
+            .collect::<Vec<_>>(),
+        window
+            .events
+            .iter()
+            .map(|event| event.cursor.clone())
+            .collect::<Vec<_>>()
+    );
+
+    gateway.close_watch(&watch_id).expect("close watch");
     assert!(
-        gateway.read_watch(&watch.watch_id).await.is_err(),
+        gateway.read_watch(&watch_id).await.is_err(),
         "a closed watch must not remain readable"
     );
+    assert!(
+        gateway
+            .read_watch_window(&watch_id, window.next_cursor)
+            .await
+            .is_err(),
+        "a closed watch must not keep serving windows"
+    );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+/// Two consumers of one watch each own their position, so neither can consume
+/// the other's backlog — the failure an acknowledged server-side cursor keeps.
+#[tokio::test]
+async fn two_readers_of_one_watch_do_not_disturb_each_others_positions() {
+    let fake = FakeErgo::spawn().await;
+    let gateway = Gateway::new(fake.config());
+    let connected = gateway
+        .connect(connect_request("Theseus"))
+        .await
+        .expect("connect");
+
+    let created = gateway
+        .create_watch(
+            &connected.agent_id,
+            WatchFilter {
+                targets: BTreeSet::from(["#agents".to_string()]),
+                ..WatchFilter::default()
+            },
+        )
+        .await
+        .expect("create watch");
+    let watch_id = created.watch.watch_id.clone();
+    let shared_start = created.latest_cursor.clone();
+
+    for text in ["first", "second", "third"] {
+        gateway
+            .execute(
+                &connected.agent_id,
+                OutboundMessage::new("PRIVMSG", vec!["#agents".into()]).with_trailing(text),
+                CompletionMode::Auto,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("send");
+    }
+
+    // Reader A drains the whole backlog and keeps reading from where it got to.
+    let drained = gateway
+        .read_watch_events(
+            &connected.agent_id,
+            &watch_id,
+            Some(shared_start.clone()),
+            100,
+            Duration::ZERO,
+        )
+        .await
+        .expect("reader A");
+    assert!(drained.events.len() >= 3);
+    let exhausted = gateway
+        .read_watch_events(
+            &connected.agent_id,
+            &watch_id,
+            Some(drained.next_cursor.clone()),
+            100,
+            Duration::ZERO,
+        )
+        .await
+        .expect("reader A again");
+    assert!(
+        exhausted.events.is_empty(),
+        "reader A should have consumed its own backlog"
+    );
+
+    // Reader B, still holding the original position, sees exactly the same
+    // backlog rather than the empty window reader A now sees.
+    let independent = gateway
+        .read_watch_events(
+            &connected.agent_id,
+            &watch_id,
+            Some(shared_start.clone()),
+            100,
+            Duration::ZERO,
+        )
+        .await
+        .expect("reader B");
+    assert_eq!(
+        independent
+            .events
+            .iter()
+            .map(|event| event.cursor.clone())
+            .collect::<Vec<_>>(),
+        drained
+            .events
+            .iter()
+            .map(|event| event.cursor.clone())
+            .collect::<Vec<_>>(),
+        "one reader consumed another reader's window"
+    );
+
+    // The other consumption path is positioned the same way, so a third reader
+    // holding the original position is equally unaffected.
+    let window = gateway
+        .read_watch_window(&watch_id, shared_start)
+        .await
+        .expect("reader C");
+    assert!(!window.events.is_empty());
+    assert!(
+        window
+            .events
+            .iter()
+            .all(|event| drained.events.iter().any(|raw| raw.cursor == event.cursor)),
+        "the compact window must be a projection of the same selected events"
+    );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+/// `has_more` must be a signal a caller can loop on: every pass makes progress
+/// and the loop ends, even when the stream retains records the watch declined.
+#[tokio::test]
+async fn draining_a_watch_backlog_makes_progress_while_more_remains() {
+    let fake = FakeErgo::spawn().await;
+    let gateway = Gateway::new(fake.config());
+    let connected = gateway
+        .connect(connect_request("Daedalus"))
+        .await
+        .expect("connect");
+
+    let created = gateway
+        .create_watch(
+            &connected.agent_id,
+            WatchFilter {
+                targets: BTreeSet::from(["#agents".to_string()]),
+                ..WatchFilter::default()
+            },
+        )
+        .await
+        .expect("create watch");
+    let watch_id = created.watch.watch_id.clone();
+
+    for text in ["one", "two", "three", "four"] {
+        for channel in ["#agents", "#elsewhere"] {
+            gateway
+                .execute(
+                    &connected.agent_id,
+                    OutboundMessage::new("PRIVMSG", vec![channel.into()]).with_trailing(text),
+                    CompletionMode::Auto,
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect("send");
+        }
+    }
+
+    let mut cursor = created.latest_cursor.clone();
+    let mut collected = Vec::new();
+    let mut passes = 0_usize;
+    loop {
+        let page = gateway
+            .read_watch_events(
+                &connected.agent_id,
+                &watch_id,
+                Some(cursor.clone()),
+                1,
+                Duration::ZERO,
+            )
+            .await
+            .expect("drain one");
+        assert!(
+            page.next_cursor.sequence >= cursor.sequence,
+            "a drain pass must never move backwards"
+        );
+        if page.has_more {
+            assert_eq!(
+                page.events.len(),
+                1,
+                "has_more must only be set when the limit truncated the window"
+            );
+            assert!(
+                page.next_cursor.sequence > cursor.sequence,
+                "has_more with no progress would loop forever"
+            );
+        }
+        collected.extend(page.events.iter().map(|event| event.cursor.clone()));
+        cursor = page.next_cursor;
+        passes += 1;
+        assert!(passes < 64, "draining did not terminate");
+        if !page.has_more {
+            break;
+        }
+    }
+    assert!(collected.len() >= 4, "the drain lost part of the backlog");
+    // Draining is complete: the same cursor now returns nothing, even though
+    // the stream retains the #elsewhere traffic this watch never wanted.
+    let exhausted = gateway
+        .read_watch_events(
+            &connected.agent_id,
+            &watch_id,
+            Some(cursor.clone()),
+            10,
+            Duration::ZERO,
+        )
+        .await
+        .expect("exhausted read");
+    assert!(exhausted.events.is_empty());
+    assert!(!exhausted.has_more);
+    assert!(
+        exhausted.next_cursor.sequence < exhausted.latest.sequence,
+        "records the watch declined must remain in the stream"
+    );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+/// A watch's selection is applied inside the journal read, so a page's worth of
+/// traffic it does not want can neither hide a match nor block the position.
+#[tokio::test]
+async fn a_watch_selection_reaches_matches_past_a_page_of_uninteresting_events() {
+    let fake = FakeErgo::spawn().await;
+    let gateway = Gateway::new(fake.config());
+    let connected = gateway
+        .connect(connect_request("Icarus"))
+        .await
+        .expect("connect");
+
+    let created = gateway
+        .create_watch(
+            &connected.agent_id,
+            WatchFilter {
+                targets: BTreeSet::from(["#agents".to_string()]),
+                ..WatchFilter::default()
+            },
+        )
+        .await
+        .expect("create watch");
+
+    for _ in 0..8 {
+        gateway
+            .execute(
+                &connected.agent_id,
+                OutboundMessage::new("PRIVMSG", vec!["#elsewhere".into()])
+                    .with_trailing("not for this watch"),
+                CompletionMode::Auto,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("send");
+    }
+    gateway
+        .execute(
+            &connected.agent_id,
+            OutboundMessage::new("PRIVMSG", vec!["#agents".into()]).with_trailing("for this watch"),
+            CompletionMode::Auto,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("send");
+
+    // One event of headroom: the match sits well past the first page of raw
+    // records, and must still arrive on the first read.
+    let page = gateway
+        .read_watch_events(
+            &connected.agent_id,
+            &created.watch.watch_id,
+            Some(created.latest_cursor),
+            1,
+            Duration::ZERO,
+        )
+        .await
+        .expect("read past the uninteresting traffic");
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].target.as_deref(), Some("#agents"));
+    assert_eq!(page.next_cursor, page.events[0].cursor);
+    assert!(
+        !page.has_more,
+        "only records this watch declined are left, so there is nothing more for it"
+    );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+/// Retention loss and a foreign stream must be reported, not papered over, on
+/// both consumption paths — a caller cannot recover a position it is not told
+/// about.
+#[tokio::test]
+async fn a_watch_reports_gaps_and_stream_resets_through_both_consumption_paths() {
+    let fake = FakeErgo::spawn().await;
+    let mut config = fake.config();
+    // Small enough that ordinary traffic evicts the position taken below.
+    config.limits.event_count = 8;
+    let gateway = Gateway::new(config);
+    let connected = gateway
+        .connect(connect_request("Minos"))
+        .await
+        .expect("connect");
+
+    let created = gateway
+        .create_watch(&connected.agent_id, WatchFilter::default())
+        .await
+        .expect("create watch");
+    let watch_id = created.watch.watch_id.clone();
+    let stale = crate::agent::journal::EventCursor {
+        stream_id: created.latest_cursor.stream_id.clone(),
+        sequence: 0,
+    };
+
+    for _ in 0..12 {
+        gateway
+            .execute(
+                &connected.agent_id,
+                OutboundMessage::new("PRIVMSG", vec!["#agents".into()]).with_trailing("churn"),
+                CompletionMode::Auto,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("send");
+    }
+
+    let gapped = gateway
+        .read_watch_window(&watch_id, stale.clone())
+        .await
+        .expect("gapped window");
+    assert_eq!(
+        gapped.status,
+        crate::agent::journal::CursorStatus::EventGap,
+        "a position the journal has evicted past must be reported as a gap"
+    );
+    let gapped_tool = gateway
+        .read_watch_events(
+            &connected.agent_id,
+            &watch_id,
+            Some(stale),
+            100,
+            Duration::ZERO,
+        )
+        .await
+        .expect("gapped read");
+    assert_eq!(
+        gapped_tool.status,
+        crate::agent::journal::CursorStatus::EventGap
+    );
+    // Recovery is a normal read from what the report handed back.
+    let recovered = gateway
+        .read_watch_window(&watch_id, gapped.next_cursor)
+        .await
+        .expect("recovered window");
+    assert_eq!(
+        recovered.status,
+        crate::agent::journal::CursorStatus::Current
+    );
+
+    let foreign = crate::agent::journal::EventCursor {
+        stream_id: "00000000-0000-4000-8000-000000000000".into(),
+        sequence: 3,
+    };
+    assert_eq!(
+        gateway
+            .read_watch_window(&watch_id, foreign.clone())
+            .await
+            .expect("reset window")
+            .status,
+        crate::agent::journal::CursorStatus::StreamReset
+    );
+    assert_eq!(
+        gateway
+            .read_watch_events(
+                &connected.agent_id,
+                &watch_id,
+                Some(foreign),
+                100,
+                Duration::ZERO
+            )
+            .await
+            .expect("reset read")
+            .status,
+        crate::agent::journal::CursorStatus::StreamReset
+    );
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+/// A long poll through a watch has to behave exactly as an unfiltered one: the
+/// parked read keeps the watch's selection and re-runs it when the journal
+/// grows, which is what makes this the fallback for a host without
+/// subscriptions.
+#[tokio::test]
+async fn a_watch_long_poll_wakes_on_traffic_the_watch_selected() {
+    let fake = FakeErgo::spawn().await;
+    let gateway = Gateway::new(fake.config());
+    let connected = gateway
+        .connect(connect_request("Pasiphae"))
+        .await
+        .expect("connect");
+    let created = gateway
+        .create_watch(
+            &connected.agent_id,
+            WatchFilter {
+                targets: BTreeSet::from(["#agents".to_string()]),
+                ..WatchFilter::default()
+            },
+        )
+        .await
+        .expect("create watch");
+
+    let poll = gateway.read_watch_events(
+        &connected.agent_id,
+        &created.watch.watch_id,
+        Some(created.latest_cursor.clone()),
+        10,
+        Duration::from_secs(5),
+    );
+    let send = gateway.execute(
+        &connected.agent_id,
+        OutboundMessage::new("PRIVMSG", vec!["#agents".into()]).with_trailing("wake up"),
+        CompletionMode::Auto,
+        Duration::from_secs(1),
+    );
+    let (page, sent) = tokio::join!(poll, send);
+    sent.expect("send");
+    let page = page.expect("long poll");
+    assert!(
+        page.events
+            .iter()
+            .all(|event| event.target.as_deref() == Some("#agents")),
+        "a woken long poll must still apply the watch selection: {:?}",
+        page.events
+    );
+    assert!(page.next_cursor.sequence > created.latest_cursor.sequence);
+
+    gateway
+        .disconnect(&connected.agent_id, None)
+        .await
+        .expect("disconnect");
+}
+
+/// Watch handles are bounded per caller and expire when nobody uses them, so
+/// the "unknown or expired watch handle" the error text promises is real.
+#[tokio::test]
+async fn watch_handles_are_bounded_per_caller_and_expire_when_unused() {
+    let fake = FakeErgo::spawn().await;
+    let mut config = fake.config();
+    config.limits.max_watches_per_owner = 1;
+    let gateway = Gateway::new(config);
+    let mine = OwnerId::from_bearer("mine");
+    let theirs = OwnerId::from_bearer("theirs");
+    let connected = gateway
+        .connect_as(mine.clone(), connect_request("Ariadne"))
+        .await
+        .expect("connect");
+    let other = gateway
+        .connect_as(theirs, connect_request("Phaedra"))
+        .await
+        .expect("connect");
+
+    gateway
+        .create_watch(&connected.agent_id, WatchFilter::default())
+        .await
+        .expect("within the allowance");
+    let refused = gateway
+        .create_watch(&connected.agent_id, WatchFilter::default())
+        .await
+        .expect_err("past the allowance");
+    assert_eq!(refused.kind(), crate::error::ErrorKind::ResourceLimit);
+    // The bound is per caller, not per process.
+    gateway
+        .create_watch(&other.agent_id, WatchFilter::default())
+        .await
+        .expect("another caller has its own allowance");
+
+    for agent_id in [&connected.agent_id, &other.agent_id] {
+        gateway
+            .disconnect(agent_id, None)
+            .await
+            .expect("disconnect");
+    }
+
+    // Expiry, with a window short enough to observe.
+    let fake = FakeErgo::spawn().await;
+    let mut config = fake.config();
+    config.limits.watch_ttl_ms = 1;
+    let gateway = Gateway::new(config);
+    let connected = gateway
+        .connect(connect_request("Ariadne"))
+        .await
+        .expect("connect");
+    let created = gateway
+        .create_watch(&connected.agent_id, WatchFilter::default())
+        .await
+        .expect("create watch");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let expired = gateway
+        .read_watch(&created.watch.watch_id)
+        .await
+        .expect_err("an unused watch must lapse");
+    assert!(
+        expired.to_string().contains("unknown or expired"),
+        "an expired handle must say so: {expired}"
+    );
+    assert!(gateway.watches().list().is_empty());
 
     gateway
         .disconnect(&connected.agent_id, None)
@@ -1311,8 +1865,8 @@ async fn disconnecting_an_agent_releases_its_watches() {
         .connect(connect_request("Icarus"))
         .await
         .expect("connect");
-    let watch = gateway
-        .create_watch(&connected.agent_id, WatchFilter::default(), None)
+    let created = gateway
+        .create_watch(&connected.agent_id, WatchFilter::default())
         .await
         .expect("create watch");
 
@@ -1322,7 +1876,10 @@ async fn disconnecting_an_agent_releases_its_watches() {
         .expect("disconnect");
 
     assert!(
-        gateway.watches().describe(&watch.watch_id).is_none(),
+        gateway
+            .watches()
+            .describe(&created.watch.watch_id)
+            .is_none(),
         "a watch outlived the stream it was watching"
     );
 }
@@ -1338,8 +1895,8 @@ async fn one_callers_handles_are_invisible_and_unusable_to_another() {
         .connect_as(mine.clone(), connect_request("Minos"))
         .await
         .expect("connect");
-    let watch = gateway
-        .create_watch(&connected.agent_id, WatchFilter::default(), None)
+    let created = gateway
+        .create_watch(&connected.agent_id, WatchFilter::default())
         .await
         .expect("create watch");
 
@@ -1367,13 +1924,13 @@ async fn one_callers_handles_are_invisible_and_unusable_to_another() {
     // A watch is reachable only through the agent it watches.
     assert!(
         gateway
-            .authorize_watch(&mine, &watch.watch_id)
+            .authorize_watch(&mine, &created.watch.watch_id)
             .await
             .is_ok()
     );
     assert!(
         gateway
-            .authorize_watch(&theirs, &watch.watch_id)
+            .authorize_watch(&theirs, &created.watch.watch_id)
             .await
             .is_err()
     );

@@ -116,6 +116,8 @@ impl Config {
             || self.limits.max_command_timeout_ms == 0
             || self.limits.max_event_wait_ms == 0
             || self.limits.max_event_page_size == 0
+            || self.limits.max_watches_per_owner == 0
+            || self.limits.watch_ttl_ms == 0
         {
             return Err(GatewayError::Configuration(
                 "gateway count, byte, queue, and timeout limits must be greater than zero".into(),
@@ -412,6 +414,12 @@ pub struct GatewayLimits {
     pub max_event_wait_ms: u64,
     /// Largest number of events returned by one read.
     pub max_event_page_size: usize,
+    /// Watch handles one caller may hold at once, across all of its agents.
+    pub max_watches_per_owner: usize,
+    /// How long a watch handle survives without being used. Refreshed whenever
+    /// a caller reads the watch or its events, so an actively consumed watch
+    /// never lapses.
+    pub watch_ttl_ms: u64,
 }
 
 impl Default for GatewayLimits {
@@ -430,6 +438,8 @@ impl Default for GatewayLimits {
             max_command_timeout_ms: 30_000,
             max_event_wait_ms: 30_000,
             max_event_page_size: 1_000,
+            max_watches_per_owner: 32,
+            watch_ttl_ms: 3_600_000,
         }
     }
 }

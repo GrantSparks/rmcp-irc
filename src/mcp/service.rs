@@ -55,8 +55,9 @@ use crate::{
         },
         tools::*,
         watch::{
-            WatchCloseInput, WatchCloseOutput, WatchCreateInput, WatchCreateOutput,
-            WatchDescriptor, WatchId,
+            WATCH_EVENTS_TEMPLATE, WATCH_INSTRUCTIONS, WATCH_URI_PREFIX, WatchCloseInput,
+            WatchCloseOutput, WatchCreateInput, WatchCreateOutput, WatchDescriptor, WatchId,
+            WatchTarget, WatchUri, watch_events_uri,
         },
     },
 };
@@ -78,11 +79,6 @@ const TRANSCRIPT_TEMPLATE: &str = "irc://agents/{agent_id}/transcripts/{encoded_
 /// `irc://agents/{agent_id}/events` and reading this on each notification is a
 /// complete delivery loop that needs no tool call.
 const EVENT_CURSOR_TEMPLATE: &str = "irc://agents/{agent_id}/events/after/{sequence}";
-
-/// Watch handles are addressed under their own authority rather than under an
-/// agent, because a watch outlives any single read and is the thing a client
-/// subscribes to.
-const WATCH_URI_PREFIX: &str = "irc://watches/";
 
 /// Resources returned by one `resources/list` page. A connected agent
 /// contributes eight fixed resources plus four per joined channel, so this
@@ -225,7 +221,25 @@ impl IrcMcpService {
         vec![PromptMessage::new_text(
             Role::User,
             format!(
-                "For IRC agent `{}`, call `irc.watch.create` with `mentions_only: true`. {targets} Attach the returned native watch resource link and subscribe to it when the host supports MCP resource subscriptions. On each update, read from the watch's durable cursor, detect reset/gap status, and promptly answer direct messages or channel mentions in the same location. If subscriptions are unavailable, keep an `irc.events.read` long poll active as the explicit fallback. Resource notifications update the host but cannot themselves require a new model turn.",
+                "For IRC agent `{}`, set up mention delivery in this order. 1. Call \
+                 `irc.watch.create` with `mentions_only: true`. {targets} Keep the returned \
+                 `watch_id` and `latest_cursor`, and attach the native watch resource link. 2. Ask \
+                 the host to call `subscriptions/listen` with that watch URI in \
+                 `resourceSubscriptions`; the notification is filtered by the watch, so it means \
+                 there is something here for you. 3. On each update, call `irc.events.read` with \
+                 that `watch_id` and the cursor you last persisted — or read \
+                 `irc://watches/{{watch_id}}/events/after/{{stream_id}}/{{sequence}}` for the \
+                 compact window. 4. Persist the returned `next_cursor` yourself: the watch holds \
+                 no position, so you own it, re-reading a cursor is always safe, and you keep \
+                 reading while `has_more` is true. Check `status` on every read and treat anything \
+                 other than `current` as records lost. Answer direct messages and channel mentions \
+                 in the same location. Without subscriptions, call `irc.events.read` with that \
+                 `watch_id` and a positive `wait_ms` as a standing long poll. Note the boundary: \
+                 resource notifications and `subscriptions/listen` wake the host application but \
+                 cannot force or schedule a model turn. MCP 2026-07-28 has no server-initiated \
+                 sampling — it is deprecated by SEP-2577 — and input requests exist only inside an \
+                 active client request. Autonomous participation belongs to the host's scheduler \
+                 or a separately configured direct LLM integration, not to this relay contract.",
                 input.agent_id
             ),
         )]
@@ -356,11 +370,11 @@ impl IrcMcpService {
         }
     }
 
-    /// Read a consistent status snapshot.
+    /// Register a caller-owned selection over one agent's stream.
     #[tool(
         name = "irc.watch.create",
         description = "Create a subscribable watch over one guest's events, returning a resource \
-                       link that delivers matching activity without polling.",
+                       link that wakes a host on matching activity and the cursor to read from.",
         output_schema = schema_for_output::<WatchCreateOutput>(),
         annotations(
             title = "Create event watch",
@@ -374,20 +388,24 @@ impl IrcMcpService {
         Parameters(input): Parameters<WatchCreateInput>,
     ) -> CallToolResult {
         let filter = input.filter();
-        match self
-            .gateway
-            .create_watch(&input.agent_id, filter, input.cursor)
-            .await
-        {
-            Ok(watch) => {
-                let summary = format!("Watching {} at {}.", watch.agent_id, watch.uri);
-                let link = ContentBlock::ResourceLink(watch_resource_entry(&watch));
+        match self.gateway.create_watch(&input.agent_id, filter).await {
+            Ok(created) => {
+                let next_uri = watch_events_uri(&created.watch.watch_id, &created.latest_cursor);
+                let summary = format!(
+                    "Watching {} at {}. Subscribe to that URI, then on each notification call \
+                     irc.events.read with watch_id {} and the cursor you last persisted, starting \
+                     from sequence {}.",
+                    created.watch.agent_id,
+                    created.watch.uri,
+                    created.watch.watch_id,
+                    created.latest_cursor.sequence
+                );
+                let link = ContentBlock::ResourceLink(watch_resource_entry(&created.watch));
                 let output = WatchCreateOutput {
-                    watch,
-                    instructions: "Subscribe to this watch's URI, then read it on each notification. Each \
-                         read returns everything matching since the previous one and advances the \
-                         watch, so no cursor argument is needed. A `status` other than `current` \
-                         means records were lost. Release the handle with irc.watch.close.",
+                    watch: created.watch,
+                    latest_cursor: created.latest_cursor,
+                    next_uri,
+                    instructions: WATCH_INSTRUCTIONS,
                 };
                 tool_success_with_content(summary, &output, vec![link])
             }
@@ -1650,7 +1668,8 @@ impl IrcMcpService {
     /// Read ordered events after a caller-owned cursor, optionally long polling.
     #[tool(
         name = "irc.events.read",
-        description = "Read an agent's bounded event journal after an explicit caller-owned cursor.",
+        description = "Read an agent's bounded event journal after an explicit caller-owned cursor, \
+                       optionally through a watch's registered selection.",
         output_schema = schema_for_output::<EventsReadOutput>(),
         annotations(
             title = "Read event journal",
@@ -1663,23 +1682,48 @@ impl IrcMcpService {
         Parameters(input): Parameters<EventsReadInput>,
     ) -> CallToolResult {
         let resources = ResourceUris::for_agent(&input.agent_id);
-        let filter = input.filter();
-        match self
-            .gateway
-            .read_events(
-                &input.agent_id,
-                input.cursor,
-                input.limit,
-                Duration::from_millis(input.wait_ms),
-                filter,
-            )
-            .await
-        {
+        let wait = Duration::from_millis(input.wait_ms);
+        let page = match &input.watch_id {
+            Some(watch_id) => {
+                if let Some(conflict) = input.conflicting_filter() {
+                    return tool_error(GatewayError::InvalidMessage(format!(
+                        "watch_id already carries a complete selection, so `{conflict}` must be \
+                         omitted; narrow the watch itself or read without watch_id"
+                    )));
+                }
+                self.gateway
+                    .read_watch_events(
+                        &input.agent_id,
+                        watch_id,
+                        input.cursor.clone(),
+                        input.limit,
+                        wait,
+                    )
+                    .await
+            }
+            None => {
+                self.gateway
+                    .read_events(
+                        &input.agent_id,
+                        input.cursor.clone(),
+                        input.limit,
+                        wait,
+                        input.filter(),
+                    )
+                    .await
+            }
+        };
+        match page {
             Ok(page) => tool_success_with_content(
                 format!(
-                    "Read {} event(s); cursor is {}.",
+                    "Read {} event(s); cursor is {}.{}",
                     page.events.len(),
-                    page.next_cursor.sequence
+                    page.next_cursor.sequence,
+                    if page.has_more {
+                        " More are already retained: read again from that cursor."
+                    } else {
+                        ""
+                    }
                 ),
                 &page,
                 vec![resource_link(resources.events)],
@@ -2233,6 +2277,15 @@ impl ServerHandler for IrcMcpService {
                      each notification to consume the journal without polling.",
                 )
                 .with_mime_type("application/json"),
+            ResourceTemplate::new(WATCH_EVENTS_TEMPLATE, "irc-watch-events-after")
+                .with_title("Watch events after a position")
+                .with_description(
+                    "Compact conversational records that one watch selects, after an explicit \
+                     position carried in the path. Reading changes nothing on the server, so the \
+                     same URI always returns the same window and `next_cursor` advances only over \
+                     the events returned.",
+                )
+                .with_mime_type("application/json"),
         ]))
     }
 
@@ -2242,18 +2295,34 @@ impl ServerHandler for IrcMcpService {
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
         let owner = self.callers.identify(&context)?;
-        // A watch lives under its own authority and is read entirely from the
-        // registry, so it is resolved before any agent lookup.
-        if let Some(handle) = request.uri.strip_prefix(WATCH_URI_PREFIX) {
-            let watch_id = WatchId::from_str(handle)
+        // A watch lives under its own authority, so it is resolved before any
+        // agent lookup. Neither of its resources mutates delivery state: the
+        // descriptor reports the selection and the stream's health, and the
+        // positioned window takes its position from the path.
+        if request.uri.starts_with(WATCH_URI_PREFIX) {
+            let watch = WatchUri::from_str(&request.uri)
                 .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
-            self.gateway.authorize_watch(&owner, &watch_id).await?;
-            let payload = self
-                .gateway
-                .read_watch(&watch_id)
-                .await
-                .map_err(gateway_read_error)?;
-            return json_resource(request.uri, &payload);
+            self.gateway
+                .authorize_watch(&owner, &watch.watch_id)
+                .await?;
+            return match watch.target {
+                WatchTarget::Descriptor => {
+                    let payload = self
+                        .gateway
+                        .read_watch(&watch.watch_id)
+                        .await
+                        .map_err(gateway_read_error)?;
+                    json_resource(request.uri, &payload)
+                }
+                WatchTarget::EventsAfter(cursor) => {
+                    let payload = self
+                        .gateway
+                        .read_watch_window(&watch.watch_id, cursor)
+                        .await
+                        .map_err(gateway_read_error)?;
+                    json_resource(request.uri, &payload)
+                }
+            };
         }
 
         let uri = AgentResourceUri::from_str(&request.uri)
@@ -2434,10 +2503,11 @@ impl ServerHandler for IrcMcpService {
                     // Dropping notifications silently leaves a subscriber
                     // believing its last read is still current, which is the
                     // one failure a resource subscription must not have. Every
-                    // resource that exists is republished instead, so each
-                    // subscriber re-reads exactly what it holds and recovers
-                    // its own position from the cursor or status in the
-                    // payload.
+                    // resource that exists is republished instead. That is safe
+                    // to do liberally because no resource read consumes
+                    // anything: a subscriber re-reads what it holds and
+                    // recovers its own position from the cursor or status in
+                    // the payload.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
                         tracing::warn!(missed, "resource notifications lagged; resynchronizing");
                         self.notify_resynchronization(&context, &owner).await;
@@ -2466,10 +2536,10 @@ impl IrcMcpService {
             return Ok(());
         };
         for uri in uris {
-            if let Some(handle) = uri.strip_prefix(WATCH_URI_PREFIX) {
-                let watch_id = WatchId::from_str(handle)
+            if uri.starts_with(WATCH_URI_PREFIX) {
+                let watch = WatchUri::from_str(uri)
                     .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
-                self.gateway.authorize_watch(owner, &watch_id).await?;
+                self.gateway.authorize_watch(owner, &watch.watch_id).await?;
             } else {
                 let resource = AgentResourceUri::from_str(uri)
                     .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
@@ -2483,11 +2553,15 @@ impl IrcMcpService {
 
     /// Whether one caller may receive an update for a stable resource URI.
     async fn owner_may_observe_resource(&self, owner: &OwnerId, uri: &str) -> bool {
-        if let Some(handle) = uri.strip_prefix(WATCH_URI_PREFIX) {
-            let Ok(watch_id) = WatchId::from_str(handle) else {
+        if uri.starts_with(WATCH_URI_PREFIX) {
+            let Ok(watch) = WatchUri::from_str(uri) else {
                 return false;
             };
-            return self.gateway.authorize_watch(owner, &watch_id).await.is_ok();
+            return self
+                .gateway
+                .authorize_watch(owner, &watch.watch_id)
+                .await
+                .is_ok();
         }
         let Ok(resource) = AgentResourceUri::from_str(uri) else {
             return false;
@@ -2601,6 +2675,10 @@ impl IrcMcpService {
     /// The list-changed notification comes first: a client that lost updates
     /// may also have missed an agent appearing or going away, so the catalog
     /// itself is resynchronized before the individual URIs within it.
+    ///
+    /// Republishing a watch URI costs the subscriber nothing but a re-read: the
+    /// watch descriptor is immutable and every event window is positioned by the
+    /// caller, so this can never consume a backlog on somebody's behalf.
     async fn notify_resynchronization(&self, context: &SubscriptionContext, owner: &OwnerId) {
         let _ = context.sink().notify_resource_list_changed().await;
         let owned = self.gateway.agent_ids_for(owner).await;
@@ -2720,8 +2798,10 @@ fn watch_resource_entry(watch: &WatchDescriptor) -> Resource {
     Resource::new(watch.uri.clone(), format!("watch-{}", watch.watch_id))
         .with_title(format!("Watch on {}", watch.agent_id))
         .with_description(
-            "Everything this watch selected since it was last read, with the position it \
-             advanced to. Subscribe here and read on each notification.",
+            "This watch's selection, the health of the stream it selects from, and where to read \
+             what it selected. Subscribe here; reading it consumes nothing, so the events come \
+             from irc.events.read with this watch_id and your own cursor, or from the positioned \
+             window URI this resource names.",
         )
         .with_mime_type("application/json")
         .with_annotations(
@@ -3590,6 +3670,44 @@ mod tests {
         assert!(service.get_info().capabilities.prompts.is_some());
     }
 
+    /// A watch already names a complete selection, so combining it with the
+    /// single-value filters is refused with an explanation rather than resolved
+    /// into a third selection nobody asked for.
+    #[tokio::test]
+    async fn a_watch_selection_and_the_single_value_filters_cannot_be_combined() {
+        let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
+        let mut input = EventsReadInput {
+            agent_id: crate::agent::AgentId::new(),
+            cursor: None,
+            limit: default_event_limit(),
+            wait_ms: 0,
+            watch_id: Some(WatchId::new()),
+            command_id: None,
+            class: Some(EventClass::MessageChannel),
+            target: None,
+            direction: None,
+            origin: None,
+            verbosity: None,
+            mentions_me: None,
+        };
+        assert_eq!(input.conflicting_filter(), Some("class"));
+        let refused = service.irc_events_read(Parameters(input.clone())).await;
+        assert_eq!(refused.is_error, Some(true));
+        let message = refused.content[0].as_text().expect("summary").text.clone();
+        assert!(
+            message.contains("`class` must be omitted"),
+            "the refusal must name the offending field: {message}"
+        );
+
+        // Without a watch the same filter is ordinary, and the two together are
+        // the only rejected shape.
+        input.watch_id = None;
+        assert_eq!(input.conflicting_filter(), Some("class"));
+        input.class = None;
+        input.watch_id = Some(WatchId::new());
+        assert_eq!(input.conflicting_filter(), None);
+    }
+
     #[tokio::test]
     async fn workflow_prompts_preserve_realtime_host_boundaries() {
         let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
@@ -3600,13 +3718,26 @@ mod tests {
             }))
             .await;
         let text = messages[0].content.as_text().expect("prompt text");
-        assert!(text.text.contains("irc.watch.create"));
-        assert!(text.text.contains("resource subscriptions"));
+        // One concrete sequence, in order, ending with who owns the cursor.
+        for step in [
+            "irc.watch.create",
+            "subscriptions/listen",
+            "resourceSubscriptions",
+            "irc.events.read",
+            "watch_id",
+            "next_cursor",
+            "wait_ms",
+        ] {
+            assert!(text.text.contains(step), "the prompt omits {step}");
+        }
+        // The corrected protocol claim: a notification wakes the host and
+        // nothing in this protocol version can schedule a model turn.
+        assert!(text.text.contains("cannot force or schedule a model turn"));
+        assert!(text.text.contains("SEP-2577"));
         assert!(
-            text.text
-                .contains("cannot themselves require a new model turn")
+            !text.text.contains("durable cursor"),
+            "the watch no longer holds a position for the caller"
         );
-        assert!(text.text.contains("irc.events.read"));
     }
 
     #[test]
@@ -3765,8 +3896,10 @@ mod tests {
                 checked += 1;
             }
         }
-        // Every tool takes a handle except irc.connect, which mints one.
-        assert_eq!(checked, TOOL_NAMES.len() - 1);
+        // Every tool takes a handle except irc.connect, which mints one, and
+        // irc.events.read takes both: an agent and, optionally, the watch whose
+        // selection it should read through.
+        assert_eq!(checked, TOOL_NAMES.len());
     }
 
     #[test]

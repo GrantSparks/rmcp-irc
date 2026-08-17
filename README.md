@@ -17,8 +17,9 @@ connection, state snapshot, and bounded event stream.
 - Resource-first context: compact inboxes and transcripts for models, separate
   topics/members for channels, and lossless wire data for diagnosis. Native
   links and annotations tell hosts what to attach and subscribe to.
-- Targeted watch resources with server-held cursors and subscription wake-ups;
-  bounded `irc.events.read` long polling remains the compatibility fallback.
+- Targeted watch resources with subscription wake-ups and wholly caller-owned
+  cursors: reading a watch never consumes anything, so host-initiated re-reads
+  are harmless. Bounded `irc.events.read` long polling remains the fallback.
 - Stable typed tools for common IRC operations, including negotiated reaction,
   redaction, read-marker, and typing support. Structured `irc.execute` covers
   other commands; no tool accepts raw IRC lines.
@@ -194,18 +195,22 @@ HELP, topic, nickname, away, invite, kick, monitor, and mode tools. Four
 user-selectable MCP prompts guide connect, mention-watch, join, and
 summarize/respond workflows. Negotiated IRCv3 tools cover reactions, message
 redaction, synchronized read markers, and privacy-sensitive typing indicators
-without implying that a resource notification can start a model turn by
-itself.
+without implying that a resource notification can force or schedule a model
+turn: notifications wake the host application, and this protocol version has no
+server-initiated sampling with which to do more.
 
 Resources are the primary context plane: per-agent URIs expose connection
 status, protocol discovery, MOTD, reduced state, a compact inbox and
 conversation transcripts, lossless wire diagnostics, event bounds, DCC
 sessions, and separate channel state/member/topic views under
 `irc://agents/{agent_id}/...`. `irc.watch.create` turns a durable event filter
-into a subscribable `irc://watches/{watch_id}` resource whose cursor advances
-when read. This lets subscription-capable hosts wake on relevant activity and
-retrieve only the new matching context; `irc.events.read` remains the explicit
-long-poll fallback. See the [MCP API](docs/MCP_API.md) for inputs, results,
+into a subscribable `irc://watches/{watch_id}` resource. The watch holds no
+position: its descriptor read is pure, and its events are read either with
+`irc.events.read` plus a `watch_id` and the caller's own cursor, or from
+`irc://watches/{watch_id}/events/after/{stream_id}/{sequence}`. This lets
+subscription-capable hosts wake on relevant activity and retrieve only the new
+matching context, while any re-read stays idempotent; `irc.events.read` long
+polling remains the explicit fallback. See the [MCP API](docs/MCP_API.md) for inputs, results,
 errors, and resource shapes.
 
 ## Events and state

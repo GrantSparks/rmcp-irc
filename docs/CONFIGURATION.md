@@ -125,6 +125,8 @@ resynchronizes state, and recovers history where possible.
 | `max_command_timeout_ms` | per request | `30000` | Largest caller-selected IRC collector deadline. |
 | `max_event_wait_ms` | per request | `30000` | Largest caller-selected event long-poll duration. |
 | `max_event_page_size` | per request | `1000` | Largest event page returned by one read. |
+| `max_watches_per_owner` | per caller | `32` | Watch handles one caller may hold at once, across all of its agents. |
+| `watch_ttl_ms` | per watch | `3600000` | How long an unused watch handle survives. Any read of the watch or its events refreshes it. |
 
 All limits must be positive. Hitting a bound returns an explicit busy,
 overflow, or gap result; it does not silently allocate beyond the bound.

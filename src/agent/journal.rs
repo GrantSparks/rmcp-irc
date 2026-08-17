@@ -1,6 +1,6 @@
 //! Bounded, cursor-addressed event storage for one agent actor.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,7 @@ use crate::{
         semantic::{SemanticClass, SemanticEvent, SemanticProjection, Source},
         wire::WireMessage,
     },
+    mcp::conversation::CompactEvent,
     time::Timestamp,
 };
 
@@ -389,6 +390,64 @@ impl RecentQuery {
     }
 }
 
+/// The complete selection applied during one cursor read.
+///
+/// Kept separate from [`EventFilter`], which is a tool input schema. A watch
+/// selects several targets and classes at once, compares targets with the
+/// server's advertised `CASEMAPPING`, and — when the caller is reading a
+/// compact window — wants records that have no conversational form left out of
+/// the selection entirely rather than dropped after the read. Dropping them
+/// afterwards is what used to advance a position over records the caller never
+/// received. [`RecentQuery`] carries the same pre-folded target for
+/// newest-first windows.
+#[derive(Clone, Debug, Default)]
+pub struct CursorQuery {
+    /// Single-valued selection shared with the tool input schema.
+    pub filter: EventFilter,
+    /// Case-folded targets to keep. Empty means every target.
+    pub folded_targets: BTreeSet<String>,
+    /// Mapping used to fold both those targets and each event's own target.
+    pub case_mapping: CaseMapping,
+    /// Event classes to keep. Empty means every class.
+    pub classes: BTreeSet<EventClass>,
+    /// Keep only records [`CompactEvent`] can project, so a read that returns
+    /// compact events advances only over events it actually returned.
+    pub conversational_only: bool,
+}
+
+impl CursorQuery {
+    /// A read narrowed only by the single-valued tool filter.
+    pub fn filtered(filter: EventFilter) -> Self {
+        Self {
+            filter,
+            ..Self::default()
+        }
+    }
+
+    /// Whether one retained event belongs to this read.
+    pub fn selects(&self, event: &IrcEvent) -> bool {
+        if !self.classes.is_empty() && !self.classes.contains(&event.class) {
+            return false;
+        }
+        if !self.folded_targets.is_empty() {
+            let Some(target) = event.target.as_ref() else {
+                return false;
+            };
+            if !self
+                .folded_targets
+                .contains(&self.case_mapping.fold(target))
+            {
+                return false;
+            }
+        }
+        if !self.filter.matches(event) {
+            return false;
+        }
+        // Last, because it is the only test that has to build a projection.
+        !self.conversational_only || CompactEvent::project(event).is_some()
+    }
+}
+
 impl EventFilter {
     fn matches(&self, event: &IrcEvent) -> bool {
         self.command_id
@@ -511,6 +570,15 @@ pub struct EventPage {
     /// over events present in `events`, so a filtered read never consumes what
     /// its filter excluded and the cursor stays safe to reuse across filters.
     pub next_cursor: EventCursor,
+    /// Whether at least one further event matching *this read's own selection*
+    /// is retained past `next_cursor`.
+    ///
+    /// A read is truncated only by `limit`, never by an uninteresting record in
+    /// the way, so this is true exactly when reading again from `next_cursor`
+    /// right now would return more. It is never a statement about records the
+    /// selection excluded, which means a caller can drain a backlog with
+    /// `while has_more` and always make progress.
+    pub has_more: bool,
 }
 
 /// Bounded journal measurements exposed by the event resource.
@@ -617,7 +685,7 @@ impl EventJournal {
         &self,
         cursor: Option<&EventCursor>,
         limit: usize,
-        filter: &EventFilter,
+        query: &CursorQuery,
     ) -> EventPage {
         let latest = self.latest_cursor();
         let oldest_available = self.events.front().map(|(event, _)| event.cursor.clone());
@@ -639,15 +707,19 @@ impl EventJournal {
             Some(requested) => (CursorStatus::Current, requested.sequence),
         };
 
-        let events: Vec<IrcEvent> = self
+        let mut selected = self
             .events
             .iter()
             .map(|(event, _)| event)
             .filter(|event| event.cursor.sequence > after_sequence)
-            .filter(|event| filter.matches(event))
-            .take(limit)
-            .cloned()
-            .collect();
+            .filter(|event| query.selects(event));
+        let events: Vec<IrcEvent> = selected.by_ref().take(limit).cloned().collect();
+        // Reported rather than derived from `latest`: "records exist past the
+        // cursor" would be true whenever the selection declined the rest of the
+        // window, and a caller draining on that signal would re-read the same
+        // empty window forever. Asking the same selection for one more event
+        // instead makes `has_more` mean "another read returns something".
+        let has_more = selected.next().is_some();
         // Advance only over events actually returned. A filter narrows the view;
         // it must never consume what it excluded, because the same caller may
         // read again through a different filter and would otherwise never see
@@ -668,6 +740,7 @@ impl EventJournal {
             latest,
             events,
             next_cursor,
+            has_more,
         }
     }
 
@@ -832,10 +905,10 @@ mod tests {
         let page = journal.read(
             None,
             10,
-            &EventFilter {
+            &CursorQuery::filtered(EventFilter {
                 mentions_me: Some(true),
                 ..EventFilter::default()
-            },
+            }),
         );
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.events[0].cursor, addressed);
@@ -863,7 +936,7 @@ mod tests {
             latest - 4
         );
 
-        let cursorless_page = journal.read(None, 5, &EventFilter::default());
+        let cursorless_page = journal.read(None, 5, &CursorQuery::default());
         assert_eq!(
             cursorless_page
                 .events
@@ -913,7 +986,7 @@ mod tests {
             .push(event(&agent_id, EventClass::MessageNotice))
             .expect("third");
 
-        let page = journal.read(Some(&first), 10, &EventFilter::default());
+        let page = journal.read(Some(&first), 10, &CursorQuery::default());
         assert_eq!(page.status, CursorStatus::Current);
         assert_eq!(page.events.len(), 2);
 
@@ -921,7 +994,7 @@ mod tests {
             stream_id: first.stream_id,
             sequence: 0,
         };
-        let page = journal.read(Some(&before_first), 10, &EventFilter::default());
+        let page = journal.read(Some(&before_first), 10, &CursorQuery::default());
         assert_eq!(page.status, CursorStatus::EventGap);
         assert_eq!(page.events[0].class, EventClass::MessageChannel);
     }
@@ -935,7 +1008,7 @@ mod tests {
         };
         assert_eq!(
             journal
-                .read(Some(&cursor), 10, &EventFilter::default())
+                .read(Some(&cursor), 10, &CursorQuery::default())
                 .status,
             CursorStatus::StreamReset
         );
@@ -955,14 +1028,18 @@ mod tests {
             .push(event(&agent_id, EventClass::ProtocolReply))
             .expect("trailing reply");
 
-        let private = EventFilter {
+        let private = CursorQuery::filtered(EventFilter {
             class: Some(EventClass::MessagePrivate),
             ..EventFilter::default()
-        };
+        });
 
         let page = journal.read(None, 1, &private);
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.next_cursor, wanted);
+        assert!(
+            !page.has_more,
+            "the trailing non-match is not something this read would return"
+        );
 
         // Nothing further matches, so the cursor must stay put rather than
         // racing ahead over the trailing non-match.
@@ -972,7 +1049,7 @@ mod tests {
 
         // The regression that matters: the same cursor read through a
         // different filter must still see the event the first filter skipped.
-        let page = journal.read(Some(&wanted), 10, &EventFilter::default());
+        let page = journal.read(Some(&wanted), 10, &CursorQuery::default());
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.events[0].cursor, trailing);
         assert_eq!(page.next_cursor, trailing);
@@ -992,10 +1069,91 @@ mod tests {
             .push(event(&agent_id, EventClass::ProtocolReply))
             .expect("third");
 
-        let page = journal.read(None, 2, &EventFilter::default());
+        let page = journal.read(None, 2, &CursorQuery::default());
         assert_eq!(page.events.len(), 2);
         assert_eq!(page.next_cursor, second);
         assert_eq!(page.latest.sequence, 3);
+        assert!(page.has_more, "the third record is still waiting");
+    }
+
+    #[test]
+    fn has_more_speaks_only_about_events_the_same_read_would_return() {
+        let agent_id = AgentId::new();
+        let mut journal = EventJournal::new(16, 64 * 1024);
+        let wanted = journal
+            .push(event(&agent_id, EventClass::MessagePrivate))
+            .expect("wanted");
+        for _ in 0..5 {
+            journal
+                .push(event(&agent_id, EventClass::ProtocolReply))
+                .expect("uninteresting");
+        }
+
+        let private = CursorQuery::filtered(EventFilter {
+            class: Some(EventClass::MessagePrivate),
+            ..EventFilter::default()
+        });
+        let page = journal.read(None, 10, &private);
+        assert_eq!(page.next_cursor, wanted);
+        assert!(
+            page.next_cursor.sequence < page.latest.sequence,
+            "later records exist, which is exactly what has_more must not report"
+        );
+        assert!(
+            !page.has_more,
+            "reading again would return nothing, so a draining caller must stop"
+        );
+    }
+
+    #[test]
+    fn a_selection_reaches_matches_beyond_a_page_of_uninteresting_records() {
+        let agent_id = AgentId::new();
+        let mut journal = EventJournal::new(64, 256 * 1024);
+        for _ in 0..40 {
+            let mut record = event(&agent_id, EventClass::MessageChannel);
+            record.target = Some("#elsewhere".into());
+            journal.push(record).expect("uninteresting");
+        }
+        let mut wanted = event(&agent_id, EventClass::MessageChannel);
+        wanted.target = Some("#Control".into());
+        let wanted = journal.push(wanted).expect("wanted");
+
+        // A single-event limit must not stop the scan at the first page of raw
+        // records: the selection is applied while reading, so uninteresting
+        // records can never keep a match out of reach or block the cursor.
+        let query = CursorQuery {
+            folded_targets: BTreeSet::from([CaseMapping::default().fold("#control")]),
+            ..CursorQuery::default()
+        };
+        let page = journal.read(None, 1, &query);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].cursor, wanted);
+        assert_eq!(page.next_cursor, wanted);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn a_conversational_read_never_advances_over_a_record_it_cannot_project() {
+        let agent_id = AgentId::new();
+        let mut journal = EventJournal::new(16, 64 * 1024);
+        // A numeric reply carries no conversational form, so a compact read
+        // must decline it as part of its selection rather than skip it after
+        // the fact and drag the cursor along.
+        journal
+            .push(event(&agent_id, EventClass::ProtocolReply))
+            .expect("numeric");
+
+        let compact = CursorQuery {
+            conversational_only: true,
+            ..CursorQuery::default()
+        };
+        let page = journal.read(None, 10, &compact);
+        assert!(page.events.is_empty());
+        assert_eq!(page.next_cursor.sequence, 0);
+        assert!(!page.has_more);
+
+        let lossless = journal.read(None, 10, &CursorQuery::default());
+        assert_eq!(lossless.events.len(), 1);
     }
 
     #[test]
@@ -1037,7 +1195,7 @@ mod tests {
         let mut journal = EventJournal::new(4, 4096);
         journal.push(event).expect("push");
         let stored = journal
-            .read(None, 1, &EventFilter::default())
+            .read(None, 1, &CursorQuery::default())
             .events
             .remove(0);
         let json = serde_json::to_value(&stored).expect("serialize");

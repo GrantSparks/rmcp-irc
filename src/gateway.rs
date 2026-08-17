@@ -15,7 +15,7 @@ use crate::{
             AgentHandle, AgentSnapshot, CompletionMode, DccAcceptRequest, DisconnectReceipt,
             ExecuteRequest, RegistrationRequest,
         },
-        journal::{CursorStatus, EventCursor, EventFilter, EventPage, EventVerbosity, RecentQuery},
+        journal::{CursorQuery, EventCursor, EventFilter, EventPage, EventVerbosity, RecentQuery},
     },
     config::Config,
     dcc::{
@@ -34,7 +34,10 @@ use crate::{
         authorization::{OwnerId, not_authorized},
         conversation::CompactEvent,
         resources::{ConversationResource, WireResource},
-        watch::{WatchDescriptor, WatchFilter, WatchId, WatchRegistry, WatchResource},
+        watch::{
+            WatchDescriptor, WatchEventsResource, WatchFilter, WatchId, WatchLimits, WatchRegistry,
+            WatchResource,
+        },
     },
 };
 
@@ -77,6 +80,16 @@ pub struct ConnectedAgent {
     pub motd: crate::agent::state::MotdState,
 }
 
+/// A newly registered watch and the position its stream had at that moment.
+#[derive(Clone, Debug)]
+pub struct WatchCreation {
+    /// The registered watch.
+    pub watch: WatchDescriptor,
+    /// Latest journal position when the watch was created, so a caller can
+    /// start from "now" instead of from the oldest retained record.
+    pub latest_cursor: EventCursor,
+}
+
 /// One published agent and the caller identity that created it.
 #[derive(Clone, Debug)]
 struct OwnedAgent {
@@ -100,12 +113,16 @@ impl Gateway {
         let capacity = Arc::new(Semaphore::new(config.limits.max_agents));
         let update_capacity = config.limits.command_queue.max(16);
         let (resource_updates, _) = broadcast::channel(update_capacity);
+        let watch_limits = WatchLimits {
+            max_per_owner: config.limits.max_watches_per_owner,
+            time_to_live: Duration::from_millis(config.limits.watch_ttl_ms),
+        };
         Self {
             config: Arc::new(config),
             agents: RwLock::new(BTreeMap::new()),
             capacity,
             resource_updates,
-            watches: Arc::new(WatchRegistry::new()),
+            watches: Arc::new(WatchRegistry::new(watch_limits)),
         }
     }
 
@@ -234,7 +251,7 @@ impl Gateway {
     ) -> Result<EventPage> {
         self.resolve(agent_id)
             .await?
-            .read_events(cursor, limit, wait, filter)
+            .read_events(cursor, limit, wait, CursorQuery::filtered(filter))
             .await
     }
 
@@ -296,17 +313,34 @@ impl Gateway {
     ///
     /// Resolving the agent first means an unusable handle fails here rather
     /// than on the caller's first read of a watch that could never produce
-    /// anything.
+    /// anything. The watch is charged to whoever owns that agent, so the
+    /// per-caller bound holds however many agents the caller has.
+    ///
+    /// The stream's current latest position comes back with the descriptor
+    /// because a watch keeps no position of its own: without it a caller's only
+    /// starting point would be the oldest retained record, and the common
+    /// intention — "tell me about things from now on" — would need a throwaway
+    /// read to establish.
     pub async fn create_watch(
         &self,
         agent_id: &AgentId,
         filter: WatchFilter,
-        cursor: Option<EventCursor>,
-    ) -> Result<WatchDescriptor> {
-        self.resolve(agent_id).await?;
-        let descriptor = self.watches.create(agent_id.clone(), filter, cursor);
+    ) -> Result<WatchCreation> {
+        let handle = self.resolve(agent_id).await?;
+        let owner = self
+            .agents
+            .read()
+            .await
+            .get(agent_id)
+            .map(|agent| agent.owner.clone())
+            .ok_or_else(|| GatewayError::AgentNotFound(agent_id.clone()))?;
+        let latest_cursor = handle.snapshot().await?.journal.latest;
+        let watch = self.watches.create(owner, agent_id.clone(), filter)?;
         let _ = self.resource_updates.send("irc://agents".into());
-        Ok(descriptor)
+        Ok(WatchCreation {
+            watch,
+            latest_cursor,
+        })
     }
 
     /// Release a watch handle.
@@ -318,74 +352,88 @@ impl Gateway {
         Ok(())
     }
 
-    /// Read everything a watch has not yet delivered, advancing its position.
+    /// Describe a watch: its selection, the health of the stream it selects
+    /// from, and where to read what it selected.
     ///
-    /// The journal read itself is unfiltered so the stored position advances
-    /// over records the watch does not want; otherwise a quiet watch on a busy
-    /// stream would rescan the same events forever. Selection is applied
-    /// afterwards, which is also what lets the compact projection drop protocol
-    /// records without those records blocking the cursor.
+    /// Pure with respect to delivery. A watch holds no position, so a host may
+    /// read this URI whenever it likes — refreshing a panel, resynchronizing
+    /// after dropped notifications, two components on the same URI — and no
+    /// caller loses an event for it. The only effect is that the handle's time
+    /// to live is refreshed, which is what "in use" has to mean for a handle
+    /// nobody is obliged to close.
     pub async fn read_watch(&self, watch_id: &WatchId) -> Result<WatchResource> {
-        let (agent_id, filter, cursor) = self
-            .watches
-            .position(watch_id)
-            .ok_or_else(|| GatewayError::WatchNotFound(watch_id.clone()))?;
-        let handle = self.resolve(&agent_id).await?;
+        let watch = self.touch_watch(watch_id)?;
+        let journal = self
+            .resolve(&watch.agent_id)
+            .await?
+            .snapshot()
+            .await?
+            .journal;
+        Ok(WatchResource::describe(watch, journal))
+    }
+
+    /// Read the events one watch selects, from an explicit caller-owned cursor.
+    ///
+    /// The watch supplies the selection and nothing else. Two consumers of one
+    /// watch therefore never disturb each other, and a caller that lost a
+    /// response recovers it by presenting the same cursor again. Long polling
+    /// works exactly as it does for an unfiltered read, because the parked read
+    /// keeps this selection and re-runs it when the journal grows.
+    pub async fn read_watch_events(
+        &self,
+        agent_id: &AgentId,
+        watch_id: &WatchId,
+        cursor: Option<EventCursor>,
+        limit: usize,
+        wait: Duration,
+    ) -> Result<EventPage> {
+        let watch = self.touch_watch(watch_id)?;
+        if watch.agent_id != *agent_id {
+            return Err(GatewayError::InvalidMessage(format!(
+                "watch {watch_id} selects from agent {} rather than {agent_id}",
+                watch.agent_id
+            )));
+        }
+        let handle = self.resolve(&watch.agent_id).await?;
+        let case_mapping = case_mapping_of(&handle.snapshot().await?);
+        handle
+            .read_events(cursor, limit, wait, watch.filter.cursor_query(case_mapping))
+            .await
+    }
+
+    /// Read one positioned, compact window of what a watch selects.
+    ///
+    /// The position arrives in the resource URI, so the read is idempotent: the
+    /// same URI always answers with the same window. Records with no
+    /// conversational form are excluded by the selection rather than dropped
+    /// after it, which is what keeps the returned `next_cursor` a position over
+    /// events the caller actually received.
+    pub async fn read_watch_window(
+        &self,
+        watch_id: &WatchId,
+        cursor: EventCursor,
+    ) -> Result<WatchEventsResource> {
+        let watch = self.touch_watch(watch_id)?;
+        let handle = self.resolve(&watch.agent_id).await?;
         let snapshot = handle.snapshot().await?;
-        let case_mapping = case_mapping_of(&snapshot);
-        let limit = self.config.limits.max_event_page_size;
+        let mut query = watch.filter.cursor_query(case_mapping_of(&snapshot));
+        query.conversational_only = true;
+        let page = handle
+            .read_events(
+                Some(cursor.clone()),
+                self.config.limits.max_event_page_size,
+                Duration::ZERO,
+                query,
+            )
+            .await?;
+        Ok(WatchEventsResource::from_page(watch, cursor, page))
+    }
 
-        // Keep reading while the page is entirely uninteresting, so a
-        // notification never resolves to an empty read while matching records
-        // sit just past the first page. Bounded by the retained window, since
-        // every pass consumes at least one record.
-        let mut cursor = cursor;
-        // The opening read decides the status: a gap or a stream reset relative
-        // to the position the watch actually held is what the caller needs to
-        // hear about, and later passes are all continuations of this same read.
-        let mut status = None;
-        let mut events = Vec::new();
-        let has_more = loop {
-            let page = handle
-                .read_events(
-                    cursor.clone(),
-                    limit,
-                    Duration::ZERO,
-                    EventFilter::default(),
-                )
-                .await?;
-            status.get_or_insert(page.status);
-            let advanced = page.next_cursor.clone();
-            events.extend(
-                page.events
-                    .iter()
-                    .filter(|event| filter.matches(event, case_mapping))
-                    .filter_map(CompactEvent::project),
-            );
-            let more = advanced.sequence < page.latest.sequence;
-            // A pass that could not move is exhausted even if the journal
-            // reports later records, so this always terminates.
-            let stalled = cursor.as_ref() == Some(&advanced);
-            cursor = Some(advanced);
-            if !events.is_empty() || stalled || !more {
-                break more;
-            }
-        };
-
-        let status = status.unwrap_or(CursorStatus::Current);
-        let next_cursor = cursor.expect("a watch read always advances to a cursor");
-        self.watches.advance(watch_id, next_cursor.clone());
-        let watch = self
-            .watches
-            .describe(watch_id)
-            .ok_or_else(|| GatewayError::WatchNotFound(watch_id.clone()))?;
-        Ok(WatchResource {
-            watch,
-            status,
-            events,
-            next_cursor,
-            has_more,
-        })
+    /// Resolve a watch handle for consumption, refreshing its time to live.
+    fn touch_watch(&self, watch_id: &WatchId) -> Result<WatchDescriptor> {
+        self.watches
+            .touch(watch_id)
+            .ok_or_else(|| GatewayError::WatchNotFound(watch_id.clone()))
     }
 
     /// Invalidate an agent handle and request clean shutdown.

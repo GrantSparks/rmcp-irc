@@ -24,7 +24,7 @@ use crate::{
         target::{ChannelName, Target},
         wire::Tag,
     },
-    mcp::resources::ResourceUris,
+    mcp::{resources::ResourceUris, watch::WatchId},
     time::Timestamp,
 };
 
@@ -1233,6 +1233,13 @@ pub struct EventsReadInput {
     /// milliseconds, up to the configured maximum of 30000 by default.
     #[serde(default)]
     pub wait_ms: u64,
+    /// Optional watch handle returned by `irc.watch.create`, whose registered
+    /// selection — several targets, several classes, addressed-to-me, direction
+    /// — is applied to this read. The watch supplies only the selection; the
+    /// position stays `cursor`, so two readers of one watch never disturb each
+    /// other. Because a watch already describes a complete selection, every
+    /// single-value filter below must be omitted when this is set.
+    pub watch_id: Option<WatchId>,
     /// Optional gateway command identifier filter.
     pub command_id: Option<String>,
     /// Optional strongly typed event class filter.
@@ -1253,6 +1260,28 @@ pub struct EventsReadInput {
 }
 
 impl EventsReadInput {
+    /// The first single-value filter set alongside `watch_id`, if any.
+    ///
+    /// The combination is refused rather than intersected. A watch carries
+    /// multi-target and multi-class selection these fields cannot express, so
+    /// combining them would silently produce a third selection that neither the
+    /// watch nor the caller describes — and a caller reading a watch through
+    /// someone else's extra filter would persist a cursor for a window it
+    /// cannot reproduce. Narrow the watch itself, or read without it.
+    pub fn conflicting_filter(&self) -> Option<&'static str> {
+        [
+            ("command_id", self.command_id.is_some()),
+            ("class", self.class.is_some()),
+            ("target", self.target.is_some()),
+            ("direction", self.direction.is_some()),
+            ("origin", self.origin.is_some()),
+            ("verbosity", self.verbosity.is_some()),
+            ("mentions_me", self.mentions_me.is_some()),
+        ]
+        .into_iter()
+        .find_map(|(name, present)| present.then_some(name))
+    }
+
     /// Build the actor journal filter without duplicating matching logic.
     pub fn filter(&self) -> EventFilter {
         EventFilter {

@@ -1,24 +1,30 @@
 //! Explicit watch handles over an agent's event stream.
 //!
-//! A watch is a named, server-side subscription: the caller says once which
-//! targets and classes it cares about, and gets back a resource URI. Reading
-//! that URI returns everything matching since the previous read, together with
-//! the position it advanced to, so `subscriptions/listen` plus `resources/read`
-//! is a complete delivery loop with no tool call in it.
+//! A watch is a named, server-side *selection*: the caller says once which
+//! targets and classes it cares about, and gets back `irc://watches/{id}`, a
+//! resource it can subscribe to. Notifications are evaluated against that
+//! selection, so a watch on one channel is never woken by traffic on another.
 //!
-//! Two properties make it usable as the primary context plane rather than as a
-//! polling fallback:
+//! A watch holds no position. The descriptor resource is immutable and reading
+//! it consumes nothing, because a spec-compliant host re-reads resources at
+//! moments the model did not choose — refreshing a panel, resynchronizing after
+//! dropped notifications, two components on one URI — and a read that consumed
+//! events would lose them silently. Every position is the caller's own and is
+//! supplied on each read, through either consumption path:
 //!
-//! * notifications are evaluated against the watch's own filter, so a watch on
-//!   one channel is not woken by traffic on another;
-//! * the position lives with the watch, so a read needs no cursor argument and
-//!   a lagging or reconnecting client is told explicitly that it lost records
-//!   instead of silently restarting.
+//! * `irc.events.read` with `watch_id` and the caller's cursor, which applies
+//!   this selection to the lossless journal and can long poll;
+//! * `irc://watches/{id}/events/after/{stream_id}/{sequence}`, which carries the
+//!   position in the path and answers with the compact conversational window.
+//!
+//! Both are idempotent: the same position always returns the same window, and
+//! the cursor they hand back advances only over events they actually returned.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     str::FromStr,
     sync::RwLock,
+    time::Duration,
 };
 
 use schemars::JsonSchema;
@@ -28,11 +34,31 @@ use uuid::Uuid;
 use crate::{
     agent::{
         AgentId,
-        journal::{CursorStatus, EventClass, EventCursor, EventDirection, IrcEvent},
+        journal::{
+            CursorQuery, CursorStatus, EventClass, EventCursor, EventDirection, EventFilter,
+            EventPage, IrcEvent, JournalStats,
+        },
     },
+    error::{GatewayError, Result},
     irc::isupport::CaseMapping,
-    mcp::conversation::CompactEvent,
+    mcp::{authorization::OwnerId, conversation::CompactEvent},
+    time::Timestamp,
 };
+
+/// Prefix under which every watch resource lives.
+///
+/// Watch handles are addressed under their own authority rather than under an
+/// agent, because a watch outlives any single read and is the thing a client
+/// subscribes to.
+pub const WATCH_URI_PREFIX: &str = "irc://watches/";
+
+/// Resource template for one positioned window over a watch's selection.
+///
+/// The position is in the path rather than in server state, which is what makes
+/// the read idempotent: a host may fetch the same URI any number of times and
+/// always receives the same window.
+pub const WATCH_EVENTS_TEMPLATE: &str =
+    "irc://watches/{watch_id}/events/after/{stream_id}/{sequence}";
 
 /// Opaque handle for one registered watch.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
@@ -55,7 +81,7 @@ impl Default for WatchId {
 impl FromStr for WatchId {
     type Err = &'static str;
 
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         // Validate the shape rather than trusting the path segment: a handle is
         // a lookup key, and anything that is not one should fail as a bad URI
         // rather than as a missing watch.
@@ -119,14 +145,59 @@ impl WatchFilter {
             .iter()
             .any(|wanted| case_mapping.fold(wanted) == folded)
     }
+
+    /// The journal selection this watch applies to a cursor read.
+    ///
+    /// Folding the targets once here, rather than per event after the read, is
+    /// what lets the journal apply the watch's own selection *during* the read.
+    /// That is the whole point: a position handed back by a read that already
+    /// knew the selection advances only over events the watch delivered, so
+    /// records the watch declined can neither be consumed silently nor block
+    /// progress behind a page of traffic it does not want.
+    pub fn cursor_query(&self, case_mapping: CaseMapping) -> CursorQuery {
+        CursorQuery {
+            filter: EventFilter {
+                direction: self.inbound_only.then_some(EventDirection::Inbound),
+                mentions_me: self.mentions_only.then_some(true),
+                ..EventFilter::default()
+            },
+            folded_targets: self
+                .targets
+                .iter()
+                .map(|target| case_mapping.fold(target))
+                .collect(),
+            case_mapping,
+            classes: self.classes.clone(),
+            conversational_only: false,
+        }
+    }
 }
 
-/// A registered watch and the position it has delivered through.
+/// A registered watch: one immutable selection over one agent's stream.
+///
+/// There is deliberately no position here. Delivery state behind a
+/// host-readable resource is shared mutable state: two authorized components
+/// reading the same URI would consume each other's window, and a retry after a
+/// lost response would consume a second one. Callers keep their own cursors
+/// instead.
 #[derive(Clone, Debug)]
 struct Watch {
+    owner: OwnerId,
     agent_id: AgentId,
     filter: WatchFilter,
-    cursor: Option<EventCursor>,
+    expires_at: Timestamp,
+}
+
+impl Watch {
+    fn descriptor(&self, watch_id: &WatchId) -> WatchDescriptor {
+        WatchDescriptor {
+            watch_id: watch_id.clone(),
+            agent_id: self.agent_id.clone(),
+            filter: self.filter.clone(),
+            uri: watch_uri(watch_id),
+            expires_at: self.expires_at,
+        }
+    }
 }
 
 /// Published description of one watch.
@@ -140,29 +211,209 @@ pub struct WatchDescriptor {
     pub filter: WatchFilter,
     /// Stable resource URI for this watch.
     pub uri: String,
+    /// When an unused handle stops working. Reading either consumption path or
+    /// the descriptor itself pushes this out again, so a watch expires only
+    /// after nobody has used it for the configured window.
+    pub expires_at: Timestamp,
 }
 
-/// Payload returned by reading a watch resource.
+/// The two ways to read what a watch selects. Both are positioned by the
+/// caller, so neither disturbs the other.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct WatchConsumption {
+    /// Tool that applies this watch's selection to the lossless journal. Pass
+    /// `watch_id`, the `next_cursor` from your previous read, and optionally
+    /// `wait_ms` to long poll.
+    pub events_read_tool: &'static str,
+    /// Resource template for the compact window, positioned in the path.
+    pub events_after_template: &'static str,
+    /// That template expanded at the oldest retained position: everything this
+    /// watch selects that is still in the window.
+    pub from_oldest_retained: String,
+    /// That template expanded at the newest position: only what happens next.
+    pub from_latest: String,
+    /// One concrete loop, spelled out.
+    pub instructions: &'static str,
+}
+
+/// Payload returned by reading `irc://watches/{watch_id}`.
+///
+/// A filter, a health report, and a notification target — never a delivery
+/// queue. Reading it is pure: any number of host-initiated re-reads return the
+/// same thing and lose nothing, which is why `consume` names positioned paths
+/// instead of returning events here.
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct WatchResource {
     /// Which watch this is.
     pub watch: WatchDescriptor,
-    /// Relationship of the watch's stored position to the retained window.
-    /// Anything other than `current` means records were lost and the reader
-    /// should treat its prior view as incomplete.
-    pub status: CursorStatus,
-    /// Matching events since the previous read, oldest first.
-    pub events: Vec<CompactEvent>,
-    /// Position this read advanced the watch to. Recorded server-side as well,
-    /// so the next read continues from here without an argument.
-    pub next_cursor: EventCursor,
-    /// Whether more retained events remain past `next_cursor`.
-    pub has_more: bool,
+    /// Retained bounds of the stream this watch selects from, so a caller can
+    /// tell whether the position it holds is still inside the window before it
+    /// reads.
+    pub journal: JournalStats,
+    /// Where to read what this watch selected.
+    pub consume: WatchConsumption,
 }
+
+impl WatchResource {
+    /// Describe one watch against the current bounds of its stream.
+    pub fn describe(watch: WatchDescriptor, journal: JournalStats) -> Self {
+        // One before the oldest retained sequence, so the window starting there
+        // includes the oldest record itself.
+        let oldest = EventCursor {
+            stream_id: journal.stream_id.clone(),
+            sequence: journal
+                .oldest_available
+                .as_ref()
+                .map_or(journal.latest.sequence, |cursor| {
+                    cursor.sequence.saturating_sub(1)
+                }),
+        };
+        let consume = WatchConsumption {
+            events_read_tool: "irc.events.read",
+            events_after_template: WATCH_EVENTS_TEMPLATE,
+            from_oldest_retained: watch_events_uri(&watch.watch_id, &oldest),
+            from_latest: watch_events_uri(&watch.watch_id, &journal.latest),
+            instructions: WATCH_INSTRUCTIONS,
+        };
+        Self {
+            watch,
+            journal,
+            consume,
+        }
+    }
+}
+
+/// One positioned window over the events a watch selects.
+///
+/// Idempotent by construction: the position comes from the URI, nothing on the
+/// server moves, and `next_cursor` advances only over the events in `events`.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct WatchEventsResource {
+    /// Which watch produced this window.
+    pub watch: WatchDescriptor,
+    /// Position this window was requested from, taken from the URI.
+    pub requested_cursor: EventCursor,
+    /// Relationship of that position to the retained window. Anything other
+    /// than `current` means records were lost between it and what follows, and
+    /// the reader should treat its prior view as incomplete.
+    pub status: CursorStatus,
+    /// Oldest position still retained, if the stream retains anything.
+    pub oldest_available: Option<EventCursor>,
+    /// Newest position assigned in this stream.
+    pub latest: EventCursor,
+    /// Selected events, compact and oldest first. Records with no
+    /// conversational form are not part of this window's selection at all; read
+    /// them losslessly with `irc.events.read` and this `watch_id`.
+    pub events: Vec<CompactEvent>,
+    /// Position to read from next. It advances only over `events`, so re-reading
+    /// `requested_cursor` returns this same window and a lost response costs
+    /// nothing.
+    pub next_cursor: EventCursor,
+    /// Whether at least one further selected event is retained past
+    /// `next_cursor`. True means read `next_uri` immediately rather than waiting
+    /// for another notification; false means this watch is drained, even when
+    /// the stream holds later records it did not select.
+    pub has_more: bool,
+    /// This resource's own URI expanded at `next_cursor`.
+    pub next_uri: String,
+}
+
+impl WatchEventsResource {
+    /// Project one journal page into the watch's compact window.
+    pub fn from_page(
+        watch: WatchDescriptor,
+        requested_cursor: EventCursor,
+        page: EventPage,
+    ) -> Self {
+        Self {
+            next_uri: watch_events_uri(&watch.watch_id, &page.next_cursor),
+            watch,
+            requested_cursor,
+            status: page.status,
+            oldest_available: page.oldest_available,
+            latest: page.latest,
+            // Every event the selection returned projects, because
+            // projectability is part of that selection.
+            events: page
+                .events
+                .iter()
+                .filter_map(CompactEvent::project)
+                .collect(),
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+        }
+    }
+}
+
+/// The single delivery loop a caller should implement, published from the
+/// descriptor resource and from `irc.watch.create` so both say the same thing.
+pub const WATCH_INSTRUCTIONS: &str = "Subscribe with subscriptions/listen, naming this watch's URI in \
+     resourceSubscriptions. On each notification, read irc.events.read with this watch_id and the \
+     cursor you last persisted, or fetch \
+     irc://watches/{watch_id}/events/after/{stream_id}/{sequence} for the compact window. Persist \
+     the next_cursor each read returns; nothing on the server moves, so re-reading a cursor is \
+     always safe. Keep reading while has_more is true. Without subscriptions, call irc.events.read \
+     with this watch_id and a positive wait_ms. Release the handle with irc.watch.close.";
 
 /// Build the stable resource URI for a watch handle.
 pub fn watch_uri(watch_id: &WatchId) -> String {
-    format!("irc://watches/{watch_id}")
+    format!("{WATCH_URI_PREFIX}{watch_id}")
+}
+
+/// Build the positioned window URI for a watch and an explicit cursor.
+pub fn watch_events_uri(watch_id: &WatchId, cursor: &EventCursor) -> String {
+    format!(
+        "{WATCH_URI_PREFIX}{watch_id}/events/after/{}/{}",
+        cursor.stream_id, cursor.sequence
+    )
+}
+
+/// Which of a watch's resources a URI addresses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WatchTarget {
+    /// The immutable descriptor, journal health, and consumption pointers.
+    Descriptor,
+    /// One compact window of selected events after an explicit position.
+    EventsAfter(EventCursor),
+}
+
+/// Parsed `irc://watches/...` resource URI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchUri {
+    /// Watch the URI addresses.
+    pub watch_id: WatchId,
+    /// Which of that watch's resources it addresses.
+    pub target: WatchTarget,
+}
+
+impl FromStr for WatchUri {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let path = value
+            .strip_prefix(WATCH_URI_PREFIX)
+            .ok_or("watch resource URI must begin with irc://watches/")?;
+        // Match the whole remainder so a trailing segment is rejected rather
+        // than silently ignored.
+        let segments: Vec<&str> = path.split('/').collect();
+        let (handle, rest) = segments
+            .split_first()
+            .ok_or("watch resource URI must name a handle")?;
+        let watch_id = WatchId::from_str(handle)?;
+        let target = match rest {
+            [] => WatchTarget::Descriptor,
+            ["events", "after", stream_id, sequence] if !stream_id.is_empty() => {
+                WatchTarget::EventsAfter(EventCursor {
+                    stream_id: (*stream_id).to_owned(),
+                    sequence: sequence
+                        .parse()
+                        .map_err(|_| "watch event position must end in a decimal sequence")?,
+                })
+            }
+            _ => return Err("unknown watch resource path"),
+        };
+        Ok(Self { watch_id, target })
+    }
 }
 
 /// Input accepted by `irc.watch.create`.
@@ -186,10 +437,6 @@ pub struct WatchCreateInput {
     /// messages.
     #[serde(default)]
     pub inbound_only: bool,
-    /// Position to begin from. Omit to start at the oldest retained event, or
-    /// supply the cursor a previous session ended on to resume without a gap.
-    #[serde(default)]
-    pub cursor: Option<EventCursor>,
 }
 
 /// Result of `irc.watch.create`.
@@ -197,7 +444,14 @@ pub struct WatchCreateInput {
 pub struct WatchCreateOutput {
     /// The registered watch.
     pub watch: WatchDescriptor,
-    /// How to consume it without polling.
+    /// Journal position at the moment this watch was created. Persist it as the
+    /// starting cursor to receive only what happens from now on; a watch stores
+    /// no position of its own, so this is the caller's "now".
+    pub latest_cursor: EventCursor,
+    /// `latest_cursor` already expanded into the positioned window URI, so the
+    /// first read needs no cursor arithmetic.
+    pub next_uri: String,
+    /// The delivery loop to implement.
     pub instructions: &'static str,
 }
 
@@ -228,55 +482,85 @@ impl WatchCreateInput {
     }
 }
 
+/// Bounds the registry enforces on watch handles.
+#[derive(Clone, Copy, Debug)]
+pub struct WatchLimits {
+    /// Watches one caller may hold at once, across all of its agents.
+    pub max_per_owner: usize,
+    /// How long a watch survives without being used. Refreshed whenever a
+    /// caller resolves the handle, so an actively consumed watch never expires.
+    pub time_to_live: Duration,
+}
+
 /// Process-wide registry of watch handles.
 ///
-/// Shared between the gateway, which creates and reads watches, and each agent
-/// actor, which tests newly journaled events against every watch on itself so a
-/// notification means "there is something here for you" rather than "something
-/// happened somewhere".
-#[derive(Debug, Default)]
+/// Shared between the gateway, which creates and resolves watches, and each
+/// agent actor, which tests newly journaled events against every watch on
+/// itself so a notification means "there is something here for you" rather than
+/// "something happened somewhere".
+///
+/// Handles are bearer-shaped: they name state a caller may read, so they are
+/// bounded per owner and expire when nobody is using them. Expiry is applied
+/// opportunistically — every read treats a lapsed handle as absent and every
+/// write reclaims it — rather than from a timer, which keeps the registry a
+/// plain lock with no task of its own.
+#[derive(Debug)]
 pub struct WatchRegistry {
+    limits: WatchLimits,
     watches: RwLock<BTreeMap<WatchId, Watch>>,
 }
 
 impl WatchRegistry {
-    /// Create an empty registry.
-    pub fn new() -> Self {
-        Self::default()
+    /// Create an empty registry with the bounds it will enforce.
+    pub fn new(limits: WatchLimits) -> Self {
+        Self {
+            limits,
+            watches: RwLock::new(BTreeMap::new()),
+        }
     }
 
-    /// Register a watch, returning its published description.
+    /// Register a watch for one caller, returning its published description.
+    ///
+    /// Lapsed handles are reclaimed first, so a caller that walked away from a
+    /// watch cannot permanently occupy its own allowance.
     pub fn create(
         &self,
+        owner: OwnerId,
         agent_id: AgentId,
         filter: WatchFilter,
-        cursor: Option<EventCursor>,
-    ) -> WatchDescriptor {
+    ) -> Result<WatchDescriptor> {
+        let now = Timestamp::now();
+        let mut watches = self.watches.write().expect("watch registry lock");
+        watches.retain(|_, watch| watch.expires_at > now);
+        let held = watches
+            .values()
+            .filter(|watch| watch.owner == owner)
+            .count();
+        if held >= self.limits.max_per_owner {
+            return Err(GatewayError::ResourceLimit(format!(
+                "watch limit reached: this caller already holds {held} of {} watches; close one \
+                 with irc.watch.close",
+                self.limits.max_per_owner
+            )));
+        }
         let watch_id = WatchId::new();
         let watch = Watch {
-            agent_id: agent_id.clone(),
-            filter: filter.clone(),
-            cursor,
-        };
-        self.watches
-            .write()
-            .expect("watch registry lock")
-            .insert(watch_id.clone(), watch);
-        WatchDescriptor {
-            uri: watch_uri(&watch_id),
-            watch_id,
+            owner,
             agent_id,
             filter,
-        }
+            expires_at: self.expiry_after(now),
+        };
+        let descriptor = watch.descriptor(&watch_id);
+        watches.insert(watch_id, watch);
+        Ok(descriptor)
     }
 
     /// Remove a watch, reporting whether it existed.
     pub fn close(&self, watch_id: &WatchId) -> bool {
-        self.watches
-            .write()
-            .expect("watch registry lock")
-            .remove(watch_id)
-            .is_some()
+        let now = Timestamp::now();
+        let mut watches = self.watches.write().expect("watch registry lock");
+        watches.retain(|_, watch| watch.expires_at > now);
+        watches.remove(watch_id).is_some()
     }
 
     /// Drop every watch belonging to a disconnected agent.
@@ -287,63 +571,43 @@ impl WatchRegistry {
             .retain(|_, watch| watch.agent_id != *agent_id);
     }
 
-    /// Describe one registered watch.
+    /// Describe one live watch without touching its expiry.
     pub fn describe(&self, watch_id: &WatchId) -> Option<WatchDescriptor> {
+        let now = Timestamp::now();
         let watches = self.watches.read().expect("watch registry lock");
-        let watch = watches.get(watch_id)?;
-        Some(WatchDescriptor {
-            watch_id: watch_id.clone(),
-            agent_id: watch.agent_id.clone(),
-            filter: watch.filter.clone(),
-            uri: watch_uri(watch_id),
-        })
+        let watch = watches
+            .get(watch_id)
+            .filter(|watch| watch.expires_at > now)?;
+        Some(watch.descriptor(watch_id))
     }
 
-    /// Every registered watch, in handle order.
+    /// Describe one live watch and push its expiry out again.
+    ///
+    /// Used by the consumption paths, so "in use" means a caller asked for its
+    /// events and not merely that IRC traffic happened to match: otherwise a
+    /// busy channel would keep a watch nobody reads alive forever.
+    pub fn touch(&self, watch_id: &WatchId) -> Option<WatchDescriptor> {
+        let now = Timestamp::now();
+        let mut watches = self.watches.write().expect("watch registry lock");
+        watches.retain(|_, watch| watch.expires_at > now);
+        let watch = watches.get_mut(watch_id)?;
+        watch.expires_at = self.expiry_after(now);
+        Some(watch.descriptor(watch_id))
+    }
+
+    /// Every live watch, in handle order.
     pub fn list(&self) -> Vec<WatchDescriptor> {
+        let now = Timestamp::now();
         self.watches
             .read()
             .expect("watch registry lock")
             .iter()
-            .map(|(watch_id, watch)| WatchDescriptor {
-                watch_id: watch_id.clone(),
-                agent_id: watch.agent_id.clone(),
-                filter: watch.filter.clone(),
-                uri: watch_uri(watch_id),
-            })
+            .filter(|(_, watch)| watch.expires_at > now)
+            .map(|(watch_id, watch)| watch.descriptor(watch_id))
             .collect()
     }
 
-    /// The agent and stored position for a watch, if it is still registered.
-    pub fn position(
-        &self,
-        watch_id: &WatchId,
-    ) -> Option<(AgentId, WatchFilter, Option<EventCursor>)> {
-        let watches = self.watches.read().expect("watch registry lock");
-        let watch = watches.get(watch_id)?;
-        Some((
-            watch.agent_id.clone(),
-            watch.filter.clone(),
-            watch.cursor.clone(),
-        ))
-    }
-
-    /// Record the position a read advanced to.
-    ///
-    /// Ignores a watch that was closed while the read was in flight rather than
-    /// resurrecting it.
-    pub fn advance(&self, watch_id: &WatchId, cursor: EventCursor) {
-        if let Some(watch) = self
-            .watches
-            .write()
-            .expect("watch registry lock")
-            .get_mut(watch_id)
-        {
-            watch.cursor = Some(cursor);
-        }
-    }
-
-    /// URIs of every watch on one agent that selects this event.
+    /// URIs of every live watch on one agent that selects this event.
     ///
     /// Called on the actor's own task for each journaled record, so it takes
     /// the read lock briefly and allocates only for watches that actually
@@ -354,24 +618,27 @@ impl WatchRegistry {
         event: &IrcEvent,
         case_mapping: CaseMapping,
     ) -> Vec<String> {
+        let now = Timestamp::now();
         self.watches
             .read()
             .expect("watch registry lock")
             .iter()
-            .filter(|(_, watch)| watch.agent_id == *agent_id)
+            .filter(|(_, watch)| watch.agent_id == *agent_id && watch.expires_at > now)
             .filter(|(_, watch)| watch.filter.matches(event, case_mapping))
             .map(|(watch_id, _)| watch_uri(watch_id))
             .collect()
+    }
+
+    fn expiry_after(&self, now: Timestamp) -> Timestamp {
+        let millis = i64::try_from(self.limits.time_to_live.as_millis()).unwrap_or(i64::MAX);
+        Timestamp::from_datetime(now.as_datetime() + chrono::Duration::milliseconds(millis))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        agent::journal::{EventCorrelation, EventOrigin, EventVerbosity},
-        time::Timestamp,
-    };
+    use crate::agent::journal::{EventCorrelation, EventOrigin, EventVerbosity};
 
     fn event(target: Option<&str>, class: EventClass, mentions_me: bool) -> IrcEvent {
         IrcEvent {
@@ -447,13 +714,68 @@ mod tests {
         ));
     }
 
+    fn registry() -> WatchRegistry {
+        WatchRegistry::new(WatchLimits {
+            max_per_owner: 4,
+            time_to_live: Duration::from_secs(60),
+        })
+    }
+
+    #[test]
+    fn the_journal_query_a_watch_builds_selects_exactly_what_the_watch_matches() {
+        let mapping = CaseMapping::default();
+        let filters = [
+            WatchFilter::default(),
+            WatchFilter {
+                targets: BTreeSet::from(["#Control".to_string(), "grant".to_string()]),
+                ..WatchFilter::default()
+            },
+            WatchFilter {
+                classes: BTreeSet::from([EventClass::MessagePrivate]),
+                mentions_only: true,
+                ..WatchFilter::default()
+            },
+            WatchFilter {
+                inbound_only: true,
+                ..WatchFilter::default()
+            },
+        ];
+        let events = [
+            event(Some("#control"), EventClass::MessageChannel, false),
+            event(Some("#control"), EventClass::MessageChannel, true),
+            event(Some("GRANT"), EventClass::MessagePrivate, true),
+            event(Some("#other"), EventClass::ProtocolReply, false),
+            event(None, EventClass::ConnectionLifecycle, false),
+            IrcEvent {
+                direction: EventDirection::Outbound,
+                ..event(Some("#control"), EventClass::MessageChannel, false)
+            },
+        ];
+        for filter in &filters {
+            let query = filter.cursor_query(mapping);
+            for event in &events {
+                assert_eq!(
+                    filter.matches(event, mapping),
+                    query.selects(event),
+                    "the notification filter and the read selection disagreed about \
+                     {event:?} under {filter:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn only_watches_on_the_same_agent_are_woken() {
-        let registry = WatchRegistry::new();
+        let registry = registry();
+        let owner = OwnerId::local();
         let mine = AgentId::new();
         let theirs = AgentId::new();
-        let descriptor = registry.create(mine.clone(), WatchFilter::default(), None);
-        registry.create(theirs, WatchFilter::default(), None);
+        let descriptor = registry
+            .create(owner.clone(), mine.clone(), WatchFilter::default())
+            .expect("create watch");
+        registry
+            .create(owner, theirs, WatchFilter::default())
+            .expect("create watch");
 
         let uris = registry.matching_uris(
             &mine,
@@ -464,32 +786,131 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_watch_stops_matching_and_cannot_be_advanced() {
-        let registry = WatchRegistry::new();
+    fn a_closed_watch_stops_matching_and_stops_being_described() {
+        let registry = registry();
         let agent = AgentId::new();
-        let descriptor = registry.create(agent.clone(), WatchFilter::default(), None);
+        let descriptor = registry
+            .create(OwnerId::local(), agent.clone(), WatchFilter::default())
+            .expect("create watch");
         assert!(registry.close(&descriptor.watch_id));
         assert!(!registry.close(&descriptor.watch_id));
-        registry.advance(
-            &descriptor.watch_id,
-            EventCursor {
-                stream_id: "stream".into(),
-                sequence: 9,
-            },
-        );
         assert!(registry.describe(&descriptor.watch_id).is_none());
+        assert!(registry.touch(&descriptor.watch_id).is_none());
+        assert!(
+            registry
+                .matching_uris(
+                    &agent,
+                    &event(Some("#control"), EventClass::MessageChannel, false),
+                    CaseMapping::default(),
+                )
+                .is_empty()
+        );
     }
 
     #[test]
-    fn watch_handles_round_trip_through_their_uri_form() {
+    fn a_caller_cannot_hold_more_watches_than_its_own_allowance() {
+        let registry = WatchRegistry::new(WatchLimits {
+            max_per_owner: 2,
+            time_to_live: Duration::from_secs(60),
+        });
+        let mine = OwnerId::from_bearer("mine");
+        let theirs = OwnerId::from_bearer("theirs");
+        let agent = AgentId::new();
+        for _ in 0..2 {
+            registry
+                .create(mine.clone(), agent.clone(), WatchFilter::default())
+                .expect("within the allowance");
+        }
+        let refused = registry
+            .create(mine.clone(), agent.clone(), WatchFilter::default())
+            .expect_err("past the allowance");
+        assert!(matches!(refused, GatewayError::ResourceLimit(_)));
+        assert!(
+            refused.to_string().contains("irc.watch.close"),
+            "the refusal must say how to make room: {refused}"
+        );
+        // The bound is per caller, so another caller is unaffected.
+        registry
+            .create(theirs, agent, WatchFilter::default())
+            .expect("another caller has its own allowance");
+    }
+
+    #[test]
+    fn an_unused_watch_expires_and_reading_it_frees_its_slot() {
+        let registry = WatchRegistry::new(WatchLimits {
+            max_per_owner: 1,
+            // Already lapsed by the time anything looks at it, which is the
+            // same condition an idle handle reaches later.
+            time_to_live: Duration::ZERO,
+        });
+        let owner = OwnerId::local();
+        let agent = AgentId::new();
+        let descriptor = registry
+            .create(owner.clone(), agent.clone(), WatchFilter::default())
+            .expect("create watch");
+        assert!(registry.describe(&descriptor.watch_id).is_none());
+        assert!(registry.touch(&descriptor.watch_id).is_none());
+        assert!(registry.list().is_empty());
+        assert!(
+            registry
+                .matching_uris(
+                    &agent,
+                    &event(Some("#control"), EventClass::MessageChannel, false),
+                    CaseMapping::default(),
+                )
+                .is_empty()
+        );
+        // The lapsed handle no longer occupies the allowance.
+        registry
+            .create(owner, agent, WatchFilter::default())
+            .expect("an expired watch does not hold a slot");
+    }
+
+    #[test]
+    fn using_a_watch_pushes_its_expiry_out() {
+        let registry = registry();
+        let descriptor = registry
+            .create(OwnerId::local(), AgentId::new(), WatchFilter::default())
+            .expect("create watch");
+        let refreshed = registry
+            .touch(&descriptor.watch_id)
+            .expect("a live watch resolves");
+        assert!(
+            refreshed.expires_at >= descriptor.expires_at,
+            "using a watch must not shorten its life"
+        );
+    }
+
+    #[test]
+    fn watch_uris_round_trip_through_both_of_their_forms() {
         let watch_id = WatchId::new();
-        let uri = watch_uri(&watch_id);
-        let parsed = uri
-            .strip_prefix("irc://watches/")
-            .map(WatchId::from_str)
-            .expect("watch URI prefix")
-            .expect("valid watch handle");
-        assert_eq!(parsed, watch_id);
+        let descriptor = watch_uri(&watch_id);
+        let parsed = WatchUri::from_str(&descriptor).expect("descriptor URI");
+        assert_eq!(parsed.watch_id, watch_id);
+        assert_eq!(parsed.target, WatchTarget::Descriptor);
+
+        let cursor = EventCursor {
+            stream_id: "a5c2f1e0-0000-4000-8000-000000000000".into(),
+            sequence: 42,
+        };
+        let positioned = watch_events_uri(&watch_id, &cursor);
+        assert!(positioned.ends_with("/events/after/a5c2f1e0-0000-4000-8000-000000000000/42"));
+        let parsed = WatchUri::from_str(&positioned).expect("positioned URI");
+        assert_eq!(parsed.watch_id, watch_id);
+        assert_eq!(parsed.target, WatchTarget::EventsAfter(cursor));
+
         assert!(WatchId::from_str("not-a-watch").is_err());
+        for rejected in [
+            format!("irc://watches/{watch_id}/events/after/stream"),
+            format!("irc://watches/{watch_id}/events/after/stream/latest"),
+            format!("irc://watches/{watch_id}/events/after/stream/4/extra"),
+            format!("irc://watches/{watch_id}/events"),
+            format!("irc://agents/{watch_id}"),
+        ] {
+            assert!(
+                WatchUri::from_str(&rejected).is_err(),
+                "{rejected} should not parse as a watch resource"
+            );
+        }
     }
 }

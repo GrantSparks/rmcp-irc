@@ -10,7 +10,7 @@ pub type Result<T> = std::result::Result<T, GatewayError>;
 pub enum ErrorKind {
     /// Process configuration is invalid.
     Configuration,
-    /// An agent or DCC handle is absent or expired.
+    /// An agent, watch, or DCC handle is absent or expired.
     NotFound,
     /// Structured IRC input is invalid or unavailable.
     Validation,
@@ -62,7 +62,8 @@ pub enum GatewayError {
     #[error("unknown or expired agent handle: {0}")]
     AgentNotFound(AgentId),
 
-    /// A referenced watch handle does not exist.
+    /// A referenced watch handle was closed, belonged to a disconnected agent,
+    /// or lapsed after `limits.watch_ttl_ms` without being used.
     #[error("unknown or expired watch handle: {0}")]
     WatchNotFound(crate::mcp::watch::WatchId),
 

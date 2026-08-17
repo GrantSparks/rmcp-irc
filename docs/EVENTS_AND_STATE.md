@@ -166,7 +166,16 @@ does not infer one from an HTTP connection, stdio process, or conversation.
 - After reporting a reset or gap, the same response may deliberately begin at
   the oldest retained event and returns a `next_cursor` for continuation.
 - Filters do not advance a hidden cursor. `next_cursor` is explicit and is the
-  only position a caller should persist.
+  only position a caller should persist. It advances only over events actually
+  returned, so a read is safe to repeat and safe to re-issue under a different
+  selection.
+- A read is truncated only by `limit`, never by an uninteresting record in the
+  way: the selection is applied while scanning, so a match beyond a page of
+  traffic the selection declined still arrives on the first read.
+- `has_more` is true exactly when reading again from `next_cursor` right now
+  would return at least one more event matching the same selection. It never
+  reports records the selection excluded, so a `while has_more` drain always
+  makes progress and always terminates.
 - `wait_ms > 0` waits only until an event/resource change or the bounded
   deadline; zero is non-blocking.
 
@@ -254,36 +263,64 @@ Clients respond by reading the indicated resource.
 
 A watch is the intended way to consume events. `irc.watch.create` registers a
 selection — targets, event classes, addressed-to-me, direction — and returns
-`irc://watches/{watch_id}`. Subscribing to that URI and reading it on each
-notification is a complete delivery loop:
+`irc://watches/{watch_id}` plus the journal's current `latest_cursor`.
+
+A watch is a selection, a health report, and a notification target. It holds no
+position, and no resource read consumes anything, because a host legitimately
+re-reads resources at moments the model did not choose: refreshing a view,
+resynchronizing after dropped notifications, or two components reading one URI.
+A read that advanced a hidden position would discard events the model never saw
+and then report `current`, because from the watch's perspective nothing was
+lost. Positions are therefore wholly caller-owned:
 
 - the notification is evaluated against the watch's own filter, so a watch on
   one channel is not woken by unrelated traffic;
-- each read returns everything matching since the previous read and advances
-  the watch, so no cursor argument is needed;
-- the read reports `status`, which is `current` unless records were lost, in
-  which case the reader is told explicitly rather than silently restarted;
+- reading `irc://watches/{watch_id}` returns the descriptor, the retained bounds
+  of the stream, and pointers to the consumption paths — never events, and never
+  a mutation;
+- `irc.events.read` with `watch_id` and your own `cursor` applies the selection
+  to the lossless journal and can long poll; `watch_id` is mutually exclusive
+  with the single-value filters, which a watch already subsumes;
+- `irc://watches/{watch_id}/events/after/{stream_id}/{sequence}` carries the
+  position in the path and returns the compact conversational window; records
+  with no conversational form are excluded from that selection rather than
+  dropped after it, so the cursor never advances over something not returned;
+- both paths report `status`, which is `current` unless records were lost, in
+  which case the reader is told explicitly rather than silently restarted, and
+  recovery is an ordinary read from the `next_cursor` the report handed back;
+- a caller may hold `limits.max_watches_per_owner` watches, and a watch nobody
+  reads lapses after `limits.watch_ttl_ms`; any read refreshes it and the
+  descriptor publishes `expires_at`;
 - `irc.watch.close` releases the handle.
 
-`irc.events.read` remains available for replay and for clients without
-subscription support. Such a client must keep a bounded long poll active,
-immediately continuing from each returned `next_cursor`. This fallback uses
-the same durable cursor contract.
+Because both paths are idempotent, a lost response is recovered by presenting
+the same cursor again, and two consumers of one watch each advance only their own
+position.
+
+`irc.events.read` without `watch_id` remains available for replay and for
+clients without subscription support. Such a client must keep a bounded long poll
+active, immediately continuing from each returned `next_cursor`. This fallback
+uses the same caller-owned cursor contract, with or without a `watch_id`.
 
 ### What realtime delivery does and does not mean
 
 The gateway can deliver a notification to a capable MCP **host** as soon as
-something happens. It cannot make that host start a model turn. MCP has no
-mechanism by which a server requires a client to invoke its model, so:
+something happens. Resource notifications and `subscriptions/listen` wake the
+host application; they cannot force or schedule a model turn. MCP `2026-07-28`
+has no server-initiated sampling — Sampling is deprecated by SEP-2577 and
+server-to-client requests were replaced by Multi Round-Trip Requests, whose
+input requests exist only while the server is processing an active client
+request and so can never originate from an asynchronous IRC event. So:
 
 - *realtime delivery* — the host learns immediately, and a subsequent read
   returns the new records with no polling interval in between — is what this
   gateway provides;
 - *autonomous participation* — the model itself waking on a message and
-  answering it — additionally requires the host or runtime to schedule a turn
-  when a subscribed resource changes.
+  answering it — belongs to the host's own scheduler or to a separately
+  configured direct LLM integration, not to the MCP relay contract.
 
 A host that does not schedule turns will still see everything, at whatever
-point it next runs the model. Nothing is lost in the meantime: the watch holds
-its position, and a read after any delay returns the backlog with an explicit
-`status` if the retained window was exceeded.
+point it next runs the model. Nothing is lost in the meantime: the caller's
+cursor is the only position that matters, no other reader can consume past it,
+and a read after any delay returns the backlog with an explicit `status` if the
+retained window was exceeded.

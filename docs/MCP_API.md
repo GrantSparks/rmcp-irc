@@ -389,7 +389,7 @@ can independently start a model turn.
 | Prompt | Arguments | Workflow |
 | --- | --- | --- |
 | `irc-connect` | optional `nickname` | Choose/check a mythological guest identity, connect, read the authoritative MOTD and topic, then announce real scope. |
-| `irc-watch-mentions` | `agent_id`, optional comma-separated `targets` | Create a mentions-only watch, subscribe when supported, consume durable cursors and gaps, or fall back to an event long poll. |
+| `irc-watch-mentions` | `agent_id`, optional comma-separated `targets` | Create a mentions-only watch, have the host listen on its URI, then read `irc.events.read` with that `watch_id` and a caller-owned cursor, or the positioned window URI, falling back to a long poll. |
 | `irc-join` | `agent_id`, `channel` | Join, follow the native channel link, read the topic/transcript/members, and announce intent before participation. |
 | `irc-summarize-respond` | `agent_id`, `target`, optional `objective` | Read semantic conversation context, separate history from live traffic, summarize directives/decisions/risks, and draft or send only as authorized. |
 
@@ -443,17 +443,36 @@ The result is the common command envelope.
 
 ### `irc.watch.create` and `irc.watch.close`
 
-`irc.watch.create` registers a caller-owned server-side selection over one
+`irc.watch.create` registers a caller-owned server-side *selection* over one
 agent's journal. Inputs are `agent_id`, optional case-preserved `targets`,
-optional semantic `classes`, `mentions_only`, `inbound_only`, and an optional
-starting `cursor`. It returns a native `irc://watches/{watch_id}` resource link.
+optional semantic `classes`, `mentions_only`, and `inbound_only`. It returns the
+watch descriptor, a native `irc://watches/{watch_id}` resource link, the
+journal's `latest_cursor` at creation time, and `next_uri`, that cursor already
+expanded into the positioned window URI.
 
-Subscribe to that URI when the host supports MCP resource subscriptions. Each
-resource read returns all retained matching events after the watch's stored
-position, advances that position without a cursor argument, and reports
-`current`, `stream_reset`, or `event_gap` plus `has_more`. Notifications are
-evaluated against the watch filter, so unrelated traffic does not wake it.
-`irc.watch.close` releases the handle and its notification state.
+A watch stores no position. Its descriptor resource is immutable: subscribe to
+it, and read it as often as you like — the read reports the selection, the
+health of the stream, and where to read from, and consumes nothing. Every
+position is the caller's own, supplied on each read through one of two
+consumption paths:
+
+- `irc.events.read` with `watch_id` plus your own `cursor`, which applies the
+  selection to the lossless journal and can long poll;
+- `irc://watches/{watch_id}/events/after/{stream_id}/{sequence}`, which carries
+  the position in the path and returns the compact conversational window.
+
+Both are idempotent: one position always returns one window, `next_cursor`
+advances only over events actually returned, and re-reading after a lost
+response costs nothing. Two consumers of one watch therefore cannot consume each
+other's backlog. Notifications are evaluated against the watch filter, so
+unrelated traffic does not wake it. Start from `latest_cursor` to receive only
+what happens next.
+
+Handles are bounded and expire. A caller may hold `limits.max_watches_per_owner`
+watches at once, and a watch nobody reads lapses after `limits.watch_ttl_ms`;
+either consumption path or a descriptor read refreshes it, and the descriptor
+publishes `expires_at`. `irc.watch.close` releases the handle and its
+notification state.
 
 ### `irc.events.read`
 
@@ -462,16 +481,27 @@ Input contains:
 - `agent_id`;
 - optional last-consumed `cursor`;
 - bounded `limit`;
-- optional `command_id`, `class`, `target`, `direction`, `origin`, and
-  `verbosity` filters;
+- optional `watch_id`, applying that watch's registered selection to this read;
+- optional `command_id`, `class`, `target`, `direction`, `origin`,
+  `verbosity`, and `mentions_me` filters;
 - `wait_ms`, where zero is non-blocking and a positive value is bounded long
   polling.
 
+`watch_id` and the single-value filters are mutually exclusive. A watch already
+describes a complete selection, including the multi-target and multi-class forms
+those fields cannot express, so supplying both is refused with a tool error
+naming the offending field rather than intersected into a third selection.
+Narrow the watch itself, or read without `watch_id`. The named watch must belong
+to the same `agent_id`.
+
 Output contains `stream_id`, `requested_cursor`, `status`, `oldest_available`,
-`latest`, ordered `events`, and `next_cursor`. Status is `current`,
-`stream_reset`, or `event_gap`. Filters affect returned records, not cursor
-ownership or journal retention. `limit` defaults to `100` and must be between
-1 and `limits.max_event_page_size`; `wait_ms` is capped by
+`latest`, ordered `events`, `next_cursor`, and `has_more`. Status is `current`,
+`stream_reset`, or `event_gap`. `has_more` is true exactly when reading again
+from `next_cursor` right now would return at least one more event matching this
+same read's selection; it says nothing about records the selection excluded, so
+`while has_more` always makes progress and terminates. Filters affect returned
+records, not cursor ownership or journal retention. `limit` defaults to `100` and
+must be between 1 and `limits.max_event_page_size`; `wait_ms` is capped by
 `limits.max_event_wait_ms`. See [EVENTS_AND_STATE.md](EVENTS_AND_STATE.md).
 
 Keep one long poll active when prompt event handling matters: pass the last
@@ -596,9 +626,22 @@ relevant conversational state changes without lossless protocol detail.
 
 ### `irc://watches/{watch_id}`
 
-Contains the watch descriptor, cursor status, matching compact events, next
-server-held cursor, and `has_more`. Reading advances the watch; closing it with
-`irc.watch.close` removes the resource.
+Contains the watch descriptor — handle, agent, selection, URI, and `expires_at`
+— the retained bounds of the stream it selects from, and `consume`, which names
+the two positioned consumption paths and expands the positioned window URI at
+both the oldest retained position and the latest one. Reading it changes nothing
+and consumes nothing; closing the watch with `irc.watch.close` removes the
+resource.
+
+### `irc://watches/{watch_id}/events/after/{stream_id}/{sequence}`
+
+Contains one positioned window of the compact conversational records that watch
+selects: `requested_cursor`, `status`, `oldest_available`, `latest`, `events`,
+`next_cursor`, `has_more`, and `next_uri`. The position comes from the path, so
+the same URI always returns the same window. Records with no conversational form
+are excluded from the selection rather than dropped after it, which is what
+keeps `next_cursor` a position over events actually returned; read them
+losslessly with `irc.events.read` and this `watch_id`.
 
 All catalog entries and native links include MCP annotations. Conversational
 resources target model/user audiences with higher priorities; wire and
@@ -611,12 +654,16 @@ Material changes emit `notifications/resources/updated` for affected stable
 URIs. Watch notifications apply their registered selection before waking a
 subscriber; event-resource notifications remain broader coalescing wake-up
 signals. Terminal DCC transitions and new MOTDs must be signaled promptly.
-Notifications do not contain a durable consumption position: read the watch or
-cursor expansion after each signal, or use `irc.events.read` as the fallback.
+Notifications carry no consumption position, and no resource read holds one on a
+caller's behalf: after each signal, read `irc.events.read` with your `watch_id`
+and your own cursor, or the positioned window URI, or the agent's cursor
+expansion. Because nothing a read touches is consumed, a host may re-read any of
+these as often as it likes — refreshing a view, resynchronizing after dropped
+notifications, or two components on one URI — without a caller losing an event.
 
-The same `rmcp` subscription listener is used by both transports. Whether an
-MCP host wakes or invokes an LLM after a notification is host behavior, not a
-gateway guarantee. A client whose API does not expose resource subscriptions
+The same `rmcp` subscription listener is used by both transports. A notification
+and `subscriptions/listen` wake the host application; neither can force or
+schedule a model turn. A client whose API does not expose resource subscriptions
 will not receive these hints; it must use the cursor-based `irc.events.read`
 long-poll loop described above instead.
 

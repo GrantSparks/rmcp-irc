@@ -62,8 +62,8 @@ use super::{
     AgentId,
     connection::{BoxedIrcStream, connect},
     journal::{
-        ConnectionEvent, CorrelationRole, DccChatMessage, DccFailure, EventClass, EventCorrelation,
-        EventCursor, EventDirection, EventFilter, EventOrigin, EventPage, EventPayload,
+        ConnectionEvent, CorrelationRole, CursorQuery, DccChatMessage, DccFailure, EventClass,
+        EventCorrelation, EventCursor, EventDirection, EventOrigin, EventPage, EventPayload,
         EventVerbosity, IrcEvent, JournalStats, MalformedLine, NewEvent, RecentQuery,
         addresses_nickname,
     },
@@ -189,7 +189,7 @@ enum AgentCommand {
         cursor: Option<EventCursor>,
         limit: usize,
         wait: Duration,
-        filter: EventFilter,
+        query: CursorQuery,
         completion: oneshot::Sender<Result<EventPage>>,
     },
     ReadRecent {
@@ -330,14 +330,14 @@ impl AgentHandle {
         cursor: Option<EventCursor>,
         limit: usize,
         wait: Duration,
-        filter: EventFilter,
+        query: CursorQuery,
     ) -> Result<EventPage> {
         let (completion, result) = oneshot::channel();
         self.send(AgentCommand::ReadEvents {
             cursor,
             limit,
             wait,
-            filter,
+            query,
             completion,
         })
         .await?;
@@ -484,7 +484,7 @@ impl AgentHandle {
 struct PendingEventRead {
     cursor: Option<EventCursor>,
     limit: usize,
-    filter: EventFilter,
+    query: CursorQuery,
     deadline: Instant,
     completion: oneshot::Sender<Result<EventPage>>,
 }
@@ -1009,9 +1009,9 @@ impl AgentActor {
                 cursor,
                 limit,
                 wait,
-                filter,
+                query,
                 completion,
-            } => self.read_events(cursor, limit, wait, filter, completion),
+            } => self.read_events(cursor, limit, wait, query, completion),
             AgentCommand::ReadRecent {
                 limit,
                 query,
@@ -1228,7 +1228,7 @@ impl AgentActor {
         cursor: Option<EventCursor>,
         limit: usize,
         wait: Duration,
-        filter: EventFilter,
+        query: CursorQuery,
         completion: oneshot::Sender<Result<EventPage>>,
     ) {
         if limit == 0 || limit > self.config.limits.max_event_page_size {
@@ -1246,7 +1246,7 @@ impl AgentActor {
             ))));
             return;
         }
-        let page = self.journal.read(cursor.as_ref(), limit, &filter);
+        let page = self.journal.read(cursor.as_ref(), limit, &query);
         if !page.events.is_empty()
             || page.status != super::journal::CursorStatus::Current
             || wait.is_zero()
@@ -1260,7 +1260,7 @@ impl AgentActor {
             self.pending_event_reads.push(PendingEventRead {
                 cursor,
                 limit,
-                filter,
+                query,
                 deadline: Instant::now() + wait,
                 completion,
             });
@@ -1273,7 +1273,7 @@ impl AgentActor {
         for read in self.pending_event_reads.drain(..) {
             let page = self
                 .journal
-                .read(read.cursor.as_ref(), read.limit, &read.filter);
+                .read(read.cursor.as_ref(), read.limit, &read.query);
             if !page.events.is_empty()
                 || page.status != super::journal::CursorStatus::Current
                 || (include_expired && now >= read.deadline)
@@ -1341,8 +1341,8 @@ impl AgentActor {
                     AgentCommand::Execute { completion, .. } => {
                         let _ = completion.send(Err(GatewayError::NotConnected(self.id.clone())));
                     }
-                    AgentCommand::ReadEvents { cursor, limit, wait, filter, completion } => {
-                        self.read_events(cursor, limit, wait, filter, completion);
+                    AgentCommand::ReadEvents { cursor, limit, wait, query, completion } => {
+                        self.read_events(cursor, limit, wait, query, completion);
                     }
                     AgentCommand::ReadRecent { limit, query, completion } => {
                         let _ = completion.send(self.journal.read_latest(limit, &query));
