@@ -21,7 +21,7 @@ log() {
     echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') [entrypoint] $*" >&2
 }
 
-ERGO_ENTRYPOINT="${ERGO_ENTRYPOINT:-/ircd-bin/entrypoint.sh}"
+ERGO_ENTRYPOINT="${ERGO_ENTRYPOINT:-/ircd-bin/run.sh}"
 ERGO_BIN="${ERGO_BIN:-/ircd-bin/ergo}"
 IRC_PORT="${IRC_PORT:-6667}"
 MCP_BIN="${MCP_BIN:-/usr/local/bin/irc-mcp}"
@@ -113,12 +113,17 @@ start_gateway() {
         log "gateway configuration is not readable: $MCP_CONFIG"
         exit 1
     fi
+    mkdir -p "$MCP_WORKDIR/downloads" 2>/dev/null || true
+    if [ ! -d "$MCP_WORKDIR/downloads" ]; then
+        log "DCC download directory is missing and could not be created: $MCP_WORKDIR/downloads"
+        exit 1
+    fi
+
     config="$(effective_config)"
     if [ -z "$config" ]; then
         log "could not determine the gateway configuration to use"
         exit 1
     fi
-    mkdir -p "$MCP_WORKDIR/downloads" 2>/dev/null || true
     log "starting MCP gateway on $MCP_LISTEN (endpoint /mcp, config $config)"
     (
         cd "$MCP_WORKDIR" || exit 1

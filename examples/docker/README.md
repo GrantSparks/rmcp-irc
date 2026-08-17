@@ -30,16 +30,19 @@ The build compiles `irc-mcp` against musl in a Rust builder stage and copies the
 static binary into the upstream Ergo image, which is pinned by digest in the
 `ERGO_IMAGE` build argument. Ergo itself is unmodified.
 
-Run it on an internal-only network, with Ergo's state bind-mounted so
-configuration, MOTD, and the database stay inspectable on the host:
+Run it on an internal-only network, with Ergo's state and the gateway working
+directory bind-mounted so server state and DCC files stay inspectable and
+persistent on the host:
 
     mkdir -p .local/ergo
+    mkdir -p .local/mcp/downloads
     cp examples/docker/ergo/* .local/ergo/
     docker network create --internal rmcp-irc-net
     docker run -d --name rmcp-irc --restart unless-stopped \
       --network rmcp-irc-net --network-alias irc \
       --user "$(id -u):$(id -g)" \
       --mount type=bind,src="$PWD/.local/ergo",dst=/ircd \
+      --mount type=bind,src="$PWD/.local/mcp",dst=/var/lib/rmcp-irc \
       rmcp-irc-ergo:local
 
 Attached containers then reach IRC at `irc:6667` and MCP at
@@ -90,5 +93,6 @@ transfer endpoint:
   table must set `allow_private_addresses = true` when peers use that network.
 - Transfers terminate at the gateway, not in the calling agent's container:
   accepted files land in `MCP_WORKDIR/downloads`, and `irc.dcc.send` can only
-  read paths visible inside this container. Bind-mount `MCP_WORKDIR` to share
-  those files with the host or with other containers.
+  read paths visible inside this container. The run command above bind-mounts
+  `.local/mcp` as `MCP_WORKDIR`, making those files available on the host. Other
+  containers can share them by bind-mounting that same host directory.
