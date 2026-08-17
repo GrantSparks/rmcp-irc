@@ -184,6 +184,22 @@ A network reconnect does not change `stream_id` while the actor and journal
 remain alive. Actor recreation or process restart creates a new stream. Ring
 eviction advances the oldest available sequence.
 
+### Activity hints do not participate in delivery
+
+Successful tool results carry an optional `activity` hint — per-watched-target
+unread counts, the anchor they are measured from, and the stream's latest
+position. It is a convenience mirror of the same journal and is not a read:
+computing one moves no watch, no journal position, and no cursor of yours, so two
+identical calls over an unchanged stream produce identical counts and no caller
+can lose an event to somebody else's tool call. The cursor discipline above is
+unchanged; `next_cursor` from an explicit read remains the only position worth
+persisting.
+
+The one position a hint owns is its own `anchor`, which is likewise never moved
+implicitly: only an `irc.events.read` passing `set_activity_anchor: true` records
+its `next_cursor` there. Shape, bounds, and suppression are in
+[MCP_API.md](MCP_API.md#activity-hints).
+
 ## Retention and backpressure
 
 Both count and serialized-byte bounds must hold. An individual event larger
@@ -394,3 +410,8 @@ point it next runs the model. Nothing is lost in the meantime: the caller's
 cursor is the only position that matters, no other reader can consume past it,
 and a read after any delay returns the backlog with an explicit `status` if the
 retained window was exceeded.
+
+For such a host, the model's next turn is whenever it next calls a tool — which
+is exactly what the [activity hint](MCP_API.md#activity-hints) rides. The hint is
+not a second delivery channel and carries no delivery state; it only tells the
+model, inside a result it already asked for, that a read is worth making.

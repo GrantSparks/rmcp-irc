@@ -144,6 +144,7 @@ server cannot force unbounded allocation.
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `confirm_destructive` | boolean | `false` | Require an answered confirmation before `irc.kick` or `irc.message.redact` is written upstream. |
+| `activity_hints` | boolean | `true` | Attach the bounded unread hint to successful tool results that name an agent. |
 
 Off by default, so existing deployments behave exactly as before: both tools
 apply immediately, and a client that declares elicitation does not acquire a
@@ -163,6 +164,20 @@ operator decided a person must approve these mutations, and proceeding when
 there is nobody to ask would delete that policy while appearing to honor it. A
 deployment that wants unattended kicks and redactions should leave the setting
 off rather than rely on the capability being absent.
+
+`activity_hints` is on by default. For a host that does not subscribe, or that
+subscribes without starting a model turn on a notification, the hint is the only
+way news reaches the model without spending a whole turn on a long poll. It costs
+a few hundred tokens at its worst, moves no cursor and no watch, and describes
+only agents the calling owner already holds — see
+[MCP_API.md](MCP_API.md#activity-hints) for the exact shape and bounds.
+
+Turn it off for a deployment that has decided its own delivery loop is enough.
+Do **not** turn it off merely because clients subscribe: a subscription proves a
+host can be woken and proves nothing about whether it will think, so suppressing
+hints on that basis removes the delivery path that reaches the model while
+appearing to change nothing. A single agent can opt out instead, through
+`activity: {"enabled": false}` on its `irc.connect` call.
 
 Nothing else on the MCP surface is configurable here. The `irc.dcc.accept`
 destination, `irc.connect` nickname, and `irc.join` channel-key round trips are

@@ -23,6 +23,16 @@ connection, state snapshot, and bounded event stream.
 - Stable typed tools for common IRC operations, including negotiated reaction,
   redaction, read-marker, and typing support. Structured `irc.execute` covers
   other commands; no tool accepts raw IRC lines.
+- One discriminated result envelope every tool declares in its `outputSchema`:
+  `ok: true` with the tool's own output, or `ok: false` with the shared failure —
+  so a gateway error, an in-band refusal, and a rejected IRC command are all as
+  schema-conformant as a success, and each tool result is validated against its
+  own advertised schema in the test suite.
+- Bounded unread activity hints piggybacked on successful results, so a host that
+  never schedules a turn on a notification still learns what arrived: counts per
+  watched target, measured against a caller-owned anchor that only an explicit
+  `irc.events.read` moves. A hint is a mirror, never a read — it advances no
+  cursor and consumes no watch.
 - Four reusable MCP prompts for connecting, watching mentions, joining with
   context, and summarizing/responding.
 - Lossless inbound and outbound wire events, including unknown extensions and
@@ -239,7 +249,10 @@ and monotonic sequence. Callers maintain their own cursors:
 
 Clients that do not expose MCP resource subscriptions cannot receive those
 wake-up signals. They must keep an `irc.events.read` long poll active, passing
-the previous `next_cursor` into the next call, to remain responsive.
+the previous `next_cursor` into the next call, to remain responsive. Every
+successful tool result also carries a bounded activity hint for the agent it
+names, so even a client that only ever calls tools learns that a read is worth
+making; the hint reports and never consumes.
 
 State resources are best-effort snapshots. Use `irc.query` when a current
 server response is required. See [events and state](docs/EVENTS_AND_STATE.md).

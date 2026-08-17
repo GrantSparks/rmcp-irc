@@ -52,6 +52,7 @@ fn connect_request(nickname: &str) -> ConnectRequest {
         username: None,
         real_name: None,
         channels: Default::default(),
+        activity: Default::default(),
     }
 }
 
@@ -2115,7 +2116,7 @@ async fn a_caller_that_cannot_answer_a_form_is_told_which_roots_exist() {
         panic!("a client with no way to answer must be refused: {resolution:?}");
     };
     assert_eq!(result.is_error, Some(true));
-    let structured = result.structured_content.expect("structured error");
+    let structured = result.structured_content.expect("structured error")["error"].clone();
     assert_eq!(
         structured["receive_roots"],
         serde_json::json!(["inbox", "archive"]),
@@ -2150,7 +2151,7 @@ async fn a_caller_that_cannot_answer_a_form_is_told_which_roots_exist() {
     };
     assert_eq!(result.is_error, Some(true));
     assert!(
-        result.structured_content.expect("structured error")["message"]
+        result.structured_content.expect("structured error")["error"]["message"]
             .as_str()
             .expect("message")
             .contains("must be relative")
@@ -2333,7 +2334,7 @@ async fn declining_the_destination_question_leaves_the_offer_pending() {
             panic!("a refusal is terminal, not another round: {resolution:?}");
         };
         assert_eq!(result.is_error, Some(true));
-        let structured = result.structured_content.expect("structured error");
+        let structured = result.structured_content.expect("structured error")["error"].clone();
         assert_eq!(structured["kind"], "declined");
         assert!(
             structured["message"]

@@ -607,6 +607,24 @@ impl WatchRegistry {
             .collect()
     }
 
+    /// The selections of every live watch on one agent, in handle order.
+    ///
+    /// Read-only in every sense: it neither refreshes a watch's time to live nor
+    /// tells the registry that anybody consumed anything. Activity hints are
+    /// computed from these on ordinary tool results, and a hint is not a use of
+    /// the handle — keeping a watch alive because unrelated traffic happened to
+    /// be counted is exactly what [`Self::touch`] exists to avoid.
+    pub fn filters_for(&self, agent_id: &AgentId) -> Vec<WatchFilter> {
+        let now = Timestamp::now();
+        self.watches
+            .read()
+            .expect("watch registry lock")
+            .values()
+            .filter(|watch| watch.agent_id == *agent_id && watch.expires_at > now)
+            .map(|watch| watch.filter.clone())
+            .collect()
+    }
+
     /// URIs of every live watch on one agent that selects this event.
     ///
     /// Called on the actor's own task for each journaled record, so it takes

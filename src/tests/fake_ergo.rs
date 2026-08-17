@@ -127,7 +127,7 @@ async fn serve_client(
             "CAP" if message.params.first().is_some_and(|value| value == "LS") => {
                 write_line(
                     &mut writer,
-                    ":fake CAP * LS :batch cap-notify draft/chathistory draft/message-redaction echo-message labeled-response message-tags server-time standard-replies",
+                    ":fake CAP * LS :batch cap-notify draft/chathistory draft/message-redaction draft/read-marker echo-message labeled-response message-tags server-time standard-replies",
                 )
                 .await;
             }
@@ -157,17 +157,33 @@ async fn serve_client(
                 let candidate = message.params.first().cloned().unwrap_or_default();
                 let mut occupied = nicknames.lock().await;
                 let collision = occupied.contains(&candidate);
-                if !collision {
-                    if let Some(previous) = nickname.replace(candidate.clone()) {
-                        occupied.remove(&previous);
+                let previous = if collision {
+                    None
+                } else {
+                    let previous = nickname.replace(candidate.clone());
+                    if let Some(previous) = previous.as_ref() {
+                        occupied.remove(previous);
                     }
                     occupied.insert(candidate.clone());
-                }
+                    previous
+                };
                 drop(occupied);
                 if collision {
                     write_line(
                         &mut writer,
                         &format!(":fake 433 * {candidate} :Nickname is already in use"),
+                    )
+                    .await;
+                } else if welcomed {
+                    // A rename after registration is echoed, which is the only
+                    // acknowledgement a client gets for one.
+                    let tag = label_prefix(&message);
+                    write_line(
+                        &mut writer,
+                        &format!(
+                            "{tag}:{}!guest@localhost NICK :{candidate}",
+                            previous.as_deref().unwrap_or("guest")
+                        ),
                     )
                     .await;
                 } else {
@@ -195,14 +211,81 @@ async fn serve_client(
             "HELP" => {
                 let target = nickname.as_deref().unwrap_or("*");
                 let subject = message.params.first().map_or("INDEX", String::as_str);
+                // Labelled, so a correlated `irc.help` completes rather than
+                // waiting out its deadline on replies it cannot attribute.
+                let tag = label_prefix(&message);
                 write_line(
                     &mut writer,
-                    &format!(":fake 704 {target} {subject} :WHOIS JOIN HISTORY"),
+                    &format!("{tag}:fake 704 {target} {subject} :WHOIS JOIN HISTORY"),
                 )
                 .await;
                 write_line(
                     &mut writer,
-                    &format!(":fake 706 {target} {subject} :End of HELP"),
+                    &format!("{tag}:fake 706 {target} {subject} :End of HELP"),
+                )
+                .await;
+            }
+            "PART" => {
+                let channel = message.params.first().map_or("#test", String::as_str);
+                let reason = message.trailing.as_deref().unwrap_or("");
+                let tag = label_prefix(&message);
+                write_line(
+                    &mut writer,
+                    &format!(
+                        "{tag}:{}!guest@localhost PART {channel} :{reason}",
+                        nickname.as_deref().unwrap_or("guest")
+                    ),
+                )
+                .await;
+            }
+            "INVITE" => {
+                let target = nickname.as_deref().unwrap_or("*");
+                let invited = message.params.first().map_or("peer", String::as_str);
+                let channel = message.params.get(1).map_or("#test", String::as_str);
+                let tag = label_prefix(&message);
+                write_line(
+                    &mut writer,
+                    &format!("{tag}:fake 341 {target} {invited} {channel}"),
+                )
+                .await;
+            }
+            "AWAY" => {
+                let target = nickname.as_deref().unwrap_or("*");
+                let numeric = if message.trailing.is_some() { 306 } else { 305 };
+                let tag = label_prefix(&message);
+                write_line(
+                    &mut writer,
+                    &format!("{tag}:fake {numeric} {target} :You are no longer away"),
+                )
+                .await;
+            }
+            "LIST" => {
+                let target = nickname.as_deref().unwrap_or("*");
+                let tag = label_prefix(&message);
+                write_line(
+                    &mut writer,
+                    &format!("{tag}:fake 322 {target} #agents 1 :Coordinate here"),
+                )
+                .await;
+                write_line(
+                    &mut writer,
+                    &format!("{tag}:fake 323 {target} :End of LIST"),
+                )
+                .await;
+            }
+            // A tag-only message carries no text, so the echo is the only thing
+            // a typing state or a reaction can be acknowledged by.
+            "TAGMSG" => {
+                let target = message.params.first().map_or("#test", String::as_str);
+                let tags = message
+                    .tag_value("label")
+                    .map_or_else(String::new, |label| format!("@label={label} "));
+                write_line(
+                    &mut writer,
+                    &format!(
+                        "{tags}:{}!guest@localhost TAGMSG {target}",
+                        nickname.as_deref().unwrap_or("guest")
+                    ),
                 )
                 .await;
             }
@@ -276,6 +359,22 @@ async fn serve_client(
                         "{tag}:{}!guest@localhost KICK {channel} {removed} :{reason}",
                         nickname.as_deref().unwrap_or("guest")
                     ),
+                )
+                .await;
+            }
+            // A server that owns the marker: a query echoes what it holds and a
+            // set echoes the timestamp it accepted, which is the only value a
+            // caller may report as the marker.
+            "MARKREAD" => {
+                let target = message.params.first().map_or("#test", String::as_str);
+                let timestamp = message
+                    .params
+                    .get(1)
+                    .map_or("timestamp=2026-08-17T00:00:00.000Z", String::as_str);
+                let tag = label_prefix(&message);
+                write_line(
+                    &mut writer,
+                    &format!("{tag}:fake MARKREAD {target} {timestamp}"),
                 )
                 .await;
             }
@@ -361,6 +460,21 @@ async fn serve_client(
                 .await;
                 write_line(&mut writer, &format!(":fake BATCH -{label}")).await;
             }
+            "TOPIC" if message.trailing.is_none() => {
+                let target = nickname.as_deref().unwrap_or("*");
+                let channel = message.params.first().map_or("#test", String::as_str);
+                let tag = label_prefix(&message);
+                write_line(
+                    &mut writer,
+                    &format!("{tag}:fake 332 {target} {channel} :Coordinate here"),
+                )
+                .await;
+                write_line(
+                    &mut writer,
+                    &format!("{tag}:fake 333 {target} {channel} guest 1700000001"),
+                )
+                .await;
+            }
             "TOPIC" if message.trailing.is_some() => {
                 let channel = message.params.first().map_or("#test", String::as_str);
                 let text = message.trailing.as_deref().unwrap_or_default();
@@ -371,6 +485,21 @@ async fn serve_client(
                         "{tag}:{}!guest@localhost TOPIC {channel} :{text}",
                         nickname.as_deref().unwrap_or("guest")
                     ),
+                )
+                .await;
+            }
+            "MODE" if message.params.len() < 2 => {
+                let target = nickname.as_deref().unwrap_or("*");
+                let channel = message.params.first().map_or("#test", String::as_str);
+                let tag = label_prefix(&message);
+                write_line(
+                    &mut writer,
+                    &format!("{tag}:fake 324 {target} {channel} +nt"),
+                )
+                .await;
+                write_line(
+                    &mut writer,
+                    &format!("{tag}:fake 329 {target} {channel} 1700000000"),
                 )
                 .await;
             }
@@ -469,6 +598,14 @@ async fn serve_client(
                 )
                 .await;
             }
+            // Deliver one arbitrary line to this client, so a test can make a
+            // peer say something without opening a second connection and
+            // without the fixture having to know why.
+            "TESTLINE" => {
+                if let Some(line) = message.trailing.as_deref() {
+                    write_line(&mut writer, line).await;
+                }
+            }
             "TESTCTCP" => {
                 let target = nickname.as_deref().unwrap_or("guest");
                 write_line(
@@ -503,7 +640,9 @@ async fn maybe_welcome(
     write_line(writer, &format!(":fake 001 {nickname} :Welcome")).await;
     write_line(
         writer,
-        &format!(":fake 005 {nickname} CASEMAPPING=ascii NICKLEN=30 LINELEN=2048 :supported"),
+        &format!(
+            ":fake 005 {nickname} CASEMAPPING=ascii NICKLEN=30 LINELEN=2048 MONITOR=100 :supported"
+        ),
     )
     .await;
     write_line(writer, &format!(":fake 375 {nickname} :- fake MOTD -")).await;

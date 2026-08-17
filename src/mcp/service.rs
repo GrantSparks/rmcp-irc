@@ -12,7 +12,7 @@ use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{
         router::{prompt::PromptRouter, tool::ToolRouter},
-        tool::{InputResponses, RequestState, ToolCallContext, schema_for_output},
+        tool::{InputResponses, RequestState, ToolCallContext},
         wrapper::Parameters,
     },
     model::{
@@ -51,7 +51,9 @@ use crate::{
     },
     mcp::{
         authorization::{CallerPolicy, OwnerId},
-        confirm_action, connect_nickname, dcc_accept, join_key,
+        confirm_action, connect_nickname, dcc_accept,
+        envelope::{self, ToolFailure, envelope_schema},
+        join_key,
         mrtr::OriginatingOperation,
         progress::ProgressReporter,
         request_profile::RequestProfile,
@@ -331,7 +333,7 @@ impl IrcMcpService {
                        With `nick_conflict_policy: \"elicit\"`, a nickname the server refuses \
                        abandons the attempt and returns an input_required question asking which \
                        name to register instead; answering and retrying makes a fresh attempt.",
-        output_schema = schema_for_output::<ConnectOutput>(),
+        output_schema = envelope_schema::<ConnectOutput>(),
         annotations(
             title = "Connect IRC guest",
             destructive_hint = false,
@@ -350,6 +352,19 @@ impl IrcMcpService {
         let profile = RequestProfile::from_context(&context);
         let result_detail = input.result_detail;
         let asks = input.nick_conflict_policy == NickConflictPolicy::Elicit;
+        // Said before anything is registered: a preference the server would
+        // have to clamp is a preference the caller cannot verify it received.
+        if let Some(field) = input.activity.out_of_bounds() {
+            return Ok(refusal(
+                ErrorKind::Validation.as_str(),
+                format!(
+                    "{field} must be between 0 and {}",
+                    crate::mcp::activity::INLINE_MENTIONS_CAP
+                ),
+                false,
+            )
+            .into());
+        }
         // Bound to the arguments as they arrived, so a retry that changed any of
         // them is a different registration and cannot redeem this exchange.
         let operation = OriginatingOperation::for_tool("irc.connect", &input.salient());
@@ -436,7 +451,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.disconnect",
         description = "Disconnect one explicit IRC guest and invalidate its process-local handle.",
-        output_schema = schema_for_output::<DisconnectOutput>(),
+        output_schema = envelope_schema::<DisconnectOutput>(),
         annotations(
             title = "Disconnect IRC guest",
             destructive_hint = true,
@@ -467,7 +482,7 @@ impl IrcMcpService {
         name = "irc.watch.create",
         description = "Create a subscribable watch over one guest's events, returning a resource \
                        link that wakes a host on matching activity and the cursor to read from.",
-        output_schema = schema_for_output::<WatchCreateOutput>(),
+        output_schema = envelope_schema::<WatchCreateOutput>(),
         annotations(
             title = "Create event watch",
             destructive_hint = false,
@@ -508,7 +523,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.watch.close",
         description = "Release one watch handle and stop its resource notifications.",
-        output_schema = schema_for_output::<WatchCloseOutput>(),
+        output_schema = envelope_schema::<WatchCloseOutput>(),
         annotations(
             title = "Close event watch",
             destructive_hint = true,
@@ -534,7 +549,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.status",
         description = "Read connection, identity, protocol, event, and reconnect status for one guest.",
-        output_schema = schema_for_output::<StatusOutput>(),
+        output_schema = envelope_schema::<StatusOutput>(),
         annotations(
             title = "Read guest status",
             read_only_hint = true,
@@ -592,7 +607,7 @@ impl IrcMcpService {
                        refused by ERR_BADCHANNELKEY (475) with no `key` supplied returns an \
                        input_required question asking for the key when the request declared form \
                        elicitation; every other rejection is the ordinary structured result.",
-        output_schema = schema_for_output::<JoinOutput>(),
+        output_schema = envelope_schema::<JoinOutput>(),
         annotations(
             title = "Join channel",
             destructive_hint = false,
@@ -658,7 +673,7 @@ impl IrcMcpService {
                         .ask_for_a_channel_key(&owner, &operation, &input, &result)?
                         .into());
                 }
-                let failure = is_failure_outcome(result.outcome).then_some(result.outcome);
+                let failure = command_failure(&result);
                 let outcome = result.outcome;
                 let result = command_result_for_detail(result, result_detail);
                 let output = JoinOutput {
@@ -686,7 +701,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.part",
         description = "Part one channel and correlate the server echo or rejection.",
-        output_schema = schema_for_output::<CommandResult>(),
+        output_schema = envelope_schema::<CommandResult>(),
         annotations(
             title = "Leave channel",
             destructive_hint = true,
@@ -719,7 +734,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.send",
         description = "Send PRIVMSG, NOTICE, ACTION, or TAGMSG with negotiated-safe semantics.",
-        output_schema = schema_for_output::<SendOutput>(),
+        output_schema = envelope_schema::<SendOutput>(),
         annotations(
             title = "Send message",
             destructive_hint = false,
@@ -730,6 +745,9 @@ impl IrcMcpService {
     async fn irc_send(&self, Parameters(input): Parameters<SendInput>) -> CallToolResult {
         match self.send_message(input).await {
             Ok(output) => {
+                // One logical message can become several lines, and the first
+                // one the server did not take is the exchange worth reporting:
+                // the rest either preceded it or never had a chance.
                 let failed = output
                     .results
                     .iter()
@@ -737,8 +755,14 @@ impl IrcMcpService {
                         result.outcome != CommandOutcome::Completed
                             && result.outcome != CommandOutcome::SentUnconfirmed
                     })
-                    .map(|result| result.outcome);
-                let summary = send_result_summary(output.line_count, failed);
+                    .map(|result| CommandFailure {
+                        outcome: result.outcome,
+                        result: result.clone(),
+                    });
+                let summary = send_result_summary(
+                    output.line_count,
+                    failed.as_ref().map(|failure| failure.outcome),
+                );
                 command_tool_result(summary, &output, failed)
             }
             Err(error) => tool_error(error),
@@ -749,7 +773,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.history",
         description = "Read IRCv3 CHATHISTORY, with an explicitly reported legacy/unavailable fallback.",
-        output_schema = schema_for_output::<HistoryOutput>(),
+        output_schema = envelope_schema::<HistoryOutput>(),
         annotations(
             title = "Read channel history",
             read_only_hint = true,
@@ -766,9 +790,9 @@ impl IrcMcpService {
         let mut progress = ProgressReporter::new(&context, HISTORY_PROGRESS_TOTAL);
         match self.history(input, &mut progress).await {
             Ok(output) => {
-                let outcome = output.result.as_ref().map(|result| result.outcome);
-                let failure = outcome.filter(|outcome| is_failure_outcome(*outcome));
-                let summary = history_result_summary(failure);
+                let failure = output.result.as_ref().and_then(command_failure);
+                let summary =
+                    history_result_summary(failure.as_ref().map(|failure| failure.outcome));
                 let resources = ResourceUris::for_agent(&agent_id);
                 let mut content = vec![resource_link(resources.events)];
                 if let Some(channel) = channel {
@@ -787,7 +811,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.query",
         description = "Run a typed WHOIS, WHO, NAMES, MODE, MOTD, HELP, or other common IRC query.",
-        output_schema = schema_for_output::<CommandResult>(),
+        output_schema = envelope_schema::<CommandResult>(),
         annotations(
             title = "Run server query",
             read_only_hint = true,
@@ -815,7 +839,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.whois",
         description = "Read one nickname's WHOIS profile as typed fields plus the lossless reply envelope.",
-        output_schema = schema_for_output::<WhoisOutput>(),
+        output_schema = envelope_schema::<WhoisOutput>(),
         annotations(
             title = "Read WHOIS profile",
             read_only_hint = true,
@@ -853,7 +877,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.names",
         description = "Read channel membership grouped into typed NAMES entries.",
-        output_schema = schema_for_output::<NamesOutput>(),
+        output_schema = envelope_schema::<NamesOutput>(),
         annotations(
             title = "Read channel names",
             read_only_hint = true,
@@ -893,7 +917,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.list",
         description = "List visible IRC channels as typed channel, member-count, and topic entries.",
-        output_schema = schema_for_output::<ListOutput>(),
+        output_schema = envelope_schema::<ListOutput>(),
         annotations(
             title = "List IRC channels",
             read_only_hint = true,
@@ -934,7 +958,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.mode.get",
         description = "Read user, channel, or list modes through a stable typed tool.",
-        output_schema = schema_for_output::<ModeGetOutput>(),
+        output_schema = envelope_schema::<ModeGetOutput>(),
         annotations(
             title = "Read IRC modes",
             read_only_hint = true,
@@ -978,7 +1002,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.help",
         description = "Read the server HELP index or one subject as ordered typed lines.",
-        output_schema = schema_for_output::<HelpOutput>(),
+        output_schema = envelope_schema::<HelpOutput>(),
         annotations(
             title = "Read server help",
             read_only_hint = true,
@@ -1021,7 +1045,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.topic.get",
         description = "Read one channel topic and setter metadata through a stable typed tool.",
-        output_schema = schema_for_output::<TopicOutput>(),
+        output_schema = envelope_schema::<TopicOutput>(),
         annotations(
             title = "Read channel topic",
             read_only_hint = true,
@@ -1067,7 +1091,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.topic.set",
         description = "Set or clear one channel topic through a stable typed mutation.",
-        output_schema = schema_for_output::<TopicOutput>(),
+        output_schema = envelope_schema::<TopicOutput>(),
         annotations(
             title = "Change channel topic",
             destructive_hint = true,
@@ -1118,7 +1142,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.nick.set",
         description = "Change this guest's nickname through a stable typed mutation.",
-        output_schema = schema_for_output::<NickSetOutput>(),
+        output_schema = envelope_schema::<NickSetOutput>(),
         annotations(
             title = "Change IRC nickname",
             destructive_hint = true,
@@ -1154,7 +1178,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.away.set",
         description = "Set or clear this guest's away state through a stable typed mutation.",
-        output_schema = schema_for_output::<AwaySetOutput>(),
+        output_schema = envelope_schema::<AwaySetOutput>(),
         annotations(
             title = "Change IRC away state",
             destructive_hint = true,
@@ -1197,7 +1221,7 @@ impl IrcMcpService {
         description = "Remove one nickname from a channel through a stable typed mutation. Where \
                        `mcp.confirm_destructive` is enabled, the call first returns an \
                        input_required confirmation and applies nothing until it is answered.",
-        output_schema = schema_for_output::<KickOutput>(),
+        output_schema = envelope_schema::<KickOutput>(),
         annotations(
             title = "Kick channel member",
             destructive_hint = true,
@@ -1271,7 +1295,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.invite",
         description = "Invite one nickname to a channel through a stable typed mutation.",
-        output_schema = schema_for_output::<InviteOutput>(),
+        output_schema = envelope_schema::<InviteOutput>(),
         annotations(
             title = "Invite channel member",
             destructive_hint = false,
@@ -1318,7 +1342,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.monitor.update",
         description = "Add, remove, or clear server-side MONITOR entries after runtime support checks.",
-        output_schema = schema_for_output::<MonitorUpdateOutput>(),
+        output_schema = envelope_schema::<MonitorUpdateOutput>(),
         annotations(
             title = "Update IRC monitor list",
             destructive_hint = true,
@@ -1408,7 +1432,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.mode.set",
         description = "Change user or channel modes through a stable typed mutation.",
-        output_schema = schema_for_output::<ModeSetOutput>(),
+        output_schema = envelope_schema::<ModeSetOutput>(),
         annotations(
             title = "Change IRC modes",
             destructive_hint = true,
@@ -1476,7 +1500,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.reaction.update",
         description = "Add or remove an IRCv3 reaction after checking message-tags and the server's client-tag policy.",
-        output_schema = schema_for_output::<ReactionUpdateOutput>(),
+        output_schema = envelope_schema::<ReactionUpdateOutput>(),
         annotations(
             title = "Update message reaction",
             destructive_hint = true,
@@ -1564,7 +1588,7 @@ impl IrcMcpService {
                        redaction. Where `mcp.confirm_destructive` is enabled, the call first \
                        returns an input_required confirmation and applies nothing until it is \
                        answered.",
-        output_schema = schema_for_output::<MessageRedactOutput>(),
+        output_schema = envelope_schema::<MessageRedactOutput>(),
         annotations(
             title = "Redact IRC message",
             destructive_hint = true,
@@ -1651,7 +1675,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.read.get",
         description = "Read one synchronized IRCv3 conversation marker after exact capability negotiation.",
-        output_schema = schema_for_output::<ReadMarkerOutput>(),
+        output_schema = envelope_schema::<ReadMarkerOutput>(),
         annotations(
             title = "Read conversation marker",
             read_only_hint = true,
@@ -1698,7 +1722,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.read.set",
         description = "Advance one synchronized IRCv3 conversation marker to a previously received server timestamp.",
-        output_schema = schema_for_output::<ReadMarkerOutput>(),
+        output_schema = envelope_schema::<ReadMarkerOutput>(),
         annotations(
             title = "Advance conversation marker",
             destructive_hint = true,
@@ -1755,7 +1779,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.typing.set",
         description = "Publish a privacy-sensitive IRCv3 typing state with negotiated-tag checks and per-target throttling.",
-        output_schema = schema_for_output::<TypingSetOutput>(),
+        output_schema = envelope_schema::<TypingSetOutput>(),
         annotations(
             title = "Publish typing state",
             destructive_hint = false,
@@ -1830,7 +1854,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.execute",
         description = "Execute a structured IRC command without accepting raw CRLF-delimited lines.",
-        output_schema = schema_for_output::<CommandResult>(),
+        output_schema = envelope_schema::<CommandResult>(),
         annotations(
             title = "Execute IRC command",
             destructive_hint = true,
@@ -1867,7 +1891,7 @@ impl IrcMcpService {
         name = "irc.events.read",
         description = "Read an agent's bounded event journal after an explicit caller-owned cursor, \
                        optionally through a watch's registered selection.",
-        output_schema = schema_for_output::<EventsReadOutput>(),
+        output_schema = envelope_schema::<EventsReadOutput>(),
         annotations(
             title = "Read event journal",
             read_only_hint = true,
@@ -1911,20 +1935,31 @@ impl IrcMcpService {
             }
         };
         match page {
-            Ok(page) => tool_success_with_content(
-                format!(
-                    "Read {} event(s); cursor is {}.{}",
-                    page.events.len(),
-                    page.next_cursor.sequence,
-                    if page.has_more {
-                        " More are already retained: read again from that cursor."
-                    } else {
-                        ""
-                    }
-                ),
-                &page,
-                vec![resource_link(resources.events)],
-            ),
+            Ok(page) => {
+                // The one explicit caller action that moves the activity
+                // anchor. It happens after the read succeeded and records
+                // exactly the position the caller is being handed, so the
+                // counts a later hint reports start where this read stopped.
+                if input.set_activity_anchor {
+                    self.gateway
+                        .set_activity_anchor(&input.agent_id, page.next_cursor.clone())
+                        .await;
+                }
+                tool_success_with_content(
+                    format!(
+                        "Read {} event(s); cursor is {}.{}",
+                        page.events.len(),
+                        page.next_cursor.sequence,
+                        if page.has_more {
+                            " More are already retained: read again from that cursor."
+                        } else {
+                            ""
+                        }
+                    ),
+                    &page,
+                    vec![resource_link(resources.events)],
+                )
+            }
             Err(error) => tool_error(error),
         }
     }
@@ -1933,7 +1968,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.chat.open",
         description = "Send an ordinary or reverse DCC CHAT offer to one peer.",
-        output_schema = schema_for_output::<DccSessionOutput>(),
+        output_schema = envelope_schema::<DccSessionOutput>(),
         annotations(
             title = "Offer direct chat",
             destructive_hint = false,
@@ -1959,7 +1994,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.chat.send",
         description = "Send one bounded line through an established DCC CHAT socket.",
-        output_schema = schema_for_output::<DccChatSendOutput>(),
+        output_schema = envelope_schema::<DccChatSendOutput>(),
         annotations(
             title = "Send direct chat line",
             destructive_hint = false,
@@ -1996,7 +2031,7 @@ impl IrcMcpService {
                        receives a task handle that follows the transfer to completion, with \
                        status and cancellation, instead of a result returned once the offer is \
                        written.",
-        output_schema = schema_for_output::<DccSessionOutput>(),
+        output_schema = envelope_schema::<DccSessionOutput>(),
         annotations(
             title = "Offer file transfer",
             destructive_hint = false,
@@ -2031,7 +2066,7 @@ impl IrcMcpService {
                        declares the tasks extension in its request capabilities receives a task \
                        handle that follows a SEND transfer to completion, with status and \
                        cancellation, instead of a result returned once the acceptance is written.",
-        output_schema = schema_for_output::<DccSessionOutput>(),
+        output_schema = envelope_schema::<DccSessionOutput>(),
         annotations(
             title = "Accept direct offer",
             destructive_hint = true,
@@ -2082,7 +2117,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.reject",
         description = "Reject one incoming offered DCC session.",
-        output_schema = schema_for_output::<DccSessionOutput>(),
+        output_schema = envelope_schema::<DccSessionOutput>(),
         annotations(
             title = "Reject direct offer",
             destructive_hint = true,
@@ -2108,7 +2143,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.cancel",
         description = "Cancel one active or offered DCC session and close its direct resources.",
-        output_schema = schema_for_output::<DccSessionOutput>(),
+        output_schema = envelope_schema::<DccSessionOutput>(),
         annotations(
             title = "Cancel direct session",
             destructive_hint = true,
@@ -2137,7 +2172,7 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.list",
         description = "List active and recently terminal DCC sessions for one guest.",
-        output_schema = schema_for_output::<DccListOutput>(),
+        output_schema = envelope_schema::<DccListOutput>(),
         annotations(
             title = "List direct sessions",
             read_only_hint = true,
@@ -2191,7 +2226,7 @@ impl IrcMcpService {
         match self.execute(agent_id, message, mode, timeout_ms).await {
             Ok(result) => {
                 let outcome = result.outcome;
-                let failure = is_failure_outcome(outcome).then_some(outcome);
+                let failure = command_failure(&result);
                 let result = command_result_for_detail(result, result_detail);
                 command_tool_result(format!("{operation}: {outcome:?}."), &result, failure)
             }
@@ -2424,8 +2459,14 @@ impl ServerHandler for IrcMcpService {
                     });
             return Ok(CreateTaskResult::new(task).into());
         }
+        let agent_id = named_agent(&request);
         let call = ToolCallContext::new(self, request, context);
-        self.tool_router.call(call).await
+        let mut response = self.tool_router.call(call).await?;
+        if let CallToolResponse::Complete(result) = &mut response {
+            adopt_unstructured(result);
+            self.hint_at_activity(agent_id.as_ref(), result).await;
+        }
+        Ok(response)
     }
 
     /// Report one task's state to the caller that created it.
@@ -2874,11 +2915,7 @@ impl IrcMcpService {
         let Some(arguments) = request.arguments.as_ref() else {
             return Ok(());
         };
-        if let Some(agent_id) = arguments
-            .get("agent_id")
-            .and_then(|value| value.as_str())
-            .and_then(|value| AgentId::from_str(value).ok())
-        {
+        if let Some(agent_id) = named_agent(request) {
             self.gateway.authorize_agent(owner, &agent_id).await?;
         }
         if let Some(watch_id) = arguments
@@ -3343,7 +3380,7 @@ impl IrcMcpService {
     ) -> Result<CallToolResult, TaskExit> {
         let agent_id = task_agent_id(&request)?;
         let call = ToolCallContext::new(self, request, context);
-        let started = match self.tool_router.call(call).await? {
+        let mut started = match self.tool_router.call(call).await? {
             CallToolResponse::Complete(result) => result,
             // A task must not carry an unanswered question, and `call_tool`
             // settles every one it can see before creating this task. Reaching
@@ -3372,8 +3409,13 @@ impl IrcMcpService {
             }
         };
         // A rejected offer, or an accepted chat, is a finished task rather than
-        // a transfer to follow.
+        // a transfer to follow. A task's terminal payload is a complete tool
+        // result, so it is enveloped and hinted exactly like one returned
+        // directly — a caller that followed a transfer for a minute is the
+        // caller most likely to have missed something meanwhile.
+        adopt_unstructured(&mut started);
         let Some(session_id) = followable_transfer(&started) else {
+            self.hint_at_activity(Some(&agent_id), &mut started).await;
             return Ok(started);
         };
 
@@ -3410,11 +3452,13 @@ impl IrcMcpService {
                 } else {
                     terminal_session_summary(&session)
                 };
-                return Ok(tool_success_with_content(
+                let mut result = tool_success_with_content(
                     summary,
                     &session,
                     vec![ContentBlock::ResourceLink(link)],
-                ));
+                );
+                self.hint_at_activity(Some(&agent_id), &mut result).await;
+                return Ok(result);
             }
             task.set_status_message(progress_summary(&session));
             tokio::select! {
@@ -3422,6 +3466,33 @@ impl IrcMcpService {
                 () = tokio::time::sleep_until(deadline) => {}
                 () = tokio::time::sleep(TASK_POLL_INTERVAL) => {}
             }
+        }
+    }
+
+    /// Attach the caller's bounded activity hint to one successful result.
+    ///
+    /// Every tool but `irc.connect` names an agent, and `call_tool` has already
+    /// refused any handle this caller does not own, so naming an agent here is
+    /// the whole entitlement check: owner isolation is inherited rather than
+    /// re-derived. `irc.connect` carries no hint because the anchor is born
+    /// during that very call, and `irc.watch.close` carries none because it
+    /// names a watch rather than an agent.
+    ///
+    /// Failures carry none either. A failure branch has no room for one in the
+    /// declared schema, and burying news of a mention inside a report that
+    /// something went wrong is not where a reader will look for it.
+    async fn hint_at_activity(&self, agent_id: Option<&AgentId>, result: &mut CallToolResult) {
+        if result.is_error == Some(true) {
+            return;
+        }
+        let Some(agent_id) = agent_id else {
+            return;
+        };
+        let Some(structured) = result.structured_content.as_mut() else {
+            return;
+        };
+        if let Some(hint) = self.gateway.activity_hint(agent_id).await {
+            envelope::attach_activity(structured, &hint);
         }
     }
 
@@ -3489,16 +3560,7 @@ const CONFIRMATION_REQUIRED: &str = "confirmation_required";
 /// Never a JSON-RPC error: the call was well formed and reached the tool, so the
 /// answer belongs in a result the model can read and act on.
 fn refusal(kind: &str, message: impl Into<String>, retriable: bool) -> CallToolResult {
-    let message = message.into();
-    structured_result(
-        message.clone(),
-        &ToolErrorOutput {
-            kind: kind.into(),
-            message,
-            retriable,
-        },
-        true,
-    )
+    failure_result(ToolFailure::refusal(kind, message, retriable))
 }
 
 /// Report that the caller was asked and refused.
@@ -3542,17 +3604,11 @@ fn unchosen_destination(roots: Vec<String>, default_path: Option<PathBuf>) -> Ca
          are {}.",
         roots.join(", ")
     );
-    structured_result(
-        message.clone(),
-        &DccReceiveRootsOutput {
-            kind: GatewayError::Dcc(String::new()).kind().as_str().into(),
-            message,
-            retriable: false,
-            receive_roots: roots,
-            default_destination_path: default_path,
-        },
-        true,
-    )
+    failure_result(ToolFailure::unchosen_destination(
+        message,
+        roots,
+        default_path,
+    ))
 }
 
 /// Whether this call is answered with a task handle instead of a result.
@@ -3577,20 +3633,29 @@ fn runs_as_task(tool: &str, profile: &RequestProfile) -> bool {
     TASK_AUGMENTED_TOOLS.contains(&tool) && profile.declares_extension(TASKS_EXTENSION_ID)
 }
 
-/// The agent handle a task-augmented DCC call names.
-fn task_agent_id(request: &CallToolRequestParams) -> Result<AgentId, TaskExit> {
+/// The agent handle one tool call names, when it names a well-formed one.
+///
+/// Every tool but `irc.connect` takes an `agent_id`, so this is both the
+/// ownership gate's subject and the subject of any activity hint the result
+/// carries — the same value read the same way, so the two can never disagree
+/// about which agent a call was about.
+fn named_agent(request: &CallToolRequestParams) -> Option<AgentId> {
     request
         .arguments
-        .as_ref()
-        .and_then(|arguments| arguments.get("agent_id"))
-        .and_then(|value| value.as_str())
+        .as_ref()?
+        .get("agent_id")?
+        .as_str()
         .and_then(|value| AgentId::from_str(value).ok())
-        .ok_or_else(|| {
-            TaskExit::Error(McpError::invalid_params(
-                "a task-augmented DCC call must name a valid agent_id",
-                None,
-            ))
-        })
+}
+
+/// The agent handle a task-augmented DCC call names.
+fn task_agent_id(request: &CallToolRequestParams) -> Result<AgentId, TaskExit> {
+    named_agent(request).ok_or_else(|| {
+        TaskExit::Error(McpError::invalid_params(
+            "a task-augmented DCC call must name a valid agent_id",
+            None,
+        ))
+    })
 }
 
 /// The transfer a DCC tool result reports having started, when it started one.
@@ -3602,7 +3667,11 @@ fn task_agent_id(request: &CallToolRequestParams) -> Result<AgentId, TaskExit> {
 /// chat as expired. A chat accept is complete when it is accepted; its activity
 /// is `dcc.chat.message` events, not bytes to count.
 fn followable_transfer(result: &CallToolResult) -> Option<DccSessionId> {
-    let session = result.structured_content.as_ref()?.get("session")?;
+    let session = result
+        .structured_content
+        .as_ref()?
+        .get("result")?
+        .get("session")?;
     if session.get("kind")?.as_str()? != "send" {
         return None;
     }
@@ -3710,6 +3779,7 @@ fn connect_request(input: &ConnectInput, chosen: Option<Nickname>) -> ConnectReq
         username: input.username.clone(),
         real_name: input.real_name.clone(),
         channels: input.channels.iter().cloned().collect::<BTreeSet<_>>(),
+        activity: input.activity,
     }
 }
 
@@ -3758,8 +3828,12 @@ fn query_message(query: Query) -> Result<OutboundMessage, GatewayError> {
     Ok(message)
 }
 
-fn command_failure(result: &CommandResult) -> Option<CommandOutcome> {
-    is_failure_outcome(result.outcome).then_some(result.outcome)
+/// Classify one correlated exchange, keeping it whole only when it failed.
+fn command_failure(result: &CommandResult) -> Option<CommandFailure> {
+    is_failure_outcome(result.outcome).then(|| CommandFailure {
+        outcome: result.outcome,
+        result: result.clone(),
+    })
 }
 
 fn whois_profile(result: &CommandResult) -> WhoisProfile {
@@ -4317,7 +4391,7 @@ fn caller_profile(profile: &RequestProfile) -> CallerProfile {
 }
 
 fn tool_success(summary: impl Into<String>, value: &impl Serialize) -> CallToolResult {
-    structured_result(summary, value, false)
+    tool_success_with_content(summary, value, Vec::new())
 }
 
 /// Succeed with additional native content blocks after the text summary, so a
@@ -4328,55 +4402,116 @@ fn tool_success_with_content(
     value: &impl Serialize,
     content: Vec<ContentBlock>,
 ) -> CallToolResult {
-    structured_result_with_content(summary, value, false, content)
+    match envelope::success(value) {
+        Ok(structured) => structured_result_with_content(summary, structured, false, content),
+        Err(error) => unserializable(&error),
+    }
 }
 
+/// Report one correlated IRC command, successfully completed or not.
+///
+/// The two cases produce different branches of the same declared schema: a
+/// completed command answers with the tool's own output, and a rejected or
+/// unacknowledged one answers with the shared failure carrying that exchange
+/// whole. The numerics are the actionable part of a rejection, so they travel
+/// with it rather than being summarized away.
 fn command_tool_result(
     summary: String,
     value: &impl Serialize,
-    failure: Option<CommandOutcome>,
+    failure: Option<CommandFailure>,
 ) -> CallToolResult {
-    structured_result(summary, value, failure.is_some())
+    command_tool_result_with_content(summary, value, failure, Vec::new())
 }
 
 fn command_tool_result_with_content(
     summary: String,
     value: &impl Serialize,
-    failure: Option<CommandOutcome>,
+    failure: Option<CommandFailure>,
     content: Vec<ContentBlock>,
 ) -> CallToolResult {
-    structured_result_with_content(summary, value, failure.is_some(), content)
+    match failure {
+        Some(failure) => failure_result_with_content(
+            ToolFailure::from_command(failure.outcome, summary, failure.result),
+            content,
+        ),
+        None => tool_success_with_content(summary, value, content),
+    }
 }
 
-fn structured_result(
-    summary: impl Into<String>,
-    value: &impl Serialize,
-    is_error: bool,
-) -> CallToolResult {
-    structured_result_with_content(summary, value, is_error, Vec::new())
+/// Report one failure in band, with the text summary taken from its message.
+fn failure_result(failure: ToolFailure) -> CallToolResult {
+    failure_result_with_content(failure, Vec::new())
 }
 
+fn failure_result_with_content(failure: ToolFailure, content: Vec<ContentBlock>) -> CallToolResult {
+    let summary = failure.message.clone();
+    match envelope::failure(&failure) {
+        Ok(structured) => structured_result_with_content(summary, structured, true, content),
+        Err(error) => unserializable(&error),
+    }
+}
+
+/// Finish one already-enveloped result: text summary first, then any native
+/// content blocks, with `isError` agreeing with the envelope's discriminator.
 fn structured_result_with_content(
     summary: impl Into<String>,
-    value: &impl Serialize,
+    structured: serde_json::Value,
     is_error: bool,
     mut content: Vec<ContentBlock>,
 ) -> CallToolResult {
-    match serde_json::to_value(value) {
-        Ok(value) => {
-            let mut result = if is_error {
-                CallToolResult::structured_error(value)
-            } else {
-                CallToolResult::structured(value)
-            };
-            content.insert(0, ContentBlock::text(summary));
-            result.content = content;
-            result
-        }
-        Err(error) => CallToolResult::error(vec![ContentBlock::text(format!(
-            "could not serialize typed tool output: {error}"
-        ))]),
+    let mut result = if is_error {
+        CallToolResult::structured_error(structured)
+    } else {
+        CallToolResult::structured(structured)
+    };
+    content.insert(0, ContentBlock::text(summary));
+    result.content = content;
+    result
+}
+
+/// Report a result this server computed but could not serialize.
+///
+/// Unreachable in practice — every output type is a plain `serde` structure —
+/// but it still has to answer inside the declared schema, because a caller
+/// validating `structuredContent` would otherwise see the advertised contract
+/// broken by the one path that exists to report a broken contract.
+fn unserializable(error: &serde_json::Error) -> CallToolResult {
+    failure_result(ToolFailure::refusal(
+        envelope::INTERNAL_KIND,
+        format!("could not serialize typed tool output: {error}"),
+        false,
+    ))
+}
+
+/// Bring a result the SDK produced before the tool ran into the envelope.
+///
+/// A call whose arguments do not satisfy the published input schema is refused
+/// by the generated dispatcher with a text-only error result, which never
+/// reaches the funnel below. Left alone it would be the one tool result on this
+/// server carrying no `structuredContent` at all — a hole in exactly the
+/// guarantee this envelope exists to make — so it is adopted here, keeping its
+/// explanation and gaining the shape every other failure has.
+fn adopt_unstructured(result: &mut CallToolResult) {
+    if result.structured_content.is_some() {
+        return;
     }
+    let message: Vec<&str> = result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text().map(|text| text.text.as_str()))
+        .collect();
+    // Not retriable unchanged: the arguments themselves are what the
+    // dispatcher refused.
+    let failure = ToolFailure::refusal(ErrorKind::Validation.as_str(), message.join(" "), false);
+    result.is_error = Some(true);
+    result.structured_content = envelope::failure(&failure).ok();
+}
+
+/// One correlated command that did not complete, kept whole for the failure it
+/// becomes.
+struct CommandFailure {
+    outcome: CommandOutcome,
+    result: CommandResult,
 }
 
 fn resource_link(uri: impl Into<String>) -> ContentBlock {
@@ -4403,12 +4538,7 @@ fn dcc_resource_link(agent_id: &crate::agent::AgentId) -> ContentBlock {
 }
 
 fn tool_error(error: GatewayError) -> CallToolResult {
-    let output = ToolErrorOutput {
-        kind: error.kind().as_str().into(),
-        message: error.to_string(),
-        retriable: error.retriable(),
-    };
-    structured_result(output.message.clone(), &output, true)
+    failure_result(ToolFailure::from_error(&error))
 }
 
 const fn is_failure_outcome(outcome: CommandOutcome) -> bool {
@@ -4507,14 +4637,19 @@ mod tests {
     #[test]
     fn a_started_transfer_is_followed_by_the_session_its_tool_reported() {
         let session_id = DccSessionId::new();
-        let result = CallToolResult::structured(serde_json::json!({
-            "session": { "id": session_id.to_string(), "kind": "send" }
-        }));
+        // Built through the funnel, so the path this reads is the path the
+        // envelope actually produces rather than a hand-written guess at it.
+        let result = tool_success(
+            "offered",
+            &serde_json::json!({
+                "session": { "id": session_id.to_string(), "kind": "send" }
+            }),
+        );
         assert_eq!(followable_transfer(&result), Some(session_id));
 
         // A tool that started nothing to follow settles the task immediately.
         assert_eq!(
-            followable_transfer(&CallToolResult::structured(serde_json::json!({}))),
+            followable_transfer(&tool_success("nothing", &serde_json::json!({}))),
             None
         );
     }
@@ -4526,9 +4661,16 @@ mod tests {
         // task open for its duration, withhold the session details the caller
         // needs to say anything at all, and then report a healthy chat as
         // expired when the deadline passed.
-        let chat = CallToolResult::structured(serde_json::json!({
-            "session": { "id": DccSessionId::new().to_string(), "kind": "chat", "state": "active" }
-        }));
+        let chat = tool_success(
+            "accepted",
+            &serde_json::json!({
+                "session": {
+                    "id": DccSessionId::new().to_string(),
+                    "kind": "chat",
+                    "state": "active",
+                }
+            }),
+        );
         assert_eq!(followable_transfer(&chat), None);
     }
 
@@ -4637,7 +4779,32 @@ mod tests {
         let tools = service.tool_router.list_all();
         let names: BTreeSet<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert_eq!(names, TOOL_NAMES.iter().copied().collect());
-        assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
+        for tool in &tools {
+            // Every tool declares the same envelope over its own output, so a
+            // client can read `ok` before it knows which tool answered. The
+            // instances are validated against these schemas in
+            // `crate::tests::output_schema`.
+            let schema = tool
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} declares an output schema", tool.name));
+            let branches = schema["oneOf"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{}: two discriminated branches", tool.name));
+            assert_eq!(branches.len(), 2, "{}", tool.name);
+            assert_eq!(
+                branches[0]["properties"]["ok"]["const"],
+                serde_json::json!(true),
+                "{}",
+                tool.name
+            );
+            assert_eq!(
+                branches[1]["properties"]["ok"]["const"],
+                serde_json::json!(false),
+                "{}",
+                tool.name
+            );
+        }
         let _ = CallToolRequestParams::new("irc.status");
     }
 
@@ -4676,6 +4843,7 @@ mod tests {
             origin: None,
             verbosity: None,
             mentions_me: None,
+            set_activity_anchor: false,
         };
         assert_eq!(input.conflicting_filter(), Some("class"));
         let refused = service.irc_events_read(Parameters(input.clone())).await;
@@ -5121,6 +5289,14 @@ mod tests {
         assert_eq!(input.result_detail, ToolResultDetail::Full);
     }
 
+    /// One rejected exchange, so a failure branch has something to carry.
+    fn rejected(outcome: CommandOutcome) -> CommandFailure {
+        let mut result = command_result_with(&[b":irc.example 475 Me #keyed :Cannot join channel"]);
+        result.outcome = outcome;
+        result.retriable = false;
+        CommandFailure { outcome, result }
+    }
+
     #[test]
     fn rejected_send_and_history_summaries_are_not_success_phrased() {
         let send = send_result_summary(1, Some(CommandOutcome::Rejected));
@@ -5132,7 +5308,7 @@ mod tests {
         let send_result = command_tool_result(
             send.clone(),
             &serde_json::json!({"outcome": "rejected"}),
-            Some(CommandOutcome::Rejected),
+            Some(rejected(CommandOutcome::Rejected)),
         );
         assert_eq!(send_result.is_error, Some(true));
         assert_eq!(send_result.content[0].as_text().expect("text").text, send);
@@ -5143,13 +5319,51 @@ mod tests {
         let history_result = command_tool_result(
             history.clone(),
             &serde_json::json!({"outcome": "timed_out"}),
-            Some(CommandOutcome::TimedOut),
+            Some(rejected(CommandOutcome::TimedOut)),
         );
         assert_eq!(history_result.is_error, Some(true));
         assert_eq!(
             history_result.content[0].as_text().expect("text").text,
             history
         );
+    }
+
+    /// A command the server refused takes the failure branch, and takes its
+    /// numerics with it: the 475 is the actionable part of the rejection, and
+    /// dropping it to fit a shared shape would make the shared shape useless.
+    #[test]
+    fn a_rejected_command_reports_the_failure_branch_with_its_exchange_intact() {
+        let result = command_tool_result(
+            "JOIN #keyed: Rejected.".into(),
+            &serde_json::json!({"channel": "#keyed"}),
+            Some(rejected(CommandOutcome::Rejected)),
+        );
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("an enveloped failure");
+        assert_eq!(structured["ok"], serde_json::json!(false));
+        assert_eq!(structured["error"]["kind"], "rejected");
+        assert_eq!(structured["error"]["message"], "JOIN #keyed: Rejected.");
+        assert_eq!(
+            structured["error"]["command_result"]["replies"][0]["command"],
+            "475"
+        );
+        assert!(
+            structured.get("result").is_none(),
+            "a failure branch never carries the success branch too: {structured}"
+        );
+
+        // The same call, completed, is the success branch and says nothing
+        // about failure at all.
+        let completed = command_tool_result(
+            "JOIN #open: Completed.".into(),
+            &serde_json::json!({"channel": "#open"}),
+            None,
+        );
+        assert_eq!(completed.is_error, Some(false));
+        let structured = completed.structured_content.expect("an enveloped success");
+        assert_eq!(structured["ok"], serde_json::json!(true));
+        assert_eq!(structured["result"]["channel"], "#open");
+        assert!(structured.get("error").is_none(), "{structured}");
     }
 
     #[test]

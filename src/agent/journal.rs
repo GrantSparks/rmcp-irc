@@ -453,6 +453,80 @@ impl CursorQuery {
     }
 }
 
+/// What one activity tally counts, and how much of it it inlines.
+///
+/// Built from the selections of every watch registered on the agent, which is
+/// what makes the counts mean "traffic this caller said it cares about" rather
+/// than "everything that happened". An empty `selections` counts nothing at
+/// all: an agent holding no watches has declared no interest, and inventing one
+/// would report a busy server as unread mail.
+#[derive(Clone, Debug, Default)]
+pub struct ActivityQuery {
+    /// Selections to union. An event is counted when any one of them selects
+    /// it, and counted once however many do.
+    pub selections: Vec<CursorQuery>,
+    /// Mapping used to fold each counted event's own target into a key.
+    pub case_mapping: CaseMapping,
+    /// The agent's own folded nickname, so nothing it said is ever unread.
+    pub folded_nickname: Option<String>,
+    /// How many of the newest counted records addressed to the agent to return
+    /// alongside the counts.
+    pub inline_mentions: usize,
+}
+
+impl ActivityQuery {
+    /// Whether one retained event is counted.
+    ///
+    /// The agent's own words never are, in either of the two forms they take: a
+    /// synthesized outbound record, and — on a server with `echo-message` — the
+    /// same message arriving back as ordinary inbound traffic. An unread hint
+    /// reports what happened while the caller was not looking, and a caller is
+    /// never behind on itself. Counting either form would also make the hint
+    /// depend on how many tools the caller had just run, which is precisely the
+    /// impurity this whole mechanism promises not to have.
+    fn counts(&self, event: &IrcEvent) -> bool {
+        if event.direction == EventDirection::Outbound || self.spoke_it(event) {
+            return false;
+        }
+        self.selections
+            .iter()
+            .any(|selection| selection.selects(event))
+    }
+
+    /// Whether the agent itself is the speaker of this record.
+    fn spoke_it(&self, event: &IrcEvent) -> bool {
+        let Some(nickname) = self.folded_nickname.as_ref() else {
+            return false;
+        };
+        let Some(EventPayload::Irc(projection)) = event.semantic.as_ref() else {
+            return false;
+        };
+        projection
+            .event
+            .source()
+            .is_some_and(|source| self.case_mapping.fold(&source.name) == *nickname)
+    }
+}
+
+/// A bounded per-target tally of what one selection retained after a cursor.
+///
+/// Pure with respect to the journal: producing one moves no position and
+/// consumes nothing, so the same cursor and query over an unchanged journal
+/// always produce the same tally.
+#[derive(Clone, Debug)]
+pub struct ActivityTally {
+    /// Counted records per case-folded target. Records with no target of their
+    /// own contribute to `total` and to nothing here.
+    pub per_target: std::collections::BTreeMap<String, u64>,
+    /// Counted records in total.
+    pub total: u64,
+    /// Newest position assigned in this stream when the tally was taken.
+    pub latest: EventCursor,
+    /// The newest counted records addressed to the agent, oldest first, at most
+    /// `inline_mentions` of them.
+    pub mentions: Vec<IrcEvent>,
+}
+
 impl EventFilter {
     fn matches(&self, event: &IrcEvent) -> bool {
         self.command_id
@@ -899,6 +973,60 @@ impl EventJournal {
             .collect();
         newest.reverse();
         newest
+    }
+
+    /// Count matching events after a caller-owned cursor, grouped by folded
+    /// target.
+    ///
+    /// Deliberately not a read: nothing here returns a position to persist,
+    /// nothing advances, and the caller's cursor is only ever compared against.
+    /// A cursor from another stream, or one past the end of this one, counts the
+    /// whole retained window rather than failing — a hint is allowed to be
+    /// approximate at the moment a stream resets, and reporting nothing would be
+    /// less honest than reporting what is there.
+    pub fn tally_after(
+        &self,
+        cursor: Option<&EventCursor>,
+        query: &ActivityQuery,
+    ) -> ActivityTally {
+        let latest = self.latest_cursor();
+        let after_sequence = match cursor {
+            Some(requested)
+                if requested.stream_id == self.stream_id
+                    && requested.sequence <= latest.sequence =>
+            {
+                requested.sequence
+            }
+            _ => 0,
+        };
+        let mut tally = ActivityTally {
+            per_target: std::collections::BTreeMap::new(),
+            total: 0,
+            latest,
+            mentions: Vec::new(),
+        };
+        let counted = self
+            .events
+            .iter()
+            .map(|(event, _)| event)
+            .filter(|event| event.cursor.sequence > after_sequence)
+            .filter(|event| query.counts(event));
+        for event in counted {
+            tally.total = tally.total.saturating_add(1);
+            if let Some(target) = event.target.as_ref() {
+                *tally
+                    .per_target
+                    .entry(query.case_mapping.fold(target))
+                    .or_default() += 1;
+            }
+            if query.inline_mentions > 0 && event.mentions_me {
+                if tally.mentions.len() == query.inline_mentions {
+                    tally.mentions.remove(0);
+                }
+                tally.mentions.push(event.clone());
+            }
+        }
+        tally
     }
 
     /// Return bounded journal measurements.

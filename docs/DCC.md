@@ -282,8 +282,11 @@ error result with `kind: "declined"`, nothing is written, and the offer stays
 pending until it expires or is accepted or rejected.
 
 A request that declared no elicitation support gets a structured error instead of
-a question, carrying `receive_roots` and `default_destination_path` so its next
-attempt can name both explicitly.
+a question: the shared failure branch, `{"ok": false, "error": {…}}`, carrying
+`receive_roots` and `default_destination_path` alongside the usual `kind`,
+`message`, and `retriable` so its next attempt can name both explicitly. Those
+two extras are part of every tool's declared `outputSchema`; see
+[MCP_API.md](MCP_API.md#errors-and-command-outcomes).
 
 A caller that also declared the tasks extension gets this question *before* any
 task exists: an accept that still needs a destination answers `input_required`

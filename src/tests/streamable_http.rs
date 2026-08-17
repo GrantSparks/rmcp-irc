@@ -33,10 +33,10 @@ const VERSION: &str = "2026-07-28";
 const HOST: &str = "127.0.0.1:8080";
 
 /// One JSON-RPC request plus the HTTP framing a 2026-07-28 POST requires.
-struct Envelope {
+pub(super) struct Envelope {
     method: String,
-    name: Option<String>,
-    params: serde_json::Value,
+    pub(super) name: Option<String>,
+    pub(super) params: serde_json::Value,
     meta: Option<serde_json::Value>,
     headers: Vec<(String, String)>,
     protocol_version_header: Option<String>,
@@ -45,7 +45,7 @@ struct Envelope {
 impl Envelope {
     /// A request that satisfies every requirement, ready to be spoiled one
     /// field at a time.
-    fn new(method: &str) -> Self {
+    pub(super) fn new(method: &str) -> Self {
         Self {
             method: method.to_owned(),
             name: None,
@@ -57,7 +57,7 @@ impl Envelope {
     }
 
     /// A `tools/call` for one tool, which also carries `Mcp-Name`.
-    fn tool_call(name: &str, arguments: serde_json::Value) -> Self {
+    pub(super) fn tool_call(name: &str, arguments: serde_json::Value) -> Self {
         let mut envelope = Self::new("tools/call");
         envelope.name = Some(name.to_owned());
         envelope.params = serde_json::json!({ "name": name, "arguments": arguments });
@@ -65,7 +65,7 @@ impl Envelope {
     }
 
     /// Replace the request `_meta`, or omit it entirely with `None`.
-    fn with_meta(mut self, meta: Option<serde_json::Value>) -> Self {
+    pub(super) fn with_meta(mut self, meta: Option<serde_json::Value>) -> Self {
         self.meta = meta;
         self
     }
@@ -89,7 +89,7 @@ impl Envelope {
     }
 
     /// Add one HTTP header.
-    fn with_header(mut self, name: &str, value: &str) -> Self {
+    pub(super) fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_owned(), value.to_owned()));
         self
     }
@@ -132,7 +132,7 @@ impl Envelope {
 }
 
 /// The per-request `_meta` every 2026-07-28 client sends.
-fn client_meta(capabilities: serde_json::Value) -> serde_json::Value {
+pub(super) fn client_meta(capabilities: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "io.modelcontextprotocol/protocolVersion": VERSION,
         "io.modelcontextprotocol/clientInfo": { "name": "test-client", "version": "0.0.0" },
@@ -193,7 +193,11 @@ fn refusal(body: &serde_json::Value) -> serde_json::Value {
     assert!(body["error"].is_null(), "a refusal is in band: {body}");
     assert_eq!(body["result"]["resultType"], "complete", "{body}");
     assert_eq!(body["result"]["isError"], true, "{body}");
-    body["result"]["structuredContent"].clone()
+    assert_eq!(
+        body["result"]["structuredContent"]["ok"], false,
+        "the envelope discriminator always agrees with isError: {body}"
+    );
+    body["result"]["structuredContent"]["error"].clone()
 }
 
 /// One accepted form answer, shaped the way a client echoes an elicitation back.
@@ -220,7 +224,7 @@ fn router(callers: CallerPolicy) -> axum::Router {
 ///
 /// Every request builds its own handler, so the gateway is the only thing two
 /// requests share — which is exactly what the cross-request tests are about.
-fn router_for(gateway: Arc<Gateway>, callers: CallerPolicy) -> axum::Router {
+pub(super) fn router_for(gateway: Arc<Gateway>, callers: CallerPolicy) -> axum::Router {
     http_service(
         gateway,
         vec!["localhost".into(), "127.0.0.1".into()],
@@ -236,7 +240,7 @@ fn router_for(gateway: Arc<Gateway>, callers: CallerPolicy) -> axum::Router {
 /// A reply arrives either as JSON or as a one-event SSE stream depending on how
 /// the transport classified it, and a test cares about neither, so both are
 /// unwrapped to the same value here.
-async fn send(
+pub(super) async fn send(
     router: &axum::Router,
     envelope: Envelope,
 ) -> (axum::http::StatusCode, serde_json::Value) {
@@ -263,7 +267,7 @@ async fn send_stream(
         .await
         .expect("router is infallible");
     let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+    let body = axum::body::to_bytes(response.into_body(), 16 << 20)
         .await
         .expect("read response body");
     let text = String::from_utf8(body.to_vec()).expect("utf-8 response");
@@ -290,9 +294,17 @@ async fn a_complete_request_reaches_the_tool_surface() {
         .iter()
         .find(|tool| tool["name"] == "irc.status")
         .unwrap_or_else(|| panic!("irc.status is listed: {body}"));
+    // Every tool declares the same two-branch envelope, and the tool's own
+    // output lives under the success branch's `result`.
+    let success = &status["outputSchema"]["oneOf"][0];
+    assert_eq!(success["properties"]["ok"]["const"], true, "{status}");
     assert!(
-        status["outputSchema"]["properties"]["caller"].is_object(),
+        success["properties"]["result"]["properties"]["caller"].is_object(),
         "the declared capability picture is part of the published status schema: {status}"
+    );
+    assert_eq!(
+        status["outputSchema"]["oneOf"][1]["properties"]["ok"]["const"], false,
+        "{status}"
     );
 }
 
@@ -500,7 +512,7 @@ impl ConnectedFixture {
         )
         .await;
         assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-        let agent_id = body["result"]["structuredContent"]["agent_id"]
+        let agent_id = body["result"]["structuredContent"]["result"]["agent_id"]
             .as_str()
             .unwrap_or_else(|| panic!("a connected agent: {body}"))
             .to_owned();
@@ -534,7 +546,7 @@ impl ConnectedFixture {
 }
 
 /// Present `credential` on a request, when the endpoint asks for one.
-fn authorized(envelope: Envelope, credential: Option<&str>) -> Envelope {
+pub(super) fn authorized(envelope: Envelope, credential: Option<&str>) -> Envelope {
     match credential {
         Some(token) => envelope.with_header("authorization", &format!("Bearer {token}")),
         None => envelope,
@@ -880,7 +892,7 @@ async fn contested(callers: CallerPolicy, credential: Option<&str>) -> (FakeErgo
     .await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
     assert_eq!(
-        body["result"]["structuredContent"]["nickname"], "Athena",
+        body["result"]["structuredContent"]["result"]["nickname"], "Athena",
         "{body}"
     );
     (server, router)
@@ -934,7 +946,7 @@ async fn a_refused_nickname_is_asked_about_and_the_answer_registers_the_guest() 
     assert_eq!(status, axum::http::StatusCode::OK, "{connected}");
     assert_eq!(connected["result"]["resultType"], "complete", "{connected}");
     assert_eq!(connected["result"]["isError"], false, "{connected}");
-    let output = &connected["result"]["structuredContent"];
+    let output = &connected["result"]["structuredContent"]["result"];
     assert_eq!(output["nickname"], "Hestia", "{connected}");
     assert_eq!(output["registered"], true, "{connected}");
     assert!(output["agent_id"].is_string(), "{connected}");
@@ -983,11 +995,11 @@ async fn a_declined_nickname_connects_nothing_and_a_headless_policy_never_asks()
     assert_eq!(status, axum::http::StatusCode::OK, "{suffixed}");
     assert_eq!(suffixed["result"]["resultType"], "complete", "{suffixed}");
     assert_eq!(
-        suffixed["result"]["structuredContent"]["nickname"], "Athena_2",
+        suffixed["result"]["structuredContent"]["result"]["nickname"], "Athena_2",
         "{suffixed}"
     );
     assert_eq!(
-        suffixed["result"]["structuredContent"]["nickname_adjusted"], true,
+        suffixed["result"]["structuredContent"]["result"]["nickname_adjusted"], true,
         "{suffixed}"
     );
 }
@@ -1032,7 +1044,7 @@ async fn an_abandoned_registration_leaves_no_agent_and_no_reserved_capacity() {
         Envelope::tool_call("irc.connect", serde_json::json!({ "nickname": "Athena" })),
     )
     .await;
-    let agent_id = held["result"]["structuredContent"]["agent_id"]
+    let agent_id = held["result"]["structuredContent"]["result"]["agent_id"]
         .as_str()
         .unwrap_or_else(|| panic!("a connected agent: {held}"))
         .to_owned();
@@ -1060,7 +1072,7 @@ async fn an_abandoned_registration_leaves_no_agent_and_no_reserved_capacity() {
     )
     .await;
     assert_eq!(
-        connected["result"]["structuredContent"]["nickname"], "Hestia",
+        connected["result"]["structuredContent"]["result"]["nickname"], "Hestia",
         "four abandoned attempts must not have consumed the gateway: {connected}"
     );
 }
@@ -1105,7 +1117,7 @@ async fn only_the_caller_that_was_asked_can_answer_the_nickname_question() {
     // The caller it was minted for still redeems it.
     let (_, connected) = send(&router, answer(&state, Some("mine"))).await;
     assert_eq!(
-        connected["result"]["structuredContent"]["nickname"], "Hestia",
+        connected["result"]["structuredContent"]["result"]["nickname"], "Hestia",
         "{connected}"
     );
 }
@@ -1152,7 +1164,7 @@ async fn a_keyed_channel_asks_for_its_key_and_joins_when_it_is_given() {
     assert_eq!(joined["result"]["resultType"], "complete", "{joined}");
     assert_eq!(joined["result"]["isError"], false, "{joined}");
     assert_eq!(
-        joined["result"]["structuredContent"]["result"]["outcome"], "completed",
+        joined["result"]["structuredContent"]["result"]["result"]["outcome"], "completed",
         "{joined}"
     );
 
@@ -1235,7 +1247,7 @@ async fn a_join_that_cannot_be_asked_about_returns_the_rejection_it_always_did()
             "{label}: {rejected}"
         );
         assert_eq!(rejected["result"]["isError"], true, "{label}: {rejected}");
-        let result = &rejected["result"]["structuredContent"]["result"];
+        let result = &rejected["result"]["structuredContent"]["error"]["command_result"];
         assert_eq!(result["outcome"], "rejected", "{label}: {rejected}");
         assert!(
             result["replies"]
@@ -1373,7 +1385,7 @@ async fn a_kick_applies_nothing_until_it_is_confirmed() {
     assert_eq!(status, axum::http::StatusCode::OK, "{applied}");
     assert_eq!(applied["result"]["isError"], false, "{applied}");
     assert_eq!(
-        applied["result"]["structuredContent"]["result"]["outcome"], "completed",
+        applied["result"]["structuredContent"]["result"]["result"]["outcome"], "completed",
         "{applied}"
     );
     assert!(wrote(&mut lines, "KICK"), "a confirmed kick is a kick");
@@ -1430,7 +1442,7 @@ async fn a_redaction_applies_nothing_until_it_is_confirmed() {
     .await;
     assert_eq!(applied["result"]["isError"], false, "{applied}");
     assert_eq!(
-        applied["result"]["structuredContent"]["result"]["outcome"], "completed",
+        applied["result"]["structuredContent"]["result"]["result"]["outcome"], "completed",
         "{applied}"
     );
     assert!(wrote(&mut lines, "REDACT"));
@@ -1517,7 +1529,7 @@ async fn offered(
         Envelope::tool_call("irc.connect", serde_json::json!({ "nickname": "Ariadne" })),
     )
     .await;
-    let agent_id = connected["result"]["structuredContent"]["agent_id"]
+    let agent_id = connected["result"]["structuredContent"]["result"]["agent_id"]
         .as_str()
         .unwrap_or_else(|| panic!("a connected agent: {connected}"))
         .to_owned();

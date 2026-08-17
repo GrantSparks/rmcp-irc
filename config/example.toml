@@ -45,6 +45,17 @@ max_event_page_size = 1000
 # capability would not be a gate.
 confirm_destructive = false
 
+# Attach the bounded unread hint to successful tool results that name an agent:
+# per-watched-target counts, the caller-owned anchor they are measured from, and
+# the stream's latest position. On by default, because for a host that does not
+# subscribe — or subscribes without starting a model turn — this is the only way
+# news reaches the model without spending a whole turn on a long poll. It moves
+# no cursor and no watch. Turn it off only for a deployment whose own delivery
+# loop is enough; a subscription is not a reason, since it proves a host can be
+# woken and nothing about whether it will think. One agent can opt out on its
+# own through `activity` on irc.connect.
+activity_hints = true
+
 [dcc]
 bind_address = "0.0.0.0"
 # Set this when automatic route discovery is not reachable by DCC peers.

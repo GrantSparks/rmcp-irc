@@ -111,6 +111,12 @@ pub struct ConnectInput {
     /// lossless MOTD inline. The linked MOTD resource is always complete.
     #[serde(default)]
     pub result_detail: ToolResultDetail,
+    /// How this agent's later tool results should carry the bounded activity
+    /// hint: `{"enabled": true, "inline_mentions": 0}` by default. The
+    /// preference is fixed here, for this agent, because a hint that any call
+    /// could reshape would make results depend on the order they were made in.
+    #[serde(default)]
+    pub activity: crate::mcp::activity::ActivityPreference,
 }
 
 impl ConnectInput {
@@ -1353,6 +1359,15 @@ pub struct EventsReadInput {
     /// nickname. The agent's own echoed messages never qualify. Set false to
     /// return only everything else; omit for both.
     pub mentions_me: Option<bool>,
+    /// Set true to record this read's `next_cursor` as the position later
+    /// activity hints count from. This is the only thing in the whole server
+    /// that moves that anchor — no tool result, resource read, or notification
+    /// ever does — so a caller that reads without it keeps counting from
+    /// wherever it last said it had caught up. It changes no delivery state:
+    /// this read returns the same events either way, and the cursor you persist
+    /// is still your own.
+    #[serde(default)]
+    pub set_activity_anchor: bool,
 }
 
 impl EventsReadInput {
@@ -1467,23 +1482,6 @@ impl DccAcceptInput {
     }
 }
 
-/// Structured refusal when a destination choice is missing and cannot be asked
-/// for, because the calling request declared no way to answer.
-#[derive(Clone, Debug, JsonSchema, Serialize)]
-pub struct DccReceiveRootsOutput {
-    /// Stable machine-readable category.
-    pub kind: String,
-    /// Safe human-readable explanation.
-    pub message: String,
-    /// Whether retrying after external state changes is normally safe.
-    pub retriable: bool,
-    /// Configured root names, in declaration order, one of which the retry must
-    /// name in `root`.
-    pub receive_roots: Vec<String>,
-    /// Destination the retry gets if it names a root and nothing else.
-    pub default_destination_path: Option<PathBuf>,
-}
-
 /// Identify one existing DCC session.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1529,17 +1527,6 @@ pub struct DccChatSendOutput {
 pub struct DccListOutput {
     /// Matching snapshots in deterministic handle order.
     pub sessions: Vec<DccSession>,
-}
-
-/// Structured MCP tool error.
-#[derive(Clone, Debug, JsonSchema, Serialize)]
-pub struct ToolErrorOutput {
-    /// Stable machine-readable category.
-    pub kind: String,
-    /// Safe human-readable explanation.
-    pub message: String,
-    /// Whether retrying after external state changes is normally safe.
-    pub retriable: bool,
 }
 
 /// Event page returned by `irc.events.read`.

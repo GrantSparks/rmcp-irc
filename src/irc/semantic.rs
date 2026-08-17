@@ -345,6 +345,35 @@ impl SemanticEvent {
             Self::ProtocolUnknown { .. } => SemanticClass::ProtocolUnknown,
         }
     }
+
+    /// Who the wire attributed this to, when it attributed it to anybody.
+    ///
+    /// Server-generated records — numerics, the MOTD, capability negotiation,
+    /// and this gateway's own lifecycle notes — have no speaker, which is
+    /// exactly the distinction a caller needs to tell somebody talking from the
+    /// protocol working.
+    pub const fn source(&self) -> Option<&Source> {
+        match self {
+            Self::MessageChannel { source, .. }
+            | Self::MessagePrivate { source, .. }
+            | Self::MessageAction { source, .. }
+            | Self::MessageNotice { source, .. }
+            | Self::MessageTagged { source, .. }
+            | Self::MessageReaction { source, .. }
+            | Self::MessageRedaction { source, .. }
+            | Self::Typing { source, .. }
+            | Self::Ctcp { source, .. }
+            | Self::Membership { source, .. }
+            | Self::Presence { source, .. }
+            | Self::ChannelState { source, .. } => Some(source),
+            Self::ReadMarker { .. }
+            | Self::ProtocolReply { .. }
+            | Self::ServerMotd { .. }
+            | Self::ProtocolCompatibility { .. }
+            | Self::ConnectionLifecycle { .. }
+            | Self::ProtocolUnknown { .. } => None,
+        }
+    }
 }
 
 /// Semantic projection paired with the class its consumers filter on.

@@ -55,7 +55,10 @@ use crate::{
         target::ChannelName,
         wire::{LineBudget, OutboundMessage, WireMessage},
     },
-    mcp::{resources::ResourceUris, watch::WatchRegistry},
+    mcp::{
+        resources::ResourceUris,
+        watch::{WatchFilter, WatchRegistry},
+    },
     time::Timestamp,
 };
 
@@ -63,10 +66,10 @@ use super::{
     AgentId,
     connection::{BoxedIrcStream, connect},
     journal::{
-        ConnectionEvent, CorrelationRole, CursorQuery, DccChatMessage, DccFailure, EventClass,
-        EventCorrelation, EventCursor, EventDirection, EventOrigin, EventPage, EventPayload,
-        EventVerbosity, IrcEvent, JournalStats, MalformedLine, NewEvent, RecentQuery,
-        addresses_nickname,
+        ActivityQuery, ActivityTally, ConnectionEvent, CorrelationRole, CursorQuery,
+        DccChatMessage, DccFailure, EventClass, EventCorrelation, EventCursor, EventDirection,
+        EventOrigin, EventPage, EventPayload, EventVerbosity, IrcEvent, JournalStats,
+        MalformedLine, NewEvent, RecentQuery, addresses_nickname,
     },
     reconnect::ReconnectBackoff,
     state::{
@@ -277,6 +280,12 @@ enum AgentCommand {
         query: RecentQuery,
         completion: oneshot::Sender<Vec<IrcEvent>>,
     },
+    TallyActivity {
+        cursor: Option<EventCursor>,
+        filters: Vec<WatchFilter>,
+        inline_mentions: usize,
+        completion: oneshot::Sender<ActivityTally>,
+    },
     Snapshot {
         completion: oneshot::Sender<AgentSnapshot>,
     },
@@ -439,6 +448,31 @@ impl AgentHandle {
         self.send(AgentCommand::ReadRecent {
             limit,
             query,
+            completion,
+        })
+        .await?;
+        result
+            .await
+            .map_err(|_| GatewayError::ActorStopped(self.id.clone()))
+    }
+
+    /// Count what a set of watch selections retained after a cursor.
+    ///
+    /// Answered by the actor rather than assembled from a snapshot plus a read,
+    /// because the selections have to be folded with the server's advertised
+    /// `CASEMAPPING` and the actor is where that lives — and because a hint
+    /// attached to every tool result must cost one round trip, not two.
+    pub async fn tally_activity(
+        &self,
+        cursor: Option<EventCursor>,
+        filters: Vec<WatchFilter>,
+        inline_mentions: usize,
+    ) -> Result<ActivityTally> {
+        let (completion, result) = oneshot::channel();
+        self.send(AgentCommand::TallyActivity {
+            cursor,
+            filters,
+            inline_mentions,
             completion,
         })
         .await?;
@@ -1199,6 +1233,18 @@ impl AgentActor {
             } => {
                 let _ = completion.send(self.journal.read_latest(limit, &query));
             }
+            AgentCommand::TallyActivity {
+                cursor,
+                filters,
+                inline_mentions,
+                completion,
+            } => {
+                let _ = completion.send(self.tally_activity(
+                    cursor.as_ref(),
+                    &filters,
+                    inline_mentions,
+                ));
+            }
             AgentCommand::Snapshot { completion } => {
                 let _ = completion.send(self.snapshot());
             }
@@ -1447,6 +1493,44 @@ impl AgentActor {
         }
     }
 
+    /// Count what this agent's watches selected after a caller-owned cursor.
+    ///
+    /// Takes `&self`: unlike every read above it, this parks nothing, moves
+    /// nothing, and cannot fail — which is the whole contract of an activity
+    /// hint. The watch selections are folded here rather than by the caller
+    /// because the server's advertised `CASEMAPPING` lives in this actor, so a
+    /// hint's target keys agree with the watch's own matching by construction.
+    fn tally_activity(
+        &self,
+        cursor: Option<&EventCursor>,
+        filters: &[WatchFilter],
+        inline_mentions: usize,
+    ) -> ActivityTally {
+        let case_mapping = self.isupport.case_mapping();
+        let query = ActivityQuery {
+            selections: filters
+                .iter()
+                .map(|filter| {
+                    let mut selection = filter.cursor_query(case_mapping);
+                    // Counts describe a conversation, so protocol bookkeeping a
+                    // reader would never see is not unread anything.
+                    selection.conversational_only = true;
+                    selection
+                })
+                .collect(),
+            case_mapping,
+            folded_nickname: self
+                .state
+                .borrow()
+                .identity
+                .nickname
+                .as_ref()
+                .map(|nickname| case_mapping.fold(nickname)),
+            inline_mentions,
+        };
+        self.journal.tally_after(cursor, &query)
+    }
+
     fn flush_event_reads(&mut self, include_expired: bool) {
         let now = Instant::now();
         let mut pending = Vec::with_capacity(self.pending_event_reads.len());
@@ -1572,6 +1656,11 @@ impl AgentActor {
                     }
                     AgentCommand::ReadRecent { limit, query, completion } => {
                         let _ = completion.send(self.journal.read_latest(limit, &query));
+                    }
+                    AgentCommand::TallyActivity { cursor, filters, inline_mentions, completion } => {
+                        let _ = completion.send(
+                            self.tally_activity(cursor.as_ref(), &filters, inline_mentions),
+                        );
                     }
                     AgentCommand::Snapshot { completion } => {
                         let _ = completion.send(self.snapshot());

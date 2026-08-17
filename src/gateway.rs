@@ -32,6 +32,7 @@ use crate::{
         wire::OutboundMessage,
     },
     mcp::{
+        activity::{ActivityHint, ActivityPreference},
         authorization::{OwnerId, not_authorized},
         conversation::CompactEvent,
         mrtr::RequestStateSealer,
@@ -59,6 +60,8 @@ pub struct ConnectRequest {
     pub real_name: Option<String>,
     /// Additional initial channels.
     pub channels: BTreeSet<ChannelName>,
+    /// How this agent's tool results should carry activity hints.
+    pub activity: ActivityPreference,
 }
 
 /// Which conversational window a resource read wants.
@@ -93,11 +96,19 @@ pub struct WatchCreation {
     pub latest_cursor: EventCursor,
 }
 
-/// One published agent and the caller identity that created it.
+/// One published agent, the caller identity that created it, and the two pieces
+/// of activity-hint state that belong to that caller rather than to the stream.
 #[derive(Clone, Debug)]
 struct OwnedAgent {
     owner: OwnerId,
     handle: AgentHandle,
+    /// How this caller asked for its hints, fixed at registration.
+    activity: ActivityPreference,
+    /// The position hint counts are measured from. Born as the stream's
+    /// position at registration and moved by exactly one thing: an
+    /// `irc.events.read` that passed `set_activity_anchor`. It is not a
+    /// delivery cursor and nothing reads through it.
+    activity_anchor: EventCursor,
 }
 
 /// Shared in-memory gateway for all MCP transports.
@@ -208,6 +219,7 @@ impl Gateway {
     ) -> Result<ConnectedAgent> {
         validate_identity_field(request.username.as_deref(), "username", false)?;
         validate_identity_field(request.real_name.as_deref(), "real name", true)?;
+        let activity = request.activity;
         let permit = self
             .capacity
             .clone()
@@ -251,10 +263,19 @@ impl Gateway {
         let receipt = ready
             .await
             .map_err(|_| GatewayError::ActorStopped(agent_id.clone()))??;
-        self.agents
-            .write()
-            .await
-            .insert(agent_id.clone(), OwnedAgent { owner, handle });
+        // The anchor is born here, at the position registration left behind, so
+        // the first hint this caller sees counts what arrived after it
+        // connected rather than the MOTD it has already been shown.
+        let activity_anchor = handle.snapshot().await?.journal.latest;
+        self.agents.write().await.insert(
+            agent_id.clone(),
+            OwnedAgent {
+                owner,
+                handle,
+                activity,
+                activity_anchor,
+            },
+        );
         let _ = self.resource_updates.send("irc://agents".into());
         Ok(ConnectedAgent {
             agent_id,
@@ -354,6 +375,52 @@ impl Gateway {
             journal: snapshot.journal,
             line_budget: snapshot.line_budget,
         })
+    }
+
+    /// Measure one agent's unread activity against its caller's anchor.
+    ///
+    /// Pure, and deliberately so. It reads the watch registry without touching
+    /// any handle's time to live, tallies the journal without moving any
+    /// position, and returns `None` — never an error — for every reason a hint
+    /// might not exist: the deployment turned hints off, this caller turned them
+    /// off for this agent, the handle is gone, or the actor stopped. A hint is a
+    /// courtesy attached to somebody else's result, so nothing about failing to
+    /// produce one may change that result.
+    pub async fn activity_hint(&self, agent_id: &AgentId) -> Option<ActivityHint> {
+        if !self.config.mcp.activity_hints {
+            return None;
+        }
+        let (handle, preference, anchor) = {
+            let agents = self.agents.read().await;
+            let agent = agents.get(agent_id)?;
+            (
+                agent.handle.clone(),
+                agent.activity,
+                agent.activity_anchor.clone(),
+            )
+        };
+        if !preference.enabled {
+            return None;
+        }
+        let filters = self.watches.filters_for(agent_id);
+        let watches = filters.len();
+        let tally = handle
+            .tally_activity(Some(anchor.clone()), filters, preference.inline_mentions)
+            .await
+            .ok()?;
+        Some(ActivityHint::from_tally(anchor, watches, tally))
+    }
+
+    /// Record where this caller says it has read to.
+    ///
+    /// The only writer of the anchor in the whole gateway. Everything else that
+    /// looks like progress — a tool result, a resource read, a notification, a
+    /// watch window — leaves it exactly where the caller put it, which is what
+    /// makes two identical calls produce two identical hints.
+    pub async fn set_activity_anchor(&self, agent_id: &AgentId, cursor: EventCursor) {
+        if let Some(agent) = self.agents.write().await.get_mut(agent_id) {
+            agent.activity_anchor = cursor;
+        }
     }
 
     /// Register a watch over one agent's stream.

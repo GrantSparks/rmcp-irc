@@ -430,7 +430,7 @@ impl Default for ReconnectConfig {
 }
 
 /// Policy for how the MCP surface behaves, independently of IRC.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpConfig {
     /// Require an explicit human confirmation before `irc.kick` or
@@ -443,6 +443,26 @@ pub struct McpConfig {
     /// request declared no way to answer: silently proceeding would defeat the
     /// only reason the setting exists.
     pub confirm_destructive: bool,
+    /// Attach the bounded activity hint to successful tool results that name an
+    /// agent.
+    ///
+    /// On by default: for a host that does not subscribe, or subscribes without
+    /// starting a model turn, this is the only way news reaches the model
+    /// without it spending a whole turn on a long poll. The hint costs a few
+    /// hundred tokens at its worst and moves nothing, so the reason to turn it
+    /// off is a deployment that has decided its own delivery loop is enough —
+    /// never the mere presence of a subscription, which proves a host can be
+    /// woken and nothing about whether it will think.
+    pub activity_hints: bool,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            confirm_destructive: false,
+            activity_hints: true,
+        }
+    }
 }
 
 /// Bounded resources owned by the process or one agent actor.

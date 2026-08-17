@@ -16,11 +16,16 @@ connection is never an IRC identity.
   `irc.connect`. It is not an authentication credential. On shared HTTP it is
   usable only by the caller owner that created it.
 - Every operation after `irc.connect` carries `agent_id`, in both transports.
-- All successful tools return concise `TextContent` plus schema-valid
-  `structuredContent`. The structured result is authoritative. Tools that
-  expose a follow-up resource append native MCP `resource_link` content blocks
-  after the text summary; clients do not need to rediscover or reinterpret a
-  URI string before attaching or subscribing to it.
+- Every complete tool result returns concise `TextContent` plus schema-valid
+  `structuredContent`, in the shared two-branch envelope described under
+  [Errors and command outcomes](#errors-and-command-outcomes): `ok: true` with
+  the tool's own output under `result`, or `ok: false` with the shared failure
+  under `error`. The structured result is authoritative, and every tool's
+  advertised `outputSchema` is a `oneOf` over exactly those two branches, so a
+  failure is as conformant as a success. Tools that expose a follow-up resource
+  append native MCP `resource_link` content blocks after the text summary;
+  clients do not need to rediscover or reinterpret a URI string before
+  attaching or subscribing to it.
 - `irc.connect`, `irc.status`, and `irc.history` default `result_detail` to
   `compact` so equivalent presentation, parsed-wire, and semantic data is not
   repeated in one response. Callers that need the legacy inline forms can set
@@ -57,14 +62,52 @@ authoritative for IRC accounts, channel privileges, and command policy.
 
 ## Errors and command outcomes
 
-Malformed JSON-RPC, an unknown MCP method/tool, or input that does not satisfy
-the advertised JSON Schema is an MCP/JSON-RPC error. Once a valid tool call has
-started, failures return `isError: true`. Gateway failures use the structured
-tool-error envelope below; correlated IRC failures use the common command
-result so their raw replies remain available.
+Malformed JSON-RPC or an unknown MCP method/tool is an MCP/JSON-RPC error.
+Everything that reaches a tool — including arguments the advertised input schema
+rejects — is answered in band, as a result with `isError: true`.
 
-The structured tool-error envelope contains `kind`, safe `message`, and
-`retriable`. Its kinds are:
+Every complete tool result travels in one envelope, and every tool's
+`outputSchema` is a `oneOf` over its two branches:
+
+```json
+{
+  "ok": true,
+  "result": { "…": "the tool's own output" },
+  "activity": { "…": "optional; see Activity hints" }
+}
+```
+
+```json
+{
+  "ok": false,
+  "error": {
+    "kind": "not_connected",
+    "message": "agent is not connected: agent-550e8400-…",
+    "retriable": true
+  }
+}
+```
+
+`ok` is the discriminator and always agrees with `isError`: `ok: false` is
+exactly `isError: true`, and neither branch ever carries the other's field. Both
+branches are closed objects, so an unexpected key is a schema violation rather
+than something a permissive client waves through. MCP `2026-07-28` requires a
+declared `outputSchema` to describe what the tool actually returns, which is why
+the failure shape is part of every tool's schema rather than an undocumented
+alternative to it.
+
+The failure branch carries `kind`, a safe `message` identical to the text
+summary, and `retriable`. Two structured extras appear only where the refusal
+has something to add:
+
+- `command_result` — the complete correlated IRC exchange behind a rejected or
+  unacknowledged command, replies and warnings intact, so the numeric that
+  refused it stays readable;
+- `receive_roots` and `default_destination_path` — the configured DCC receive
+  roots a retried `irc.dcc.accept` must choose between, and the destination it
+  gets if it names a root and nothing else.
+
+The kinds are:
 
 | Kind | Meaning | Default retry guidance |
 | --- | --- | --- |
@@ -81,12 +124,16 @@ The structured tool-error envelope contains `kind`, safe `message`, and
 | `actor_stopped` | The owning actor terminated before replying. | Reconnect a new agent. |
 | `declined` | A question this call asked was declined or cancelled. Nothing was applied. | Call again and answer it. |
 | `confirmation_required` | `mcp.confirm_destructive` is enabled and the mutation was not confirmed, could not be asked about, or presented an unusable `requestState`. Nothing was applied. | Answer the confirmation, or declare form elicitation. |
+| `rejected` | An IRC command the server definitively refused. `command_result` carries the refusing numeric. | Retry only after changing input. |
+| `not_written` | An IRC command that never reached the socket. | Retry after reconnect. |
+| `internal_error` | This gateway computed a result it could not serialize. | Not retriable; report it. |
 
-`not_written`, `sent_unconfirmed`, `rejected`, `timed_out`, and `indeterminate`
-are command outcomes, not error-envelope kinds. A rejected or timed-out
-command result has `isError: true` and retains collected replies.
-`stream_reset` and `event_gap` are successful event-page statuses carrying
-current bounds.
+`rejected`, `timed_out`, `not_written`, and `indeterminate` are both command
+outcomes and failure kinds: a command that ends in one of them is reported on the
+failure branch, with its `kind` naming the outcome and its `command_result`
+carrying the whole exchange. `completed` and `sent_unconfirmed` are successes and
+appear on the success branch, inside the tool's own output. `stream_reset` and
+`event_gap` are successful event-page statuses carrying current bounds.
 
 This gateway declares no MCP logging capability and emits no
 `notifications/message`. Logging was deprecated in MCP `2026-07-28` by
@@ -105,7 +152,9 @@ to support here. Operational facts are split instead:
 Arbitrary IRC `NOTICE` traffic is neither: it is ordinary IRC traffic and
 appears as a `message.notice` event.
 
-Commands that await IRC completion use this common result envelope:
+Commands that await IRC completion carry this common exchange record — under
+`result` when the command completed, and under `error.command_result` when it did
+not:
 
 ```json
 {
@@ -128,9 +177,10 @@ Commands that await IRC completion use this common result envelope:
 ```
 
 `outcome` is one of `completed`, `sent_unconfirmed`, `rejected`, `timed_out`,
-`not_written`, or `indeterminate`. A result may add tool-specific fields. `WARN` and `NOTE`
-appear in `warnings`; `FAIL` and known error numerics produce `isError: true`
-while retaining their raw replies.
+`not_written`, or `indeterminate`. A successful tool's own output may add
+tool-specific fields alongside it. `WARN` and `NOTE` appear in `warnings`; `FAIL`
+and known error numerics produce `isError: true` — the failure branch, with this
+record under `error.command_result` and its raw replies intact.
 
 `irc.join`, `irc.part`, `irc.send`, `irc.query`, and `irc.execute` accept
 `result_detail`. It defaults to `full` for backward compatibility. Explicit
@@ -138,12 +188,102 @@ while retaining their raw replies.
 but sets its third, derived `semantic_result` representation to `null`. This
 control does not alter command outcome or acknowledgment metadata.
 
-The URI fields retained in `structuredContent` are backward-compatible routing
-data. In MCP `content`, `irc.connect` and `irc.status` link all current agent
-resources, `irc.join` and typed channel mutations link the affected channel,
-`irc.history` links the event stream and a channel snapshot when applicable,
-and DCC tools link the live DCC-session resource. A resource link describes
-live state; it is not a copy of the snapshot at tool-completion time.
+The URI fields retained inside `result` are backward-compatible routing data. In
+MCP `content`, `irc.connect` and `irc.status` link all current agent resources,
+`irc.join` and typed channel mutations link the affected channel, `irc.history`
+links the event stream and a channel snapshot when applicable, and DCC tools link
+the live DCC-session resource. A resource link describes live state; it is not a
+copy of the snapshot at tool-completion time.
+
+## Activity hints
+
+Notifications reach the *host*. The only channel guaranteed to reach the model's
+context window is the result of an operation the model itself started, so for a
+host that does not subscribe — or subscribes without starting a model turn on a
+notification — the model's real event loop is its own tool-call cadence. An
+activity hint makes that cadence self-refreshing at zero extra round trips:
+`irc.send` to one channel can report, in the same result, that three messages
+arrived in another.
+
+A hint rides the success branch as `activity`:
+
+```json
+{
+  "ok": true,
+  "result": { "…": "the tool's own output" },
+  "activity": {
+    "unread": { "#dev": 3, "#control": 1 },
+    "total": 4,
+    "truncated": false,
+    "watches": 2,
+    "anchor": { "stream_id": "c6a2…", "sequence": 184 },
+    "latest": { "stream_id": "c6a2…", "sequence": 212 },
+    "mentions": []
+  }
+}
+```
+
+### What it counts
+
+`unread` counts records after `anchor`, grouped by target and keyed with the
+server's advertised `CASEMAPPING`, so a watch registered for `#Dev` reports
+traffic the server calls `#dev`. Only what this agent's own watches select is
+counted, and only records with conversational content — protocol bookkeeping a
+reader would never see is not unread anything. The agent's own words never count,
+in either form they take: the outbound record, and the same message arriving back
+on a server with `echo-message`.
+
+`watches` is how many live watches the counts were drawn from. Zero means this
+agent holds none, which is why `unread` is empty: create one with
+`irc.watch.create` to give the counts a selection. Direct messages are keyed by
+the conversation target IRC reports, which for an incoming private message is the
+agent's own nickname — the signal that distinguishes them is `mentions_me`, which
+is what `mentions` inlines and what a `mentions_only` watch selects.
+
+### The anchor
+
+`anchor` is the position the counts are measured from. It is **caller-owned**:
+born at registration, and moved by exactly one thing — an `irc.events.read` that
+passes `set_activity_anchor: true`, which records that read's `next_cursor`.
+Nothing else in the server touches it. No tool result, resource read, watch
+window, or notification advances it, and computing a hint is pure: two identical
+calls over an unchanged stream produce identical counts. `latest` is where the
+stream is now, which is the one field the caller's own traffic does move.
+
+A hint is a mirror, never a read. It moves no watch, no delivery cursor, and no
+journal position, so it can never consume a backlog on somebody's behalf.
+
+### Bounds
+
+| Bound | Value |
+| --- | --- |
+| Entries in `unread` | 8. Beyond that the busiest targets are kept — ties broken by name — and `truncated` is `true`. `total` still counts everything. |
+| Records in `mentions` | `activity.inline_mentions` from `irc.connect`, `0` by default, maximum `3`. A larger value is refused, not clamped. |
+| Text per inlined record | 200 bytes, then clipped with `…`. Read the full record with `irc.events.read`. |
+| Whole hint | roughly 700 characters with counts alone, roughly 1 900 at the maximum inline preference. |
+
+### Which tools carry one
+
+Every tool that names an `agent_id` and succeeds. That is every tool except
+`irc.connect`, whose own call is where the anchor is born, and `irc.watch.close`,
+which names a watch rather than an agent. A task's terminal result is an ordinary
+tool result and carries one too. Failures never do: the failure branch has no
+room for it, and news of a mention does not belong inside a report that something
+went wrong. Ownership is inherited from the per-tool authorization gate, so a hint
+only ever describes an agent the caller already holds.
+
+### Suppression
+
+Explicit only, in exactly two places:
+
+- `[mcp] activity_hints = false` turns hints off for the whole process;
+- `activity: {"enabled": false}` on `irc.connect` turns them off for one agent.
+
+Nothing suppresses a hint implicitly. In particular an active subscription does
+**not**: `subscriptions/listen` proves a host can be woken and proves nothing
+about whether it will schedule a model turn, so deciding that a subscribed client
+needs no hint would silently remove the only delivery path that reaches the
+model.
 
 ## Input round trips
 
@@ -292,6 +432,12 @@ or `tasks/cancel` without declaring the extension is a
 creates no task, whatever the request declared; the task handle appears on the
 retry that settles it. See [Input round trips](#input-round-trips).
 
+**Result shape.** A `CreateTaskResult` is a different `resultType` and is not
+enveloped; neither is an `input_required` interim result. A completed task's
+`result`, however, is an ordinary complete tool result and carries the same
+envelope — and the same [activity hint](#activity-hints) — as the synchronous
+call would have.
+
 **Owner binding.** A task belongs to the caller that created it. `tasks/get`,
 `tasks/update`, and `tasks/cancel` resolve the caller the same way every other
 operation does, and a task belonging to a different owner is refused exactly as
@@ -403,33 +549,42 @@ Because the whole sequence happens inside one call, a request carrying
 `_meta.progressToken` receives a `notifications/progress` for each stage it
 reaches. See [Long-running work](#long-running-work-progress-and-tasks).
 
-Minimum successful result:
+`activity` is an optional per-agent preference block, `{"enabled": true,
+"inline_mentions": 0}` by default, fixed here for the life of the handle. See
+[Activity hints](#activity-hints).
+
+Minimum successful `structuredContent`. This is the one tool whose result never
+carries an `activity` hint, because the anchor those counts are measured from is
+born during this call:
 
 ```json
 {
-  "agent_id": "agent-550e8400-e29b-41d4-a716-446655440000",
-  "nickname": "Athena",
-  "nickname_adjusted": false,
-  "registered": true,
-  "motd": {
-    "status": "received",
-    "lines": [],
-    "text": "...",
-    "wire_replies": [],
-    "source": "initial",
-    "received_at": "2026-08-17T00:00:00Z"
-  },
-  "resources": {
-    "status": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/status",
-    "motd": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/motd",
-    "protocol": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/protocol",
-    "state": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/state",
-    "events": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/events",
-    "inbox": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/inbox",
-    "wire": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/wire",
-    "dcc": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/dcc"
-  },
-  "result_detail": "compact"
+  "ok": true,
+  "result": {
+    "agent_id": "agent-550e8400-e29b-41d4-a716-446655440000",
+    "nickname": "Athena",
+    "nickname_adjusted": false,
+    "registered": true,
+    "motd": {
+      "status": "received",
+      "lines": [],
+      "text": "...",
+      "wire_replies": [],
+      "source": "initial",
+      "received_at": "2026-08-17T00:00:00Z"
+    },
+    "resources": {
+      "status": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/status",
+      "motd": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/motd",
+      "protocol": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/protocol",
+      "state": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/state",
+      "events": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/events",
+      "inbox": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/inbox",
+      "wire": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/wire",
+      "dcc": "irc://agents/agent-550e8400-e29b-41d4-a716-446655440000/dcc"
+    },
+    "result_detail": "compact"
+  }
 }
 ```
 
@@ -788,7 +943,8 @@ Input contains:
 - optional `command_id`, `class`, `target`, `direction`, `origin`,
   `verbosity`, and `mentions_me` filters;
 - `wait_ms`, where zero is non-blocking and a positive value is bounded long
-  polling.
+  polling;
+- `set_activity_anchor`, default false.
 
 `watch_id` and the single-value filters are mutually exclusive. A watch already
 describes a complete selection, including the multi-target and multi-class forms
@@ -806,6 +962,13 @@ same read's selection; it says nothing about records the selection excluded, so
 records, not cursor ownership or journal retention. `limit` defaults to `100` and
 must be between 1 and `limits.max_event_page_size`; `wait_ms` is capped by
 `limits.max_event_wait_ms`. See [EVENTS_AND_STATE.md](EVENTS_AND_STATE.md).
+
+`set_activity_anchor: true` records this read's `next_cursor` as the position
+later [activity hints](#activity-hints) count from. It is the only thing in the
+whole server that moves that anchor, and it changes nothing else: the read
+returns the same events either way, and the cursor you persist is still your own.
+A caller that reads without it keeps counting from wherever it last said it had
+caught up.
 
 Keep one long poll active when prompt event handling matters: pass the last
 consumed `next_cursor`, choose a positive `wait_ms`, and immediately issue the
