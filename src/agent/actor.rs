@@ -23,7 +23,7 @@ use tokio::{
 use tokio_util::{codec::Framed, sync::CancellationToken};
 
 use crate::{
-    config::Config,
+    config::{Config, IrcTransport},
     dcc::{
         chat::{DccChatEvent, DccChatHandle, spawn_chat},
         manager::DccManager,
@@ -102,6 +102,81 @@ pub struct RegistrationReceipt {
     pub nickname_adjusted: bool,
     /// Complete initial MOTD state.
     pub motd: MotdState,
+}
+
+/// One observable stage of an initial connect.
+///
+/// Registering an IRC guest is a sequence of round trips — transport, capability
+/// negotiation, authentication, welcome, MOTD, rejoins — that the caller
+/// experiences as a single opaque wait of up to `onboarding.connect_timeout_ms`.
+/// These are the points at which something verifiable has changed, published so
+/// the tool handling the request can narrate them without knowing anything about
+/// the IRC protocol.
+///
+/// Two properties are deliberate. The steps are *ordinals*, not a count of work
+/// completed, because the sequence is increasing rather than contiguous: a guest
+/// connection never authenticates, and a server may have no MOTD to send.
+/// "Registered" and "autojoin synchronized" are also separate stages — the
+/// server accepting a nickname and the guest being present in its channels are
+/// different facts, and a caller that acts on the first as though it were the
+/// second will address a channel it has not joined.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectMilestone {
+    /// Opening the transport to the configured server.
+    Connecting,
+    /// The transport is up, encrypted or not as configured.
+    TransportReady {
+        /// Whether the transport is TLS rather than plain TCP.
+        encrypted: bool,
+    },
+    /// Capability negotiation settled; nothing further will be requested.
+    CapabilitiesNegotiated,
+    /// The server accepted the configured SASL credential.
+    Authenticated,
+    /// The server issued its welcome for an accepted nickname.
+    Registered,
+    /// The MOTD arrived in full, or the server reported having none.
+    MotdComplete,
+    /// Configured and remembered channels have been rejoined.
+    AutojoinSynchronized,
+}
+
+impl ConnectMilestone {
+    /// How many stages one connect can report.
+    ///
+    /// This is the `total` a progress notification carries, so it counts the
+    /// stages that exist rather than the ones a particular connect reaches.
+    pub const TOTAL: u32 = 7;
+
+    /// Position of this stage in the sequence, counted from one.
+    ///
+    /// One-based so the first report is distinguishable from "nothing has
+    /// happened yet", which zero would not be.
+    pub const fn step(self) -> u32 {
+        match self {
+            Self::Connecting => 1,
+            Self::TransportReady { .. } => 2,
+            Self::CapabilitiesNegotiated => 3,
+            Self::Authenticated => 4,
+            Self::Registered => 5,
+            Self::MotdComplete => 6,
+            Self::AutojoinSynchronized => 7,
+        }
+    }
+
+    /// What reaching this stage means, for a human reading progress.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Connecting => "Opening a connection to the IRC server.",
+            Self::TransportReady { encrypted: true } => "TLS established.",
+            Self::TransportReady { encrypted: false } => "Connected over plain TCP.",
+            Self::CapabilitiesNegotiated => "Capability negotiation complete.",
+            Self::Authenticated => "SASL authentication accepted.",
+            Self::Registered => "Registered with the server.",
+            Self::MotdComplete => "Message of the day received.",
+            Self::AutojoinSynchronized => "Autojoin channels synchronized.",
+        }
+    }
 }
 
 /// Completion strategy selected by the public execute tool.
@@ -254,6 +329,7 @@ impl AgentHandle {
         resource_updates: broadcast::Sender<String>,
         watches: Arc<WatchRegistry>,
         capacity_permit: OwnedSemaphorePermit,
+        milestones: Option<mpsc::Sender<ConnectMilestone>>,
     ) -> (
         Self,
         AgentActor,
@@ -272,6 +348,7 @@ impl AgentHandle {
             commands: command_rx,
             state: state_tx,
             ready: Some(ready_tx),
+            milestones,
             journal: super::journal::EventJournal::new(
                 config.limits.event_count,
                 config.limits.event_bytes,
@@ -554,6 +631,10 @@ pub struct AgentActor {
     commands: mpsc::Receiver<AgentCommand>,
     state: watch::Sender<AgentState>,
     ready: Option<oneshot::Sender<Result<RegistrationReceipt>>>,
+    /// Where to publish initial-connect stages, when the caller asked to see
+    /// them. Dropped once the initial connect settles: a later reconnect has no
+    /// request waiting on it, so it has nobody to narrate to.
+    milestones: Option<mpsc::Sender<ConnectMilestone>>,
     journal: super::journal::EventJournal,
     isupport: IsupportRegistry,
     capabilities: CapabilityNegotiator,
@@ -621,6 +702,7 @@ impl AgentActor {
             }
         };
         self.registration.nickname = receipt.nickname.clone();
+        self.milestones = None;
         if let Some(ready) = self.ready.take() {
             let _ = ready.send(Ok(receipt));
         }
@@ -681,15 +763,32 @@ impl AgentActor {
             ConnectionState::TerminalError,
             Some(connection_failure_detail(&error)),
         );
+        self.milestones = None;
         if let Some(ready) = self.ready.take() {
             let _ = ready.send(Err(error));
         }
         self.finish_shutdown();
     }
 
+    /// Publish one connect stage to whoever is awaiting this registration.
+    ///
+    /// Best effort by construction. The channel is bounded and sized for the
+    /// whole sequence, so nothing is dropped in practice, but progress is
+    /// advisory: a caller that stopped reading must lose notifications rather
+    /// than slow the connection down or fail it.
+    fn reach(&self, milestone: ConnectMilestone) {
+        if let Some(milestones) = &self.milestones {
+            let _ = milestones.try_send(milestone);
+        }
+    }
+
     async fn establish(&mut self, source: MotdSource) -> Result<(IrcFramed, RegistrationReceipt)> {
         self.set_connection_state(ConnectionState::Connecting, None);
+        self.reach(ConnectMilestone::Connecting);
         let stream = connect(&self.config.irc).await?;
+        self.reach(ConnectMilestone::TransportReady {
+            encrypted: matches!(self.config.irc.transport, IrcTransport::Tls),
+        });
         self.reset_connection_protocol();
         let mut framed = Framed::new(
             stream,
@@ -781,6 +880,20 @@ impl AgentActor {
                 true,
                 EventCorrelation::default(),
             );
+            // Both actions mean the capability round has settled: the server has
+            // answered every request, so the only steps left are authenticating
+            // or ending. Reading it here rather than from `is_complete()` keeps
+            // the stage ahead of authentication, which the negotiator folds into
+            // the same completion flag.
+            if matches!(
+                action,
+                CapabilityAction::Authenticate(_) | CapabilityAction::EndNegotiation
+            ) {
+                self.reach(ConnectMilestone::CapabilitiesNegotiated);
+            }
+            if message.numeric() == Some(903) && credentials.sasl.is_some() {
+                self.reach(ConnectMilestone::Authenticated);
+            }
             match action {
                 CapabilityAction::None => {}
                 CapabilityAction::Request(capabilities) => {
@@ -858,6 +971,7 @@ impl AgentActor {
                             attempted_nicknames: attempted.clone(),
                         }
                     })?);
+                    self.reach(ConnectMilestone::Registered);
                 }
                 Some(375 | 372 | 376 | 422) => {
                     if message.numeric() == Some(372) {
@@ -869,10 +983,12 @@ impl AgentActor {
                         motd.status = MotdStatus::Received;
                         motd.text = motd.lines.join("\n");
                         motd.received_at = Some(Timestamp::now());
+                        self.reach(ConnectMilestone::MotdComplete);
                     } else if message.numeric() == Some(422) {
                         motd.status = MotdStatus::NotAvailable;
                         motd.text = message.trailing.clone().unwrap_or_default();
                         motd.received_at = Some(Timestamp::now());
+                        self.reach(ConnectMilestone::MotdComplete);
                     }
                 }
                 Some(numeric @ 400..=599)
@@ -921,6 +1037,11 @@ impl AgentActor {
                 )
                 .await?;
                 self.restore_channels(&mut framed).await?;
+                // Distinct from registration on purpose: the server accepting a
+                // nickname does not put the guest in any channel, and a caller
+                // that treats the two as one will address a channel it has not
+                // joined yet.
+                self.reach(ConnectMilestone::AutojoinSynchronized);
                 if source == MotdSource::Reconnect {
                     self.recover_history(&mut framed).await?;
                 }

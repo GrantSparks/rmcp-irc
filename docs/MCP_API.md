@@ -143,6 +143,93 @@ resources, `irc.join` and typed channel mutations link the affected channel,
 and DCC tools link the live DCC-session resource. A resource link describes
 live state; it is not a copy of the snapshot at tool-completion time.
 
+## Long-running work: progress and tasks
+
+Two distinct mechanisms cover two distinct situations. Progress narrates work
+that stays inside one request; tasks are for work that outlives it. Neither
+substitutes for the other.
+
+### Progress notifications
+
+A request that carries `_meta.progressToken` may receive
+`notifications/progress` on its own response stream while it is being served.
+`progress` strictly increases within one token, `total` is the number of stages
+the operation defines, and nothing is sent after the result. A request without a
+token receives no notifications at all. On Streamable HTTP these travel only on
+the originating request's stream, which ends with that request's result.
+
+Two tools report progress:
+
+| Tool | `total` | Stages |
+| --- | --- | --- |
+| `irc.connect` | 7 | connecting, transport ready (TLS or plain), capabilities negotiated, SASL authenticated, registered, MOTD complete, autojoin synchronized |
+| `irc.history` | 3 | availability checked, playback requested, records collected |
+
+The connect sequence is increasing but not contiguous: a guest connection never
+reports authentication, and a server with no MOTD still reports MOTD complete
+through its `422` reply. **Registered** and **autojoin synchronized** are
+separate stages on purpose — the server accepting a nickname does not put the
+guest in any channel, and a caller that treats the first as the second will
+address a channel it has not joined.
+
+`irc.connect` is deliberately not task-augmented. An initial connect is a single
+attempt bounded by `onboarding.connect_timeout_ms`; the reconnect backoff loop
+exists only after a connection has been established once, so a connect cannot
+outlive its own request and a task handle would replace a usable result with a
+poll for one the caller already has.
+
+### Tasks
+
+This server implements the `io.modelcontextprotocol/tasks` extension and
+advertises it under `capabilities.extensions`.
+
+**Trigger.** Tasks are *server-directed*. The server decides which operations
+become tasks; a client's only say is whether it declared the extension in that
+request's `_meta` client capabilities. There is no per-call opt-in key and no
+client-supplied TTL. `irc.dcc.send` and `irc.dcc.accept` are answered with a
+`CreateTaskResult` when the request declares the extension, and with the
+ordinary synchronous result when it does not. Calling `tasks/get`, `tasks/update`,
+or `tasks/cancel` without declaring the extension is a
+`MissingRequiredClientCapability` error (`-32021`).
+
+**Owner binding.** A task belongs to the caller that created it. `tasks/get`,
+`tasks/update`, and `tasks/cancel` resolve the caller the same way every other
+operation does, and a task belonging to a different owner is refused exactly as
+an unknown task id is — same `-32602` code, same `unknown task: {taskId}`
+message. A task id is otherwise a bearer token, and a distinguishable "not
+yours" would be an oracle for which ids exist.
+
+**Expiry and poll cadence.** `CreateTaskResult` advertises `ttlMs` (300000) and
+`pollIntervalMs` (500). A settled task stays readable for one further TTL window
+so a poller learns the outcome, and is then evicted; after that the id is
+unknown. Polling `tasks/get` at the advertised interval is the delivery
+mechanism: `notifications/tasks` is not delivered.
+
+A task stops *following* its transfer shortly before the TTL and completes with
+the session as it stands, linking the DCC-session resource. It does **not**
+report `failed`: a transfer still running at that point has not failed, and it
+continues in the gateway regardless of whether a task is watching. Transfers
+expected to outlast the window should be followed through
+`irc://agents/{agent_id}/dcc/{dcc_session_id}` and the `dcc.transfer.*` events,
+which have no such horizon.
+
+**Chat accepts.** `irc.dcc.accept` also accepts DCC CHAT offers. A chat has no
+transfer to follow — it is `active` for as long as the conversation lasts — so a
+task for a chat accept completes as soon as the offer is accepted, and its
+result is the session snapshot the synchronous call would have returned. One
+`tasks/get` therefore yields everything needed to use the chat.
+
+**Restart semantics.** Tasks are process-lifetime. Nothing is written to disk,
+because the DCC transfer a task follows does not survive a restart either. After
+a restart every previously issued task id returns the same deterministic
+unknown-task error rather than hanging or reporting a fabricated state. This
+holds even on HTTP with configured bearer credentials, where the owner identity
+itself *is* durable across restarts.
+
+**Cancellation** is cooperative. `tasks/cancel` acknowledges immediately and
+cancels the underlying DCC session; a transfer that had already finished settles
+in its own terminal state rather than as `cancelled`.
+
 ## Identity tools
 
 ### `irc.connect`
@@ -183,8 +270,14 @@ registration failures are terminal. A terminal failure returns the attempted
 candidates and complete server rejection, then destroys the provisional actor.
 
 No usable handle is published until `RPL_WELCOME` and the initial MOTD sequence
-(`375`, zero or more `372`, then `376`) or `ERR_NOMOTD` (`422`) has completed.
-The complete connection operation is bounded by `connect_timeout_ms`.
+(`375`, zero or more `372`, then `376`) or `ERR_NOMOTD` (`422`) has completed,
+and until the requested channels have been joined. The complete connection
+operation is bounded by `connect_timeout_ms`, and it is a single attempt: the
+reconnect backoff loop applies only after a connection has been established.
+
+Because the whole sequence happens inside one call, a request carrying
+`_meta.progressToken` receives a `notifications/progress` for each stage it
+reaches. See [Long-running work](#long-running-work-progress-and-tasks).
 
 Minimum successful result:
 
@@ -337,7 +430,10 @@ server time, and event-playback state events. Ergo's legacy `HISTORY` command
 is an explicitly reported `degraded` fallback. If neither mechanism is
 available, the tool returns `unavailable` rather than implying local history.
 `limit` defaults to `100` and must be positive; `timeout_ms` defaults to
-`10000` and is capped by `limits.max_command_timeout_ms`.
+`10000` and is capped by `limits.max_command_timeout_ms`. A request carrying
+`_meta.progressToken` receives a `notifications/progress` when availability has
+been determined, when the playback request goes out, and when the records have
+been collected.
 
 `result_detail` defaults to `compact`. Because `events` is the authoritative
 history projection, compact successful results retain the command metadata but
@@ -570,12 +666,22 @@ conflict semantics are normative in [DCC.md](DCC.md). Every DCC operation uses
 an explicit `agent_id`; operations on an existing session also use its opaque
 `dcc_session_id`.
 
-`irc.dcc.send` and `irc.dcc.accept` are task-augmented tools. Their default
-calls retain the compatible immediate result after the offer or acceptance is
-written. When the call requests the MCP tasks extension, it returns a task
-handle instead; task status follows session state and byte progress,
-cancellation cooperatively cancels the DCC session, and the terminal result
-contains the final session plus its native resource link.
+`irc.dcc.send` and `irc.dcc.accept` are the two task-augmented tools. A call
+from a client that declared the tasks extension returns a task handle; one that
+did not returns the immediate result after the offer or acceptance is written.
+Task status follows session state and byte progress, cancellation cooperatively
+cancels the DCC session, and the terminal result contains the final session plus
+its native resource link. See
+[Long-running work](#long-running-work-progress-and-tasks) for the trigger,
+owner binding, expiry, and restart semantics.
+
+DCC tools emit no `notifications/progress`. Byte-level progress belongs to task
+status and to `dcc.transfer.progress` events, which remain observable after the
+call returns; a progress notification cannot, because it may only travel on the
+originating request's stream and that stream ends when the tool answers. A
+client that wants live transfer progress therefore declares the tasks extension
+and polls, or subscribes to the DCC-session resource — narrating the few
+milliseconds before the offer is written would tell it nothing it could act on.
 
 ## Resources
 

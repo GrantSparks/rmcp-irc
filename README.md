@@ -34,8 +34,11 @@ connection, state snapshot, and bounded event stream.
 - Reconnection, channel restoration, state resynchronization, and history
   recovery when the server supports it.
 - Bounded in-memory queues, journals, collectors, and DCC sessions.
+- Progress notifications for the calls that block longest — connect reports each
+  registration stage, history reports each phase of a playback.
 - Direct DCC CHAT and streamed DCC SEND, including reverse connections and
-  resume negotiation; file transfers can run as progress-reporting MCP tasks.
+  resume negotiation; file transfers run as MCP tasks for clients that declare
+  the tasks extension, with task handles bound to the caller that created them.
 
 The gateway connects to an existing Ergo server; it does not provision or
 configure one. Ergo remains responsible for accounts, permissions, channel
@@ -189,7 +192,7 @@ does this for its `irc` network alias. HTTP responses are marked
 | Channels and messages | `irc.join`, `irc.part`, `irc.send`, `irc.history`, typed topic/reaction/redaction/read/typing tools |
 | Queries and commands | `irc.query`, `irc.execute` |
 | Events | `irc.watch.create`, `irc.watch.close`, `irc.events.read` |
-| DCC | `irc.dcc.chat.open`, `irc.dcc.chat.send`, `irc.dcc.send`, `irc.dcc.accept`, `irc.dcc.reject`, `irc.dcc.cancel`, `irc.dcc.list`; SEND/accept can run as MCP tasks |
+| DCC | `irc.dcc.chat.open`, `irc.dcc.chat.send`, `irc.dcc.send`, `irc.dcc.accept`, `irc.dcc.reject`, `irc.dcc.cancel`, `irc.dcc.list`; SEND/accept run as MCP tasks for clients declaring the tasks extension |
 
 The stable typed semantic surface additionally includes WHOIS, NAMES, LIST,
 HELP, topic, nickname, away, invite, kick, monitor, and mode tools. Four

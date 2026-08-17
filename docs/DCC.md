@@ -132,14 +132,16 @@ or later I/O failure through session state/events. It streams bytes through the
 configured buffer; the body is never loaded wholly into memory and never
 appears in MCP results, logs, resources, or events.
 
-By default the tool returns after the offer is written with a session snapshot.
-Progress, completion, cancellation, and failure are asynchronous. If the MCP
-call requests the tasks extension, the tool instead returns a task handle;
+For a client that declared no tasks extension the tool returns after the offer
+is written, with a session snapshot; progress, completion, cancellation, and
+failure are then asynchronous. When the request's client capabilities declare
+`io.modelcontextprotocol/tasks`, the server answers with a task handle instead:
 task status follows the transfer's state and byte progress, task cancellation
 cancels the DCC session, and the terminal result contains the final session and
-a native link to `irc://agents/{agent_id}/dcc/{dcc_session_id}`. Successful
-completion requires the negotiated DCC acknowledgment behavior, not merely
-end-of-file on the source read.
+a native link to `irc://agents/{agent_id}/dcc/{dcc_session_id}`. The choice is
+the server's and depends only on that declaration — there is no per-call opt-in
+key. Successful completion requires the negotiated DCC acknowledgment behavior,
+not merely end-of-file on the source read.
 
 ## `irc.dcc.accept`
 
@@ -161,9 +163,9 @@ For CHAT, acceptance establishes the direct connection. For SEND, acceptance
 resolves a relative path beneath `download_directory`, rejects a path whose
 resolved parent escapes that root, and starts a bounded streamed transfer. An
 absolute path is accepted only when it is already below the same root. The
-default result is the updated session snapshot. When the call requests the MCP
-tasks extension, it instead returns a task handle and follows the same
-progress, cancellation, terminal-result, and native-resource-link behavior as
+result is the updated session snapshot; when the request declares the tasks
+extension the server answers with a task handle instead, following the same
+status, cancellation, terminal-result, and native-resource-link behavior as
 task-augmented `irc.dcc.send`.
 
 The destination's parent directory must already exist and be writable by the

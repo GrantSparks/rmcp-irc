@@ -6,14 +6,14 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::{RwLock, Semaphore, broadcast};
+use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 
 use crate::{
     agent::{
         AgentId,
         actor::{
-            AgentHandle, AgentSnapshot, CompletionMode, DccAcceptRequest, DisconnectReceipt,
-            ExecuteRequest, RegistrationRequest,
+            AgentHandle, AgentSnapshot, CompletionMode, ConnectMilestone, DccAcceptRequest,
+            DisconnectReceipt, ExecuteRequest, RegistrationRequest,
         },
         journal::{CursorQuery, EventCursor, EventFilter, EventPage, EventVerbosity, RecentQuery},
     },
@@ -35,6 +35,7 @@ use crate::{
         conversation::CompactEvent,
         mrtr::RequestStateSealer,
         resources::{ConversationResource, WireResource},
+        tasks::TaskLedger,
         watch::{
             WatchDescriptor, WatchEventsResource, WatchFilter, WatchId, WatchLimits, WatchRegistry,
             WatchResource,
@@ -107,6 +108,7 @@ pub struct Gateway {
     resource_updates: broadcast::Sender<String>,
     watches: Arc<WatchRegistry>,
     request_states: RequestStateSealer,
+    tasks: TaskLedger,
 }
 
 impl Gateway {
@@ -126,12 +128,34 @@ impl Gateway {
             resource_updates,
             watches: Arc::new(WatchRegistry::new(watch_limits)),
             request_states: RequestStateSealer::generate(),
+            tasks: TaskLedger::new(),
         }
+    }
+
+    /// Shorten the task retention window.
+    ///
+    /// Expiry is only observable in a test that does not wait out the
+    /// production TTL, and the ledger is constructed here rather than injected
+    /// because nothing outside a test has any business choosing it.
+    #[cfg(test)]
+    pub fn with_task_ttl(mut self, ttl: Duration) -> Self {
+        self.tasks = TaskLedger::with_ttl(ttl);
+        self
     }
 
     /// Shared registry of watch handles.
     pub fn watches(&self) -> &Arc<WatchRegistry> {
         &self.watches
+    }
+
+    /// The one task ledger this process serves.
+    ///
+    /// It lives here for the same reason the request-state key does: Streamable
+    /// HTTP builds a fresh handler for every POST, so a task created while
+    /// answering one request must be found by the `tasks/get` that arrives as
+    /// the next one.
+    pub fn tasks(&self) -> &TaskLedger {
+        &self.tasks
     }
 
     /// Sealer for multi round-trip request state.
@@ -167,15 +191,23 @@ impl Gateway {
     /// Register a guest owned by the local caller.
     #[cfg(test)]
     pub async fn connect(&self, request: ConnectRequest) -> Result<ConnectedAgent> {
-        self.connect_as(OwnerId::local(), request).await
+        self.connect_as(OwnerId::local(), request, None).await
     }
 
     /// Register a guest, publishing its handle only after success and
     /// recording the caller that may use it.
+    ///
+    /// `milestones` receives the stages of this one connect attempt while it is
+    /// still in flight. It exists because registration is a multi-round-trip
+    /// wait that this method resolves in a single `await`: the caller cannot see
+    /// inside it otherwise, and the actor that does has no MCP peer to tell.
+    /// Passing `None` — which every caller that was not asked for progress
+    /// does — leaves the actor with nothing to publish to.
     pub async fn connect_as(
         &self,
         owner: OwnerId,
         request: ConnectRequest,
+        milestones: Option<mpsc::Sender<ConnectMilestone>>,
     ) -> Result<ConnectedAgent> {
         validate_identity_field(request.username.as_deref(), "username", false)?;
         validate_identity_field(request.real_name.as_deref(), "real name", true)?;
@@ -216,6 +248,7 @@ impl Gateway {
             self.resource_updates.clone(),
             self.watches.clone(),
             permit,
+            milestones,
         );
         tokio::spawn(actor.run());
         let receipt = ready

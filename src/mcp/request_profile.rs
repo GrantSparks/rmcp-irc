@@ -77,10 +77,6 @@ impl RequestProfile {
     /// Extensions ride in `clientCapabilities.extensions` as a map of
     /// extension id to a settings object, so presence of the key is the
     /// declaration and an empty object means "supported, no settings".
-    #[allow(
-        dead_code,
-        reason = "the per-request tasks-extension gate that reads this lands separately"
-    )]
     pub fn declares_extension(&self, id: &str) -> bool {
         self.capabilities
             .as_ref()

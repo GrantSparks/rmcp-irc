@@ -25,7 +25,7 @@ use rmcp::{
     },
     prompt, prompt_handler, prompt_router,
     service::{RequestContext, RoleServer, SubscriptionContext},
-    task_manager::{TaskContext, TaskExit, TaskManager, TaskOptions},
+    task_manager::{TaskContext, TaskExit},
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -36,7 +36,7 @@ use crate::{
     MCP_INSTRUCTIONS,
     agent::AgentId,
     agent::{
-        actor::CompletionMode,
+        actor::{CompletionMode, ConnectMilestone},
         journal::{EventClass, EventCursor, EventFilter, EventOrigin},
     },
     dcc::session::{DccSession, DccSessionId},
@@ -49,11 +49,13 @@ use crate::{
     },
     mcp::{
         authorization::{CallerPolicy, OwnerId},
+        progress::ProgressReporter,
         request_profile::RequestProfile,
         resources::{
             AgentResourceUri, ResourceDescriptor, ResourceKind, ResourcePayload, ResourceUris,
             describe as describe_resource, descriptors_for_agent, encode_channel_segment,
         },
+        tasks::TASK_POLL_INTERVAL,
         tools::*,
         watch::{
             WATCH_EVENTS_TEMPLATE, WATCH_INSTRUCTIONS, WATCH_URI_PREFIX, WatchCloseInput,
@@ -102,12 +104,21 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_202
 /// Only the two DCC operations that genuinely outlive their request qualify.
 /// Everything else here completes in one round trip, and wrapping a fast
 /// operation in a task handle would cost the caller a poll for no benefit.
+///
+/// `irc.connect` is deliberately absent. An initial connect is a single attempt
+/// bounded by `onboarding.connect_timeout_ms` — the reconnect backoff loop only
+/// exists after a connection has been established once — so it cannot outlive
+/// its own request, and a task handle would replace a result the caller can use
+/// with a poll for one it already has. Its long wait is narrated with progress
+/// notifications instead.
 const TASK_AUGMENTED_TOOLS: &[&str] = &["irc.dcc.send", "irc.dcc.accept"];
 
-/// How often a running transfer republishes its progress as a task status
-/// message. Slow enough not to churn, fast enough that a stalled transfer is
-/// visible well before its deadline.
-const TASK_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
+/// Status message a task-augmented DCC call starts with, before its session
+/// exists to describe.
+const TASK_INITIAL_STATUS: &str = "Negotiating the direct connection.";
+
+/// The steps `irc.history` reports, for the `total` its progress carries.
+const HISTORY_PROGRESS_TOTAL: u32 = 3;
 
 /// MCP request handler backed by a shared gateway.
 #[derive(Clone)]
@@ -116,18 +127,17 @@ pub struct IrcMcpService {
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
     typing_deadlines: Arc<Mutex<BTreeMap<(crate::agent::AgentId, String), Instant>>>,
-    tasks: TaskManager,
     callers: CallerPolicy,
 }
 
 impl std::fmt::Debug for IrcMcpService {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The task manager holds running futures rather than inspectable data,
+        // The task ledger holds running futures rather than inspectable data,
         // so the count is the only part of it worth printing.
         formatter
             .debug_struct("IrcMcpService")
             .field("gateway", &self.gateway)
-            .field("running_tasks", &self.tasks.running_task_count())
+            .field("running_tasks", &self.gateway.tasks().running_task_count())
             .finish_non_exhaustive()
     }
 }
@@ -148,7 +158,6 @@ impl IrcMcpService {
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             typing_deadlines: Arc::new(Mutex::new(BTreeMap::new())),
-            tasks: TaskManager::new(),
             callers,
         }
     }
@@ -315,33 +324,38 @@ impl IrcMcpService {
             Ok(request) => request,
             Err(error) => return Ok(tool_error(error)),
         };
-        Ok(match self.gateway.connect_as(owner, request).await {
-            Ok(connected) => {
-                let output = ConnectOutput {
-                    resources: ResourceUris::for_agent(&connected.agent_id),
-                    agent_id: connected.agent_id,
-                    nickname: connected.nickname.clone(),
-                    nickname_adjusted: connected.nickname_adjusted,
-                    registered: true,
-                    motd: motd_for_tool_result(connected.motd, result_detail),
-                    result_detail,
-                };
-                let summary = if output.motd.text.is_empty() {
-                    format!(
-                        "Connected {} as {}. The server has no MOTD.",
-                        output.agent_id, output.nickname
-                    )
-                } else {
-                    format!(
-                        "Connected {} as {}. Server MOTD:\n{}",
-                        output.agent_id, output.nickname, output.motd.text
-                    )
-                };
-                let content = agent_resource_links(&output.resources);
-                tool_success_with_content(summary, &output, content)
-            }
-            Err(error) => tool_error(error),
-        })
+        Ok(
+            match self
+                .connect_reporting_progress(owner, request, &context)
+                .await
+            {
+                Ok(connected) => {
+                    let output = ConnectOutput {
+                        resources: ResourceUris::for_agent(&connected.agent_id),
+                        agent_id: connected.agent_id,
+                        nickname: connected.nickname.clone(),
+                        nickname_adjusted: connected.nickname_adjusted,
+                        registered: true,
+                        motd: motd_for_tool_result(connected.motd, result_detail),
+                        result_detail,
+                    };
+                    let summary = if output.motd.text.is_empty() {
+                        format!(
+                            "Connected {} as {}. The server has no MOTD.",
+                            output.agent_id, output.nickname
+                        )
+                    } else {
+                        format!(
+                            "Connected {} as {}. Server MOTD:\n{}",
+                            output.agent_id, output.nickname, output.motd.text
+                        )
+                    };
+                    let content = agent_resource_links(&output.resources);
+                    tool_success_with_content(summary, &output, content)
+                }
+                Err(error) => tool_error(error),
+            },
+        )
     }
 
     /// Disconnect and destroy one actor and all of its direct sessions.
@@ -625,10 +639,15 @@ impl IrcMcpService {
             open_world_hint = true
         )
     )]
-    async fn irc_history(&self, Parameters(input): Parameters<HistoryInput>) -> CallToolResult {
+    async fn irc_history(
+        &self,
+        Parameters(input): Parameters<HistoryInput>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
         let agent_id = input.agent_id.clone();
         let channel = input.target.channel().cloned();
-        match self.history(input).await {
+        let mut progress = ProgressReporter::new(&context, HISTORY_PROGRESS_TOTAL);
+        match self.history(input, &mut progress).await {
             Ok(output) => {
                 let outcome = output.result.as_ref().map(|result| result.outcome);
                 let failure = outcome.filter(|outcome| is_failure_outcome(*outcome));
@@ -1804,8 +1823,9 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.send",
         description = "Offer and stream one local file through ordinary or reverse DCC SEND. \
-                       Request the tasks extension on the call to follow the transfer as a task \
-                       with progress and cancellation instead of returning once the offer is \
+                       A client that declares the tasks extension in its request capabilities \
+                       receives a task handle that follows the transfer to completion, with \
+                       status and cancellation, instead of a result returned once the offer is \
                        written.",
         output_schema = schema_for_output::<DccSessionOutput>(),
         annotations(
@@ -1836,9 +1856,10 @@ impl IrcMcpService {
     #[tool(
         name = "irc.dcc.accept",
         description = "Accept one incoming DCC CHAT or SEND offer with explicit file conflict \
-                       behavior. Request the tasks extension on the call to follow the transfer \
-                       as a task with progress and cancellation instead of returning once the \
-                       acceptance is written.",
+                       behavior. A client that declares the tasks extension in its request \
+                       capabilities receives a task handle that follows the transfer to \
+                       completion, with status and cancellation, instead of a result returned \
+                       once the acceptance is written.",
         output_schema = schema_for_output::<DccSessionOutput>(),
         annotations(
             title = "Accept direct offer",
@@ -2030,7 +2051,21 @@ impl IrcMcpService {
         })
     }
 
-    async fn history(&self, input: HistoryInput) -> Result<HistoryOutput, GatewayError> {
+    /// Read history, reporting the phases a caller cannot otherwise see.
+    ///
+    /// The playback request is one correlated command bounded by the caller's
+    /// own `timeout_ms`, which is where the whole latency of this tool lives, so
+    /// the useful reports are that the request went out and how much came back.
+    /// Finer granularity is not available without restructuring correlation: a
+    /// CHATHISTORY request produces exactly one batch, and per-record ticks
+    /// would need a channel threaded through the command path that every one of
+    /// this server's tools shares — for a signal no client can act on.
+    async fn history(
+        &self,
+        input: HistoryInput,
+        progress: &mut Option<ProgressReporter>,
+    ) -> Result<HistoryOutput, GatewayError> {
+        crate::mcp::progress::report(progress, 1, "Checking history availability.").await;
         let snapshot = self.gateway.snapshot(&input.agent_id).await?;
         let native = capability_active(&snapshot, "chathistory");
         let legacy = snapshot.protocol.commands.contains_key("HISTORY");
@@ -2056,6 +2091,7 @@ impl IrcMcpService {
             });
         };
         let before = snapshot.journal.latest;
+        crate::mcp::progress::report(progress, 2, "Requesting playback from the server.").await;
         let result = self
             .execute(
                 &input.agent_id,
@@ -2092,6 +2128,12 @@ impl IrcMcpService {
             });
         }
         events.truncate(input.limit);
+        crate::mcp::progress::report(
+            progress,
+            HISTORY_PROGRESS_TOTAL,
+            format!("Collected {} history records.", events.len()),
+        )
+        .await;
         let failure = is_failure_outcome(result.outcome);
         let result_detail = if failure {
             ToolResultDetail::Full
@@ -2146,8 +2188,8 @@ impl ServerHandler for IrcMcpService {
         std::borrow::Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
-    /// Route one tool call, running the long DCC operations as MCP tasks when
-    /// the caller asked for that and can follow one.
+    /// Route one tool call, running the long DCC operations as MCP tasks for a
+    /// caller that can follow one.
     ///
     /// A DCC transfer already has gateway-side session state, progress, and
     /// cancellation; without this the originating tool completed as soon as the
@@ -2165,45 +2207,59 @@ impl ServerHandler for IrcMcpService {
         let owner = self.callers.identify(&context)?;
         self.authorize_handles(&owner, &request).await?;
 
-        if TASK_AUGMENTED_TOOLS.contains(&request.name.as_ref())
-            && let Some(options) = requested_task_options(&request)
-        {
+        if runs_as_task(&request.name, &RequestProfile::from_context(&context)) {
             let service = self.clone();
             let context = context.clone();
-            let task = self.tasks.spawn(options, move |task_context| {
-                Box::pin(async move { service.run_dcc_task(request, context, task_context).await })
-            });
+            let task =
+                self.gateway
+                    .tasks()
+                    .spawn(owner, TASK_INITIAL_STATUS, move |task_context| {
+                        Box::pin(async move {
+                            service.run_dcc_task(request, context, task_context).await
+                        })
+                    });
             return Ok(CreateTaskResult::new(task).into());
         }
         let call = ToolCallContext::new(self, request, context);
         self.tool_router.call(call).await
     }
 
+    /// Report one task's state to the caller that created it.
+    ///
+    /// The owner check is what makes a task id safe to hand out: it is a bearer
+    /// token otherwise, and any caller who learned one could read a transfer it
+    /// never started. A task belonging to somebody else is refused exactly as a
+    /// task that never existed.
     async fn get_task(
         &self,
         request: GetTaskParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
-        self.tasks
-            .get_task(&request.task_id)
+        let owner = self.callers.identify(&context)?;
+        self.gateway
+            .tasks()
+            .get(&owner, &request.task_id)
             .map(GetTaskResult::new)
     }
 
     async fn update_task(
         &self,
         request: UpdateTaskParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        self.tasks
-            .update_task(&request.task_id, request.input_responses)
+        let owner = self.callers.identify(&context)?;
+        self.gateway
+            .tasks()
+            .update(&owner, &request.task_id, request.input_responses)
     }
 
     async fn cancel_task(
         &self,
         request: CancelTaskParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        self.tasks.cancel_task(&request.task_id)
+        let owner = self.callers.identify(&context)?;
+        self.gateway.tasks().cancel(&owner, &request.task_id)
     }
 
     /// List agent resources one bounded page at a time.
@@ -2631,6 +2687,49 @@ impl IrcMcpService {
         Ok(())
     }
 
+    /// Connect one guest, narrating the wait to a caller that asked to see it.
+    ///
+    /// Registration is the longest blocking call this server has: transport
+    /// setup, capability negotiation, optional authentication, nickname
+    /// arbitration and a full MOTD, all inside one `await` bounded by
+    /// `onboarding.connect_timeout_ms`. Without this the caller sees a single
+    /// opaque pause and cannot distinguish a slow server from a hung one.
+    ///
+    /// The stages come from the actor, which is the only thing that observes
+    /// them and has no MCP peer of its own, so they arrive over a bounded
+    /// channel that is drained here alongside the connect itself. A caller that
+    /// supplied no progress token creates no channel at all, and the actor then
+    /// has nothing to publish to — the silent path costs one `Option` check.
+    async fn connect_reporting_progress(
+        &self,
+        owner: OwnerId,
+        request: ConnectRequest,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<crate::gateway::ConnectedAgent, GatewayError> {
+        let Some(mut reporter) = ProgressReporter::new(context, ConnectMilestone::TOTAL) else {
+            return self.gateway.connect_as(owner, request, None).await;
+        };
+        // Sized for the whole sequence, so a stage is never dropped for want of
+        // room while this loop is between iterations.
+        let (milestones, mut reached) =
+            tokio::sync::mpsc::channel(ConnectMilestone::TOTAL as usize);
+        let connect = self.gateway.connect_as(owner, request, Some(milestones));
+        tokio::pin!(connect);
+        loop {
+            tokio::select! {
+                // Biased so a stage that arrived before the connect resolved is
+                // reported rather than raced away by the result.
+                biased;
+                Some(milestone) = reached.recv() => {
+                    reporter.report(milestone.step(), milestone.describe()).await;
+                }
+                // Progress stops here: the request is over, and on Streamable
+                // HTTP its notification stream ends with this result.
+                connected = &mut connect => return connected,
+            }
+        }
+    }
+
     /// Run one DCC tool and then follow its session to a terminal state.
     ///
     /// The tool call itself only writes the offer, so returning there would
@@ -2648,9 +2747,23 @@ impl IrcMcpService {
         let call = ToolCallContext::new(self, request, context);
         let started = match self.tool_router.call(call).await? {
             CallToolResponse::Complete(result) => result,
-            // Neither is reachable: no tool in this service asks for client
-            // input or answers with a task of its own, and only this wrapper
-            // can create one.
+            // A task must not carry an unanswered question. The specification is
+            // explicit that input exchanges are resolved *before* a task handle
+            // is returned, and by this point the handle is already in the
+            // client's hands and the originating stream is closed, so there is
+            // nowhere to ask. Failing deterministically with the reason is the
+            // honest answer; the fix is to resolve the input first, not here.
+            CallToolResponse::InputRequired(_) => {
+                return Err(TaskExit::Error(McpError::invalid_request(
+                    "this operation needs its input resolved before it can run as a task: answer \
+                     the input request the tool returns, then call it again",
+                    None,
+                )));
+            }
+            // Only this wrapper creates tasks, so a tool cannot have made one,
+            // and the enum is `non_exhaustive`: a future response kind this
+            // server has not been taught to follow is an internal fault rather
+            // than something to guess at.
             other => {
                 return Err(TaskExit::Error(McpError::internal_error(
                     format!("a task-augmented tool returned an unexpected response: {other:?}"),
@@ -2658,11 +2771,18 @@ impl IrcMcpService {
                 )));
             }
         };
-        // A rejected offer is a finished task, not a transfer to follow.
-        let Some(session_id) = started_session_id(&started) else {
+        // A rejected offer, or an accepted chat, is a finished task rather than
+        // a transfer to follow.
+        let Some(session_id) = followable_transfer(&started) else {
             return Ok(started);
         };
 
+        // Stop following before the SDK's expiry sweep would abort this
+        // operation and settle the task as `failed: task expired`. A transfer
+        // still running at its deadline has not failed — it continues in the
+        // gateway whatever this task does — so the honest terminal result is
+        // the session as it stands plus where to keep watching it.
+        let deadline = tokio::time::Instant::now() + self.gateway.tasks().follow_window();
         loop {
             if task.is_cancel_requested() {
                 // Best effort: the peer may already have finished, in which
@@ -2675,7 +2795,8 @@ impl IrcMcpService {
                 .dcc_session(&agent_id, &session_id)
                 .await
                 .map_err(|error| TaskExit::Error(gateway_read_error(error)))?;
-            if session.state.is_terminal() {
+            let expired = tokio::time::Instant::now() >= deadline;
+            if session.state.is_terminal() || expired {
                 let link = describe_resource(
                     &AgentResourceUri {
                         agent_id: agent_id.clone(),
@@ -2684,7 +2805,11 @@ impl IrcMcpService {
                     Some(session.updated_at),
                 )
                 .into_resource();
-                let summary = terminal_session_summary(&session);
+                let summary = if expired && !session.state.is_terminal() {
+                    unfinished_session_summary(&session)
+                } else {
+                    terminal_session_summary(&session)
+                };
                 return Ok(tool_success_with_content(
                     summary,
                     &session,
@@ -2694,7 +2819,8 @@ impl IrcMcpService {
             task.set_status_message(progress_summary(&session));
             tokio::select! {
                 () = task.cancelled() => continue,
-                () = tokio::time::sleep(TASK_PROGRESS_INTERVAL) => {}
+                () = tokio::time::sleep_until(deadline) => {}
+                () = tokio::time::sleep(TASK_POLL_INTERVAL) => {}
             }
         }
     }
@@ -2736,23 +2862,26 @@ impl IrcMcpService {
     }
 }
 
-/// Task options when the caller asked for this call to run as a task.
+/// Whether this call is answered with a task handle instead of a result.
 ///
-/// Opting in is the client's decision, signalled by the tasks extension key in
-/// request metadata. A caller that did not ask still gets the ordinary
-/// synchronous result, so nothing that worked before starts returning a handle
-/// the caller cannot follow.
-fn requested_task_options(request: &CallToolRequestParams) -> Option<TaskOptions> {
-    let requested = request.meta.as_ref()?.get(TASKS_EXTENSION_ID)?;
-    let mut options = TaskOptions::new()
-        .with_poll_interval_ms(TASK_PROGRESS_INTERVAL.as_millis() as u64)
-        .with_status_message("Negotiating the direct connection.");
-    // A caller may name its own retention window; anything else just takes the
-    // default rather than failing a call over an advisory hint.
-    if let Some(ttl_ms) = requested.get("ttl").and_then(serde_json::Value::as_u64) {
-        options = options.with_ttl_ms(ttl_ms);
-    }
-    Some(options)
+/// Tasks in 2026-07-28 are **server-directed**: the server decides, per request,
+/// whether a call becomes a task, and the client's only say is whether it
+/// declared the extension it would need to follow one. There is no per-call
+/// opt-in key and no client-supplied retention window — both belonged to the
+/// superseded design, where the client asked for a task by naming the extension
+/// in the call's own metadata.
+///
+/// So the decision is exactly two facts: this is one of the operations that
+/// outlives its request, and this request declared the tasks extension in its
+/// `_meta` client capabilities. Returning a task to a client that did not
+/// declare it is forbidden — the SDK rejects the attempt — and would in any case
+/// hand back a handle the client has no method to resolve.
+///
+/// Written as a free function so both facts can be tested without a live
+/// request; the capability half is read through [`RequestProfile`], never from
+/// `params.meta`, which is always `None` server-side.
+fn runs_as_task(tool: &str, profile: &RequestProfile) -> bool {
+    TASK_AUGMENTED_TOOLS.contains(&tool) && profile.declares_extension(TASKS_EXTENSION_ID)
 }
 
 /// The agent handle a task-augmented DCC call names.
@@ -2771,12 +2900,20 @@ fn task_agent_id(request: &CallToolRequestParams) -> Result<AgentId, TaskExit> {
         })
 }
 
-/// The session a DCC tool result reports having started, when it started one.
-fn started_session_id(result: &CallToolResult) -> Option<DccSessionId> {
-    result
-        .structured_content
-        .as_ref()?
-        .get("session")?
+/// The transfer a DCC tool result reports having started, when it started one.
+///
+/// Only a SEND is followable. `irc.dcc.accept` also accepts CHAT offers, and an
+/// accepted chat sits in `active` for as long as the conversation lasts —
+/// following it would hold the task open for the whole exchange, withhold the
+/// session details the caller needs to say anything, and then report a healthy
+/// chat as expired. A chat accept is complete when it is accepted; its activity
+/// is `dcc.chat.message` events, not bytes to count.
+fn followable_transfer(result: &CallToolResult) -> Option<DccSessionId> {
+    let session = result.structured_content.as_ref()?.get("session")?;
+    if session.get("kind")?.as_str()? != "send" {
+        return None;
+    }
+    session
         .get("id")?
         .as_str()
         .and_then(|value| DccSessionId::from_str(value).ok())
@@ -2794,6 +2931,18 @@ fn progress_summary(session: &DccSession) -> String {
             session.state, session.transferred_bytes, session.peer
         ),
     }
+}
+
+/// Human-readable outcome for a session still running when its task must end.
+///
+/// This is a completed task, not a failed one: the task was only ever following
+/// the transfer, and the transfer is unaffected by the follower stopping.
+fn unfinished_session_summary(session: &DccSession) -> String {
+    format!(
+        "Direct session with {} is still {:?} after {} bytes; this task stopped following it at \
+         its deadline. The session resource remains authoritative.",
+        session.peer, session.state, session.transferred_bytes
+    )
 }
 
 /// Human-readable outcome for a settled direct session.
@@ -3576,34 +3725,61 @@ mod tests {
     use super::*;
     use rmcp::model::CallToolRequestParams;
 
-    #[test]
-    fn only_a_caller_that_asked_for_a_task_gets_one() {
-        let mut request = CallToolRequestParams::new("irc.dcc.send");
-        assert!(
-            requested_task_options(&request).is_none(),
-            "a call with no task metadata must still complete synchronously"
-        );
+    /// The profile of a request declaring `capabilities`.
+    fn declaring(capabilities: rmcp::model::ClientCapabilities) -> RequestProfile {
+        let mut meta = rmcp::model::RequestMetaObject::new();
+        meta.set_protocol_version(ProtocolVersion::V_2026_07_28);
+        meta.set_client_capabilities(capabilities);
+        RequestProfile::from_meta(&meta)
+    }
 
+    #[test]
+    fn a_task_is_created_only_for_a_client_that_declared_the_extension() {
+        let declared = declaring(
+            rmcp::model::ClientCapabilities::builder()
+                .enable_tasks()
+                .build(),
+        );
+        let silent = declaring(rmcp::model::ClientCapabilities::default());
+
+        assert!(runs_as_task("irc.dcc.send", &declared));
+        assert!(runs_as_task("irc.dcc.accept", &declared));
+        assert!(
+            !runs_as_task("irc.dcc.send", &silent),
+            "a client with no way to resolve a task handle must get its result directly"
+        );
+    }
+
+    #[test]
+    fn declaring_the_extension_does_not_make_every_call_a_task() {
+        // The trigger is the server's, but it applies only to the operations
+        // that outlive their request: a fast tool answered with a handle would
+        // cost the caller a poll for nothing.
+        let declared = declaring(
+            rmcp::model::ClientCapabilities::builder()
+                .enable_tasks()
+                .build(),
+        );
+        assert!(!runs_as_task("irc.send", &declared));
+        assert!(!runs_as_task("irc.dcc.list", &declared));
+        assert!(!runs_as_task("irc.connect", &declared));
+    }
+
+    #[test]
+    fn the_task_trigger_reads_declared_capabilities_and_not_call_metadata() {
+        // The superseded design had the client opt one call in by putting the
+        // extension id in that call's own `_meta`. Honoring that would also
+        // reintroduce the bug it hid: inbound `_meta` is hoisted onto the
+        // request context, so `params.meta` is always `None` on the wire and a
+        // trigger reading it never fires in production.
+        let mut request = CallToolRequestParams::new("irc.dcc.send");
         let mut meta = rmcp::model::RequestMetaObject::new();
         meta.insert(TASKS_EXTENSION_ID.to_string(), serde_json::json!({}));
         request.meta = Some(meta);
-        let options = requested_task_options(&request).expect("opted in");
-        assert_eq!(
-            options.ttl_ms,
-            Some(rmcp::task_manager::DEFAULT_TASK_TTL_MS),
-            "an opt-in without a ttl takes the default rather than failing"
-        );
-
-        let mut meta = rmcp::model::RequestMetaObject::new();
-        meta.insert(
-            TASKS_EXTENSION_ID.to_string(),
-            serde_json::json!({ "ttl": 60_000 }),
-        );
-        request.meta = Some(meta);
-        assert_eq!(
-            requested_task_options(&request).expect("opted in").ttl_ms,
-            Some(60_000)
-        );
+        assert!(!runs_as_task(
+            &request.name,
+            &RequestProfile::from_meta(request.meta.as_ref().expect("metadata"))
+        ));
     }
 
     #[test]
@@ -3631,15 +3807,28 @@ mod tests {
     fn a_started_transfer_is_followed_by_the_session_its_tool_reported() {
         let session_id = DccSessionId::new();
         let result = CallToolResult::structured(serde_json::json!({
-            "session": { "id": session_id.to_string() }
+            "session": { "id": session_id.to_string(), "kind": "send" }
         }));
-        assert_eq!(started_session_id(&result), Some(session_id));
+        assert_eq!(followable_transfer(&result), Some(session_id));
 
         // A tool that started nothing to follow settles the task immediately.
         assert_eq!(
-            started_session_id(&CallToolResult::structured(serde_json::json!({}))),
+            followable_transfer(&CallToolResult::structured(serde_json::json!({}))),
             None
         );
+    }
+
+    #[test]
+    fn an_accepted_chat_is_a_finished_task_rather_than_something_to_follow() {
+        // `irc.dcc.accept` takes CHAT offers too, and an accepted chat stays
+        // `active` for the whole conversation. Following one would hold the
+        // task open for its duration, withhold the session details the caller
+        // needs to say anything at all, and then report a healthy chat as
+        // expired when the deadline passed.
+        let chat = CallToolResult::structured(serde_json::json!({
+            "session": { "id": DccSessionId::new().to_string(), "kind": "chat", "state": "active" }
+        }));
+        assert_eq!(followable_transfer(&chat), None);
     }
 
     #[test]

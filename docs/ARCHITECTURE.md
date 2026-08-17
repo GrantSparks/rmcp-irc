@@ -42,15 +42,21 @@ same way as a missing one. Stdio has one trusted local owner.
 
 | Component | Responsibility |
 | --- | --- |
-| MCP service | Tool/prompt schemas, caller authorization, resource URIs, structured results, tasks, and scoped resource notifications. |
-| Gateway | Agent-handle lookup, publication, removal, and process-wide agent limits. |
+| MCP service | Tool/prompt schemas, caller authorization, resource URIs, structured results, progress notifications, task creation, and scoped resource notifications. |
+| Gateway | Agent-handle lookup, publication, removal, process-wide agent limits, and the shared task ledger. |
 | Agent actor | IRC registration, the exclusive socket writer, command collection, state, journal, reconnects, and DCC ownership for one identity. |
 | IRC modules | Framing, wire data, encoding, capability discovery, batches, correlation, and semantic projection. |
 | DCC modules | CTCP negotiation, direct sockets, streaming, and session lifecycle. |
 | Configuration | Endpoint settings, credential references, onboarding defaults, and operational limits. |
 
 The gateway is intentionally in-memory. Agent handles, state, event cursors,
-pending commands, and DCC sessions do not survive process restart.
+pending commands, DCC sessions, and task handles do not survive process restart.
+
+Everything shared between requests lives on the gateway rather than on the MCP
+handler, because Streamable HTTP constructs a fresh handler for every request.
+The task ledger is the clearest case: a task created while answering one request
+is resolved, updated, and cancelled by requests that arrive later, each with its
+own handler instance.
 
 ## Agent lifecycle
 
@@ -61,12 +67,21 @@ pending commands, and DCC sessions do not survive process restart.
 4. It resolves nickname collisions using caller fallbacks and bounded suffix
    attempts.
 5. It waits for `RPL_WELCOME` and a complete MOTD response.
-6. The gateway publishes the handle and returns the connection result.
-7. The actor joins requested channels and finishes state synchronization.
+6. It joins requested channels and finishes state synchronization.
+7. The gateway publishes the handle and returns the connection result.
 8. `irc.disconnect` removes the handle, attempts `QUIT`, closes DCC sessions,
    and stops the actor.
 
 A failed provisional connection never publishes a usable handle.
+
+Steps 2 through 6 all happen inside the single `irc.connect` call, bounded by
+`onboarding.connect_timeout_ms`. A caller that supplies a `progressToken` sees
+each of them reported as `notifications/progress`; the actor publishes stages
+over a bounded channel that the tool drains while awaiting registration, since
+the actor itself has no MCP peer. Registration and autojoin are reported
+separately because they are different facts. This is a single attempt: the
+reconnect backoff loop exists only after step 7, so a connect never outlives its
+own request and is never answered with a task handle.
 
 ## Command path
 
