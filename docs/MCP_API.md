@@ -17,7 +17,10 @@ connection is never an IRC identity.
   credential.
 - Every operation after `irc.connect` carries `agent_id`, in both transports.
 - All successful tools return concise `TextContent` plus schema-valid
-  `structuredContent`. The structured result is authoritative.
+  `structuredContent`. The structured result is authoritative. Tools that
+  expose a follow-up resource append native MCP `resource_link` content blocks
+  after the text summary; clients do not need to rediscover or reinterpret a
+  URI string before attaching or subscribing to it.
 - `irc.connect`, `irc.status`, and `irc.history` default `result_detail` to
   `compact` so equivalent presentation, parsed-wire, and semantic data is not
   repeated in one response. Callers that need the legacy inline forms can set
@@ -96,6 +99,13 @@ while retaining their raw replies.
 `compact` retains the lossless `replies` array, including rejection diagnostics,
 but sets its third, derived `semantic_result` representation to `null`. This
 control does not alter command outcome or acknowledgment metadata.
+
+The URI fields retained in `structuredContent` are backward-compatible routing
+data. In MCP `content`, `irc.connect` and `irc.status` link all current agent
+resources, `irc.join` and typed channel mutations link the affected channel,
+`irc.history` links the event stream and a channel snapshot when applicable,
+and DCC tools link the live DCC-session resource. A resource link describes
+live state; it is not a copy of the snapshot at tool-completion time.
 
 ## Identity tools
 
@@ -296,6 +306,42 @@ the shared MOTD resource and emits the same events/notifications as a reconnect
 MOTD. `timeout_ms` defaults to `10000` and is capped by
 `limits.max_command_timeout_ms`.
 
+### Stable semantic query and mutation tools
+
+Common operations also have fixed command-specific tools. Their schemas never
+change after `irc.connect`; unsupported runtime features fail explicitly and
+remain discoverable through the protocol resource. `irc.query` and
+`irc.execute` remain compatible expert fallbacks.
+
+Typed query tools are:
+
+| Tool | Typed projection |
+| --- | --- |
+| `irc.whois` | Requested nickname plus username, host, real name, server, account, away text, channels, idle/sign-on data, and secure/operator flags. |
+| `irc.names` | Membership grouped by channel with visibility and membership prefixes preserved. |
+| `irc.list` | Channel, visible-member count, and topic entries. |
+| `irc.mode.get` | Ordered mode numerics/standard replies with the client nickname removed. |
+| `irc.help` | Ordered help subject/text lines. |
+| `irc.topic.get` | Topic, setter, timestamp, and a native channel resource link. |
+
+Typed mutation tools are:
+
+| Tool | Operation and typed result |
+| --- | --- |
+| `irc.topic.set` | Set or clear a topic; returns the affected channel, confirmed/requested topic, metadata, command result, and channel link. |
+| `irc.nick.set` | Change this guest's nickname; returns the command envelope with the requested nickname. |
+| `irc.away.set` | Set an away message, or clear away state by omitting/emptying it. |
+| `irc.kick` | Remove one nickname from a channel, with an optional reason and channel link. |
+| `irc.invite` | Invite one nickname to one channel and return the channel link. |
+| `irc.monitor.update` | Add/remove nicknames or clear the server-side MONITOR list; rejects the call unless ISUPPORT advertises `MONITOR`. |
+| `irc.mode.set` | Apply a `+`/`-` user or channel mode change with validated ordered arguments and an optional channel link. |
+
+Every typed command result retains the common lossless `result` envelope.
+Query-specific fields are projected before `result_detail: "compact"` removes
+the duplicate semantic projection, so compact mode does not erase the typed
+answer. All deadlines default to `10000` milliseconds and are capped by
+`limits.max_command_timeout_ms`.
+
 ## Complete command surface
 
 ### `irc.execute`
@@ -453,10 +499,14 @@ The complete stable tool list is:
 ```text
 irc.connect                 irc.disconnect             irc.status
 irc.join                    irc.part                   irc.send
-irc.history                 irc.query                  irc.execute
-irc.events.read             irc.dcc.chat.open          irc.dcc.chat.send
-irc.dcc.send                irc.dcc.accept             irc.dcc.reject
-irc.dcc.cancel              irc.dcc.list
+irc.history                 irc.query                  irc.whois
+irc.names                   irc.list                   irc.mode.get
+irc.help                    irc.topic.get              irc.topic.set
+irc.nick.set                irc.away.set               irc.kick
+irc.invite                  irc.monitor.update         irc.mode.set
+irc.execute                 irc.events.read            irc.dcc.chat.open
+irc.dcc.chat.send           irc.dcc.send               irc.dcc.accept
+irc.dcc.reject              irc.dcc.cancel             irc.dcc.list
 ```
 
 Complete IRC command coverage belongs in `irc.execute` and the lossless event

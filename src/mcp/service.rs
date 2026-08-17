@@ -1,6 +1,11 @@
 //! One `rmcp` handler type shared by stdio and Streamable HTTP.
 
-use std::{collections::BTreeSet, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -109,7 +114,8 @@ impl IrcMcpService {
                         output.agent_id, output.nickname, output.motd.text
                     )
                 };
-                tool_success(summary, &output)
+                let content = agent_resource_links(&output.resources);
+                tool_success_with_content(summary, &output, content)
             }
             Err(error) => tool_error(error),
         }
@@ -174,7 +180,8 @@ impl IrcMcpService {
                 };
                 let mut output = output;
                 output.state.motd = motd_for_tool_result(output.state.motd, output.result_detail);
-                tool_success(
+                let content = agent_resource_links(&output.resources);
+                tool_success_with_content(
                     format!(
                         "{} is {:?} as {}.",
                         input.agent_id,
@@ -187,6 +194,7 @@ impl IrcMcpService {
                             .unwrap_or("unknown")
                     ),
                     &output,
+                    content,
                 )
             }
             Err(error) => tool_error(error),
@@ -227,14 +235,20 @@ impl IrcMcpService {
                 let failure = is_failure_outcome(result.outcome).then_some(result.outcome);
                 let outcome = result.outcome;
                 let result = command_result_for_detail(result, result_detail);
-                command_tool_result(
-                    format!("JOIN {}: {outcome:?}.", input.channel),
-                    &JoinOutput {
-                        resource: ResourceUris::channel(&input.agent_id, input.channel.as_str()),
-                        channel: input.channel,
-                        result,
-                    },
+                let output = JoinOutput {
+                    resource: ResourceUris::channel(&input.agent_id, input.channel.as_str()),
+                    channel: input.channel,
+                    result,
+                };
+                let content = vec![channel_resource_link(
+                    output.resource.clone(),
+                    output.channel.as_str(),
+                )];
+                command_tool_result_with_content(
+                    format!("JOIN {}: {outcome:?}.", output.channel),
+                    &output,
                     failure,
+                    content,
                 )
             }
             Err(error) => tool_error(error),
@@ -316,12 +330,27 @@ impl IrcMcpService {
         )
     )]
     async fn irc_history(&self, Parameters(input): Parameters<HistoryInput>) -> CallToolResult {
+        let agent_id = input.agent_id.clone();
+        let channel = input.target.channel().cloned();
         match self.history(input).await {
             Ok(output) => {
                 let outcome = output.result.as_ref().map(|result| result.outcome);
                 let failure = outcome.filter(|outcome| is_failure_outcome(*outcome));
                 let summary = history_result_summary(failure);
-                command_tool_result(summary, &output, failure)
+                let resources = ResourceUris::for_agent(&agent_id);
+                let mut content = vec![resource_link(
+                    resources.events,
+                    "irc-agent-events",
+                    "IRC event stream",
+                    "Live and retained events for the agent that produced this history",
+                )];
+                if let Some(channel) = channel {
+                    content.push(channel_resource_link(
+                        ResourceUris::channel(&agent_id, channel.as_str()),
+                        channel.as_str(),
+                    ));
+                }
+                command_tool_result_with_content(summary, &output, failure, content)
             }
             Err(error) => tool_error(error),
         }
@@ -353,6 +382,643 @@ impl IrcMcpService {
             result_detail,
         )
         .await
+    }
+
+    /// Read a WHOIS profile with a command-specific input and result schema.
+    #[tool(
+        name = "irc.whois",
+        description = "Read one nickname's WHOIS profile as typed fields plus the lossless reply envelope.",
+        output_schema = schema_for_output::<WhoisOutput>(),
+        annotations(
+            title = "Read WHOIS profile",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_whois(&self, Parameters(input): Parameters<WhoisInput>) -> CallToolResult {
+        let requested_nickname = input.nickname;
+        let message = OutboundMessage::new("WHOIS", vec![requested_nickname.to_string()]);
+        match self
+            .execute(
+                &input.agent_id,
+                message,
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let profile = whois_profile(&result);
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = WhoisOutput {
+                    requested_nickname,
+                    profile,
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result(format!("WHOIS: {outcome:?}."), &output, failure)
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Read channel membership with a command-specific input and result schema.
+    #[tool(
+        name = "irc.names",
+        description = "Read channel membership grouped into typed NAMES entries.",
+        output_schema = schema_for_output::<NamesOutput>(),
+        annotations(
+            title = "Read channel names",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_names(&self, Parameters(input): Parameters<NamesInput>) -> CallToolResult {
+        let channels: Vec<String> = input.channels.iter().map(ToString::to_string).collect();
+        let params = (!channels.is_empty())
+            .then(|| channels.join(","))
+            .into_iter()
+            .collect();
+        match self
+            .execute(
+                &input.agent_id,
+                OutboundMessage::new("NAMES", params),
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let channels = names_channels(&result);
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = NamesOutput {
+                    channels,
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result(format!("NAMES: {outcome:?}."), &output, failure)
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Read the visible channel list with typed entries.
+    #[tool(
+        name = "irc.list",
+        description = "List visible IRC channels as typed channel, member-count, and topic entries.",
+        output_schema = schema_for_output::<ListOutput>(),
+        annotations(
+            title = "List IRC channels",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_list(&self, Parameters(input): Parameters<ListInput>) -> CallToolResult {
+        if let Some(mask) = input.mask.as_deref()
+            && let Err(error) = validate_irc_atom(mask, "mask")
+        {
+            return tool_error(error);
+        }
+        let message = OutboundMessage::new("LIST", input.mask.into_iter().collect());
+        match self
+            .execute(
+                &input.agent_id,
+                message,
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let channels = list_channels(&result);
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = ListOutput {
+                    channels,
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result(format!("LIST: {outcome:?}."), &output, failure)
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Read user or channel modes with typed replies.
+    #[tool(
+        name = "irc.mode.get",
+        description = "Read user, channel, or list modes through a stable typed tool.",
+        output_schema = schema_for_output::<ModeGetOutput>(),
+        annotations(
+            title = "Read IRC modes",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_mode_get(&self, Parameters(input): Parameters<ModeGetInput>) -> CallToolResult {
+        if let Some(mode) = input.mode.as_deref()
+            && let Err(error) = validate_irc_atom(mode, "mode")
+        {
+            return tool_error(error);
+        }
+        let target = input.target;
+        let mut params = vec![target.to_string()];
+        params.extend(input.mode);
+        match self
+            .execute(
+                &input.agent_id,
+                OutboundMessage::new("MODE", params),
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let modes = mode_replies(&result);
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = ModeGetOutput {
+                    target,
+                    modes,
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result(format!("MODE query: {outcome:?}."), &output, failure)
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Read HELP with ordered typed lines.
+    #[tool(
+        name = "irc.help",
+        description = "Read the server HELP index or one subject as ordered typed lines.",
+        output_schema = schema_for_output::<HelpOutput>(),
+        annotations(
+            title = "Read server help",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_help(&self, Parameters(input): Parameters<HelpInput>) -> CallToolResult {
+        if let Some(subject) = input.subject.as_deref()
+            && let Err(error) = validate_irc_atom(subject, "subject")
+        {
+            return tool_error(error);
+        }
+        let subject = input.subject;
+        let message = OutboundMessage::new("HELP", subject.clone().into_iter().collect());
+        match self
+            .execute(
+                &input.agent_id,
+                message,
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let lines = help_lines(&result);
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = HelpOutput {
+                    subject,
+                    lines,
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result(format!("HELP: {outcome:?}."), &output, failure)
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Read one channel topic with typed metadata.
+    #[tool(
+        name = "irc.topic.get",
+        description = "Read one channel topic and setter metadata through a stable typed tool.",
+        output_schema = schema_for_output::<TopicOutput>(),
+        annotations(
+            title = "Read channel topic",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_topic_get(&self, Parameters(input): Parameters<TopicGetInput>) -> CallToolResult {
+        let channel = input.channel;
+        let resource = ResourceUris::channel(&input.agent_id, channel.as_str());
+        match self
+            .execute(
+                &input.agent_id,
+                OutboundMessage::new("TOPIC", vec![channel.to_string()]),
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let (topic, set_by, set_at) = topic_reply(&result);
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = TopicOutput {
+                    channel,
+                    topic,
+                    set_by,
+                    set_at,
+                    resource: resource.clone(),
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result_with_content(
+                    format!("TOPIC query: {outcome:?}."),
+                    &output,
+                    failure,
+                    vec![channel_resource_link(resource, output.channel.as_str())],
+                )
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Set or clear one channel topic.
+    #[tool(
+        name = "irc.topic.set",
+        description = "Set or clear one channel topic through a stable typed mutation.",
+        output_schema = schema_for_output::<TopicOutput>(),
+        annotations(
+            title = "Change channel topic",
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_topic_set(&self, Parameters(input): Parameters<TopicSetInput>) -> CallToolResult {
+        let channel = input.channel;
+        let requested_topic = input.topic;
+        let resource = ResourceUris::channel(&input.agent_id, channel.as_str());
+        let message = OutboundMessage::new("TOPIC", vec![channel.to_string()])
+            .with_trailing(&requested_topic);
+        match self
+            .execute(
+                &input.agent_id,
+                message,
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let (confirmed, set_by, set_at) = topic_reply(&result);
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let topic = confirmed.or_else(|| failure.is_none().then_some(requested_topic));
+                let output = TopicOutput {
+                    channel,
+                    topic,
+                    set_by,
+                    set_at,
+                    resource: resource.clone(),
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result_with_content(
+                    format!("TOPIC mutation: {outcome:?}."),
+                    &output,
+                    failure,
+                    vec![channel_resource_link(resource, output.channel.as_str())],
+                )
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Change this guest's nickname.
+    #[tool(
+        name = "irc.nick.set",
+        description = "Change this guest's nickname through a stable typed mutation.",
+        output_schema = schema_for_output::<NickSetOutput>(),
+        annotations(
+            title = "Change IRC nickname",
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_nick_set(&self, Parameters(input): Parameters<NickSetInput>) -> CallToolResult {
+        let nickname = input.nickname;
+        match self
+            .execute(
+                &input.agent_id,
+                OutboundMessage::new("NICK", vec![nickname.to_string()]),
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = NickSetOutput {
+                    nickname,
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result(format!("NICK: {outcome:?}."), &output, failure)
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Set or clear this guest's away state.
+    #[tool(
+        name = "irc.away.set",
+        description = "Set or clear this guest's away state through a stable typed mutation.",
+        output_schema = schema_for_output::<AwaySetOutput>(),
+        annotations(
+            title = "Change IRC away state",
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_away_set(&self, Parameters(input): Parameters<AwaySetInput>) -> CallToolResult {
+        let message = input.message.filter(|message| !message.is_empty());
+        let outbound = message.as_ref().map_or_else(
+            || OutboundMessage::new("AWAY", Vec::new()),
+            |message| OutboundMessage::new("AWAY", Vec::new()).with_trailing(message),
+        );
+        match self
+            .execute(
+                &input.agent_id,
+                outbound,
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = AwaySetOutput {
+                    away: message.is_some(),
+                    message,
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result(format!("AWAY: {outcome:?}."), &output, failure)
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Remove one member from a channel.
+    #[tool(
+        name = "irc.kick",
+        description = "Remove one nickname from a channel through a stable typed mutation.",
+        output_schema = schema_for_output::<KickOutput>(),
+        annotations(
+            title = "Kick channel member",
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_kick(&self, Parameters(input): Parameters<KickInput>) -> CallToolResult {
+        let channel = input.channel;
+        let nickname = input.nickname;
+        let resource = ResourceUris::channel(&input.agent_id, channel.as_str());
+        let outbound = input.reason.map_or_else(
+            || OutboundMessage::new("KICK", vec![channel.to_string(), nickname.to_string()]),
+            |reason| {
+                OutboundMessage::new("KICK", vec![channel.to_string(), nickname.to_string()])
+                    .with_trailing(reason)
+            },
+        );
+        match self
+            .execute(
+                &input.agent_id,
+                outbound,
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = KickOutput {
+                    channel,
+                    nickname,
+                    resource: resource.clone(),
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result_with_content(
+                    format!("KICK: {outcome:?}."),
+                    &output,
+                    failure,
+                    vec![channel_resource_link(resource, output.channel.as_str())],
+                )
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Invite one nickname to a channel.
+    #[tool(
+        name = "irc.invite",
+        description = "Invite one nickname to a channel through a stable typed mutation.",
+        output_schema = schema_for_output::<InviteOutput>(),
+        annotations(
+            title = "Invite channel member",
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_invite(&self, Parameters(input): Parameters<InviteInput>) -> CallToolResult {
+        let channel = input.channel;
+        let nickname = input.nickname;
+        let resource = ResourceUris::channel(&input.agent_id, channel.as_str());
+        let outbound =
+            OutboundMessage::new("INVITE", vec![nickname.to_string(), channel.to_string()]);
+        match self
+            .execute(
+                &input.agent_id,
+                outbound,
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = InviteOutput {
+                    nickname,
+                    channel,
+                    resource: resource.clone(),
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result_with_content(
+                    format!("INVITE: {outcome:?}."),
+                    &output,
+                    failure,
+                    vec![channel_resource_link(resource, output.channel.as_str())],
+                )
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Mutate the server-side MONITOR list after runtime ISUPPORT validation.
+    #[tool(
+        name = "irc.monitor.update",
+        description = "Add, remove, or clear server-side MONITOR entries after runtime support checks.",
+        output_schema = schema_for_output::<MonitorUpdateOutput>(),
+        annotations(
+            title = "Update IRC monitor list",
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_monitor_update(
+        &self,
+        Parameters(input): Parameters<MonitorUpdateInput>,
+    ) -> CallToolResult {
+        let snapshot = match self.gateway.snapshot(&input.agent_id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tool_error(error),
+        };
+        if !snapshot
+            .protocol
+            .isupport
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("MONITOR"))
+        {
+            return tool_error(GatewayError::InvalidMessage(
+                "MONITOR is not advertised by this server".into(),
+            ));
+        }
+        let operation = input.operation;
+        let nicknames = input.nicknames;
+        let (verb, target_list) = match operation {
+            MonitorUpdateKind::Add if !nicknames.is_empty() => (
+                "+",
+                Some(
+                    nicknames
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            ),
+            MonitorUpdateKind::Remove if !nicknames.is_empty() => (
+                "-",
+                Some(
+                    nicknames
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            ),
+            MonitorUpdateKind::Clear if nicknames.is_empty() => ("C", None),
+            MonitorUpdateKind::Add | MonitorUpdateKind::Remove => {
+                return tool_error(GatewayError::InvalidMessage(
+                    "MONITOR add/remove requires at least one nickname".into(),
+                ));
+            }
+            MonitorUpdateKind::Clear => {
+                return tool_error(GatewayError::InvalidMessage(
+                    "MONITOR clear does not accept nicknames".into(),
+                ));
+            }
+        };
+        let mut params = vec![verb.into()];
+        params.extend(target_list);
+        match self
+            .execute(
+                &input.agent_id,
+                OutboundMessage::new("MONITOR", params),
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = MonitorUpdateOutput {
+                    operation,
+                    nicknames,
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                command_tool_result(format!("MONITOR: {outcome:?}."), &output, failure)
+            }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    /// Change user or channel modes.
+    #[tool(
+        name = "irc.mode.set",
+        description = "Change user or channel modes through a stable typed mutation.",
+        output_schema = schema_for_output::<ModeSetOutput>(),
+        annotations(
+            title = "Change IRC modes",
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn irc_mode_set(&self, Parameters(input): Parameters<ModeSetInput>) -> CallToolResult {
+        if let Err(error) = validate_irc_atom(&input.modes, "modes") {
+            return tool_error(error);
+        }
+        if !input.modes.starts_with(['+', '-']) {
+            return tool_error(GatewayError::InvalidMessage(
+                "mode mutation must begin with + or -".into(),
+            ));
+        }
+        for argument in &input.arguments {
+            if let Err(error) = validate_irc_atom(argument, "mode argument") {
+                return tool_error(error);
+            }
+        }
+        let target = input.target;
+        let modes = input.modes;
+        let arguments = input.arguments;
+        let mut params = vec![target.to_string(), modes.clone()];
+        params.extend(arguments.iter().cloned());
+        let resource = target
+            .channel()
+            .map(|channel| ResourceUris::channel(&input.agent_id, channel.as_str()));
+        match self
+            .execute(
+                &input.agent_id,
+                OutboundMessage::new("MODE", params),
+                CompletionMode::Auto,
+                input.timeout_ms,
+            )
+            .await
+        {
+            Ok(result) => {
+                let outcome = result.outcome;
+                let failure = command_failure(&result);
+                let output = ModeSetOutput {
+                    target,
+                    modes,
+                    arguments,
+                    resource: resource.clone(),
+                    result: command_result_for_detail(result, input.result_detail),
+                };
+                let content = resource
+                    .map(|uri| channel_resource_link(uri, output.target.as_str()))
+                    .into_iter()
+                    .collect();
+                command_tool_result_with_content(
+                    format!("MODE mutation: {outcome:?}."),
+                    &output,
+                    failure,
+                    content,
+                )
+            }
+            Err(error) => tool_error(error),
+        }
     }
 
     /// Execute any syntactically valid structured IRC command.
@@ -406,6 +1072,7 @@ impl IrcMcpService {
         &self,
         Parameters(input): Parameters<EventsReadInput>,
     ) -> CallToolResult {
+        let resources = ResourceUris::for_agent(&input.agent_id);
         let filter = input.filter();
         match self
             .gateway
@@ -418,13 +1085,19 @@ impl IrcMcpService {
             )
             .await
         {
-            Ok(page) => tool_success(
+            Ok(page) => tool_success_with_content(
                 format!(
                     "Read {} event(s); cursor is {}.",
                     page.events.len(),
                     page.next_cursor.sequence
                 ),
                 &page,
+                vec![resource_link(
+                    resources.events,
+                    "irc-agent-events",
+                    "IRC event stream",
+                    "Live and retained events for this IRC agent",
+                )],
             ),
             Err(error) => tool_error(error),
         }
@@ -451,7 +1124,7 @@ impl IrcMcpService {
             .dcc_chat_open(&input.agent_id, input.target.to_string(), input.reverse)
             .await
         {
-            Ok(session) => dcc_session_result("DCC CHAT offer written.", session),
+            Ok(session) => dcc_session_result("DCC CHAT offer written.", &input.agent_id, session),
             Err(error) => tool_error(error),
         }
     }
@@ -477,12 +1150,13 @@ impl IrcMcpService {
             .dcc_chat_send(&input.agent_id, input.dcc_session_id.clone(), input.text)
             .await
         {
-            Ok(()) => tool_success(
+            Ok(()) => tool_success_with_content(
                 "DCC CHAT line queued.",
                 &DccChatSendOutput {
                     dcc_session_id: input.dcc_session_id,
                     queued: true,
                 },
+                vec![dcc_resource_link(&input.agent_id)],
             ),
             Err(error) => tool_error(error),
         }
@@ -512,7 +1186,7 @@ impl IrcMcpService {
             )
             .await
         {
-            Ok(session) => dcc_session_result("DCC SEND offer written.", session),
+            Ok(session) => dcc_session_result("DCC SEND offer written.", &input.agent_id, session),
             Err(error) => tool_error(error),
         }
     }
@@ -543,7 +1217,7 @@ impl IrcMcpService {
             )
             .await
         {
-            Ok(session) => dcc_session_result("DCC offer accepted.", session),
+            Ok(session) => dcc_session_result("DCC offer accepted.", &input.agent_id, session),
             Err(error) => tool_error(error),
         }
     }
@@ -569,7 +1243,7 @@ impl IrcMcpService {
             .dcc_reject(&input.agent_id, input.dcc_session_id)
             .await
         {
-            Ok(session) => dcc_session_result("DCC offer rejected.", session),
+            Ok(session) => dcc_session_result("DCC offer rejected.", &input.agent_id, session),
             Err(error) => tool_error(error),
         }
     }
@@ -597,7 +1271,7 @@ impl IrcMcpService {
         {
             Ok(session) => {
                 let summary = format!("DCC session is {}.", session.state);
-                dcc_session_result(&summary, session)
+                dcc_session_result(&summary, &input.agent_id, session)
             }
             Err(error) => tool_error(error),
         }
@@ -627,9 +1301,10 @@ impl IrcMcpService {
         {
             Ok(sessions) => {
                 let output = DccListOutput { sessions };
-                tool_success(
+                tool_success_with_content(
                     format!("Found {} DCC session(s).", output.sessions.len()),
                     &output,
+                    vec![dcc_resource_link(&input.agent_id)],
                 )
             }
             Err(error) => tool_error(error),
@@ -1088,6 +1763,143 @@ fn query_message(query: Query) -> Result<OutboundMessage, GatewayError> {
     Ok(message)
 }
 
+fn command_failure(result: &CommandResult) -> Option<CommandOutcome> {
+    is_failure_outcome(result.outcome).then_some(result.outcome)
+}
+
+fn whois_profile(result: &CommandResult) -> WhoisProfile {
+    let mut profile = WhoisProfile::default();
+    for reply in &result.replies {
+        match reply.command.parse::<u16>().ok() {
+            Some(301) => {
+                profile.nickname = reply.params.get(1).cloned().or(profile.nickname);
+                profile.away_message = reply.trailing.clone();
+            }
+            Some(311) => {
+                profile.nickname = reply.params.get(1).cloned();
+                profile.username = reply.params.get(2).cloned();
+                profile.hostname = reply.params.get(3).cloned();
+                profile.real_name = reply.trailing.clone();
+            }
+            Some(312) => {
+                profile.nickname = reply.params.get(1).cloned().or(profile.nickname);
+                profile.server = reply.params.get(2).cloned();
+            }
+            Some(313) => profile.operator = true,
+            Some(317) => {
+                profile.idle_seconds = reply.params.get(2).and_then(|value| value.parse().ok());
+                profile.signon_timestamp = reply.params.get(3).and_then(|value| value.parse().ok());
+            }
+            Some(319) => {
+                profile.channels.extend(
+                    reply
+                        .trailing
+                        .as_deref()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .map(str::to_owned),
+                );
+            }
+            Some(330) => profile.account = reply.params.get(2).cloned(),
+            Some(671) => profile.secure = true,
+            _ => {}
+        }
+    }
+    profile
+}
+
+fn names_channels(result: &CommandResult) -> Vec<NamesChannel> {
+    let mut channels: BTreeMap<String, NamesChannel> = BTreeMap::new();
+    for reply in &result.replies {
+        if reply.command != "353" {
+            continue;
+        }
+        let Some(channel) = reply.params.get(2) else {
+            continue;
+        };
+        let entry = channels
+            .entry(channel.clone())
+            .or_insert_with(|| NamesChannel {
+                channel: channel.clone(),
+                visibility: reply.params.get(1).cloned().unwrap_or_default(),
+                names: Vec::new(),
+            });
+        entry.names.extend(
+            reply
+                .trailing
+                .as_deref()
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_owned),
+        );
+    }
+    channels.into_values().collect()
+}
+
+fn list_channels(result: &CommandResult) -> Vec<ChannelListEntry> {
+    result
+        .replies
+        .iter()
+        .filter(|reply| reply.command == "322")
+        .filter_map(|reply| {
+            Some(ChannelListEntry {
+                channel: reply.params.get(1)?.clone(),
+                visible_users: reply.params.get(2).and_then(|value| value.parse().ok()),
+                topic: reply.trailing.clone(),
+            })
+        })
+        .collect()
+}
+
+fn mode_replies(result: &CommandResult) -> Vec<ModeReply> {
+    result
+        .replies
+        .iter()
+        .filter(|reply| {
+            matches!(
+                reply.command.as_str(),
+                "221" | "324" | "367" | "368" | "348" | "349" | "346" | "347"
+            )
+        })
+        .map(|reply| ModeReply {
+            command: reply.command.clone(),
+            parameters: reply.params.iter().skip(1).cloned().collect(),
+            text: reply.trailing.clone(),
+        })
+        .collect()
+}
+
+fn help_lines(result: &CommandResult) -> Vec<HelpLine> {
+    result
+        .replies
+        .iter()
+        .filter(|reply| matches!(reply.command.as_str(), "704" | "705" | "706" | "FAIL"))
+        .map(|reply| HelpLine {
+            command: reply.command.clone(),
+            subject: reply.params.get(1).cloned(),
+            text: reply.trailing.clone(),
+        })
+        .collect()
+}
+
+fn topic_reply(result: &CommandResult) -> (Option<String>, Option<String>, Option<u64>) {
+    let mut topic = None;
+    let mut set_by = None;
+    let mut set_at = None;
+    for reply in &result.replies {
+        match reply.command.as_str() {
+            "331" => topic = None,
+            "332" | "TOPIC" => topic = reply.trailing.clone(),
+            "333" => {
+                set_by = reply.params.get(2).cloned();
+                set_at = reply.params.get(3).and_then(|value| value.parse().ok());
+            }
+            _ => {}
+        }
+    }
+    (topic, set_by, set_at)
+}
+
 /// Split one logical message into lines that survive relay intact.
 ///
 /// A client writes prefix-less lines, but the body budget applies to the form
@@ -1338,8 +2150,16 @@ fn validate_irc_atom(value: &str, field: &str) -> Result<(), GatewayError> {
     }
 }
 
-fn dcc_session_result(summary: &str, session: DccSession) -> CallToolResult {
-    tool_success(summary, &DccSessionOutput { session })
+fn dcc_session_result(
+    summary: &str,
+    agent_id: &crate::agent::AgentId,
+    session: DccSession,
+) -> CallToolResult {
+    tool_success_with_content(
+        summary,
+        &DccSessionOutput { session },
+        vec![dcc_resource_link(agent_id)],
+    )
 }
 
 /// Keep one presentation copy of the MOTD in normal tool traffic. The stable
@@ -1395,6 +2215,14 @@ fn tool_success(summary: impl Into<String>, value: &impl Serialize) -> CallToolR
     structured_result(summary, value, false)
 }
 
+fn tool_success_with_content(
+    summary: impl Into<String>,
+    value: &impl Serialize,
+    content: Vec<ContentBlock>,
+) -> CallToolResult {
+    structured_result_with_content(summary, value, false, content)
+}
+
 fn command_tool_result(
     summary: String,
     value: &impl Serialize,
@@ -1403,10 +2231,28 @@ fn command_tool_result(
     structured_result(summary, value, failure.is_some())
 }
 
+fn command_tool_result_with_content(
+    summary: String,
+    value: &impl Serialize,
+    failure: Option<CommandOutcome>,
+    content: Vec<ContentBlock>,
+) -> CallToolResult {
+    structured_result_with_content(summary, value, failure.is_some(), content)
+}
+
 fn structured_result(
     summary: impl Into<String>,
     value: &impl Serialize,
     is_error: bool,
+) -> CallToolResult {
+    structured_result_with_content(summary, value, is_error, Vec::new())
+}
+
+fn structured_result_with_content(
+    summary: impl Into<String>,
+    value: &impl Serialize,
+    is_error: bool,
+    mut content: Vec<ContentBlock>,
 ) -> CallToolResult {
     match serde_json::to_value(value) {
         Ok(value) => {
@@ -1415,13 +2261,61 @@ fn structured_result(
             } else {
                 CallToolResult::structured(value)
             };
-            result.content = vec![ContentBlock::text(summary)];
+            content.insert(0, ContentBlock::text(summary));
+            result.content = content;
             result
         }
         Err(error) => CallToolResult::error(vec![ContentBlock::text(format!(
             "could not serialize typed tool output: {error}"
         ))]),
     }
+}
+
+fn resource_link(
+    uri: impl Into<String>,
+    name: impl Into<String>,
+    title: impl Into<String>,
+    description: impl Into<String>,
+) -> ContentBlock {
+    ContentBlock::ResourceLink(
+        Resource::new(uri, name)
+            .with_title(title)
+            .with_description(description)
+            .with_mime_type("application/json"),
+    )
+}
+
+fn agent_resource_links(resources: &ResourceUris) -> Vec<ContentBlock> {
+    resources
+        .named()
+        .into_iter()
+        .map(|(name, uri)| {
+            resource_link(
+                uri,
+                format!("irc-agent-{name}"),
+                format!("IRC agent {name}"),
+                format!("Live {name} resource for this IRC agent"),
+            )
+        })
+        .collect()
+}
+
+fn channel_resource_link(uri: impl Into<String>, channel: &str) -> ContentBlock {
+    resource_link(
+        uri,
+        "irc-channel-state",
+        format!("IRC channel {channel}"),
+        format!("Live topic, membership, and mode state for {channel}"),
+    )
+}
+
+fn dcc_resource_link(agent_id: &crate::agent::AgentId) -> ContentBlock {
+    resource_link(
+        ResourceUris::for_agent(agent_id).dcc,
+        "irc-dcc-sessions",
+        "IRC DCC sessions",
+        "Live direct-chat and file-transfer sessions for this IRC agent",
+    )
 }
 
 fn tool_error(error: GatewayError) -> CallToolResult {
@@ -1477,6 +2371,110 @@ mod tests {
         assert_eq!(names, TOOL_NAMES.iter().copied().collect());
         assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
         let _ = CallToolRequestParams::new("irc.status");
+    }
+
+    #[test]
+    fn native_resource_links_accompany_structured_tool_output() {
+        let agent_id = crate::agent::AgentId::new();
+        let resources = ResourceUris::for_agent(&agent_id);
+        let links = agent_resource_links(&resources);
+        assert_eq!(links.len(), 6);
+        assert!(
+            links
+                .iter()
+                .all(|block| matches!(block, ContentBlock::ResourceLink(_)))
+        );
+
+        let result = tool_success_with_content(
+            "connected",
+            &serde_json::json!({"agent_id": agent_id}),
+            links,
+        );
+        assert_eq!(result.content.len(), 7);
+        assert_eq!(
+            result.content[0].as_text().expect("summary text").text,
+            "connected"
+        );
+        let linked_uris: BTreeSet<_> = result.content[1..]
+            .iter()
+            .map(|block| match block {
+                ContentBlock::ResourceLink(resource) => resource.uri.as_str(),
+                other => panic!("expected resource link, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            linked_uris,
+            resources.named().into_iter().map(|(_, uri)| uri).collect()
+        );
+        assert!(result.structured_content.is_some());
+    }
+
+    fn command_result_with(lines: &[&'static [u8]]) -> CommandResult {
+        CommandResult {
+            command_id: crate::irc::correlation::CommandId::new(),
+            agent_id: crate::agent::AgentId::new(),
+            command: "TEST".into(),
+            outcome: CommandOutcome::Completed,
+            written: true,
+            acknowledged: true,
+            retriable: false,
+            label: None,
+            replies: lines
+                .iter()
+                .map(|line| {
+                    crate::irc::wire::WireMessage::parse(bytes::Bytes::from_static(line))
+                        .expect("wire reply")
+                })
+                .collect(),
+            semantic_result: None,
+            warnings: Vec::new(),
+            first_event_cursor: None,
+        }
+    }
+
+    #[test]
+    fn typed_query_projections_extract_standard_reply_fields() {
+        let whois = command_result_with(&[
+            b":irc.example 311 Me Athena user host * :Athena Example",
+            b":irc.example 317 Me Athena 42 1700000000 :seconds idle, signon time",
+            b":irc.example 319 Me Athena :@#control +#rust",
+            b":irc.example 330 Me Athena account :is logged in as",
+            b":irc.example 671 Me Athena :is using a secure connection",
+        ]);
+        let profile = whois_profile(&whois);
+        assert_eq!(profile.nickname.as_deref(), Some("Athena"));
+        assert_eq!(profile.username.as_deref(), Some("user"));
+        assert_eq!(profile.hostname.as_deref(), Some("host"));
+        assert_eq!(profile.real_name.as_deref(), Some("Athena Example"));
+        assert_eq!(profile.idle_seconds, Some(42));
+        assert_eq!(profile.signon_timestamp, Some(1_700_000_000));
+        assert_eq!(profile.channels, ["@#control", "+#rust"]);
+        assert_eq!(profile.account.as_deref(), Some("account"));
+        assert!(profile.secure);
+
+        let names = command_result_with(&[
+            b":irc.example 353 Me = #control :@grant Athena",
+            b":irc.example 353 Me = #control :Ninshubur",
+            b":irc.example 366 Me #control :End of NAMES",
+        ]);
+        let channels = names_channels(&names);
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].channel, "#control");
+        assert_eq!(channels[0].visibility, "=");
+        assert_eq!(channels[0].names, ["@grant", "Athena", "Ninshubur"]);
+
+        let topic = command_result_with(&[
+            b":irc.example 332 Me #control :Coordinate here",
+            b":irc.example 333 Me #control grant 1700000001",
+        ]);
+        assert_eq!(
+            topic_reply(&topic),
+            (
+                Some("Coordinate here".into()),
+                Some("grant".into()),
+                Some(1_700_000_001)
+            )
+        );
     }
 
     /// Description of one top-level property of a tool's input schema.

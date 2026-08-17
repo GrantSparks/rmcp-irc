@@ -7,6 +7,17 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ## [Unreleased]
 
+### Added
+
+- Tool results that expose follow-up state now include native MCP
+  `resource_link` content blocks alongside backward-compatible structured URI
+  fields, covering connect, status, join, history, events, channel mutations,
+  and DCC operations.
+- Stable command-specific tools and typed result projections now cover WHOIS,
+  NAMES, LIST, MODE and HELP reads, topic reads/changes, nickname and away
+  changes, KICK, INVITE, MONITOR updates, and MODE mutations; `irc.query` and
+  `irc.execute` remain available as compatibility and expert fallbacks.
+
 ### Fixed
 
 - `irc.connect` and `irc.status` now default to compact MOTD results that keep

@@ -51,6 +51,19 @@ pub const TOOL_NAMES: &[&str] = &[
     "irc.send",
     "irc.history",
     "irc.query",
+    "irc.whois",
+    "irc.names",
+    "irc.list",
+    "irc.mode.get",
+    "irc.help",
+    "irc.topic.get",
+    "irc.topic.set",
+    "irc.nick.set",
+    "irc.away.set",
+    "irc.kick",
+    "irc.invite",
+    "irc.monitor.update",
+    "irc.mode.set",
     "irc.execute",
     "irc.events.read",
     "irc.dcc.chat.open",
@@ -501,6 +514,471 @@ pub struct QueryInput {
     /// semantic projection; `compact` sets the duplicate projection to null.
     #[serde(default = "default_full_result_detail")]
     pub result_detail: ToolResultDetail,
+}
+
+/// WHOIS one nickname through a command-specific MCP schema.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WhoisInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Nickname whose current server profile is requested.
+    pub nickname: Nickname,
+    /// Milliseconds to wait for the complete WHOIS reply sequence, between 1
+    /// and the configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Useful fields projected from a WHOIS reply sequence.
+#[derive(Clone, Debug, Default, JsonSchema, Serialize)]
+pub struct WhoisProfile {
+    /// Case-preserved nickname returned by the server.
+    pub nickname: Option<String>,
+    /// IRC username.
+    pub username: Option<String>,
+    /// Visible hostname.
+    pub hostname: Option<String>,
+    /// Human-facing real name.
+    pub real_name: Option<String>,
+    /// Server currently carrying the user.
+    pub server: Option<String>,
+    /// Identified account name.
+    pub account: Option<String>,
+    /// Away reason when the user is away.
+    pub away_message: Option<String>,
+    /// Channels as presented by the server, including status prefixes.
+    pub channels: Vec<String>,
+    /// Idle seconds when disclosed.
+    pub idle_seconds: Option<u64>,
+    /// Sign-on Unix timestamp when disclosed.
+    pub signon_timestamp: Option<u64>,
+    /// Whether the server reported a secure connection.
+    pub secure: bool,
+    /// Whether the server reported IRC-operator status.
+    pub operator: bool,
+}
+
+/// Typed WHOIS result plus the lossless correlated command envelope.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct WhoisOutput {
+    /// Requested nickname.
+    pub requested_nickname: Nickname,
+    /// Command-specific projection of the standard WHOIS numerics.
+    pub profile: WhoisProfile,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// Read channel membership names through a command-specific MCP schema.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NamesInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Channels to query; an empty list requests the server default.
+    #[serde(default)]
+    pub channels: Vec<ChannelName>,
+    /// Milliseconds to wait for the complete NAMES reply sequence, between 1
+    /// and the configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Names returned for one channel.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct NamesChannel {
+    /// Case-preserved channel name.
+    pub channel: String,
+    /// Server visibility marker from RPL_NAMREPLY (`=`, `*`, or `@`).
+    pub visibility: String,
+    /// Nicknames as presented by the server, including membership prefixes.
+    pub names: Vec<String>,
+}
+
+/// Typed NAMES result plus the lossless correlated command envelope.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct NamesOutput {
+    /// Membership grouped by channel.
+    pub channels: Vec<NamesChannel>,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// List visible channels through a command-specific MCP schema.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Optional server-side channel mask.
+    pub mask: Option<String>,
+    /// Milliseconds to wait for the complete LIST reply sequence, between 1
+    /// and the configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// One RPL_LIST channel entry.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct ChannelListEntry {
+    /// Case-preserved channel name.
+    pub channel: String,
+    /// Visible member count when the server supplied a number.
+    pub visible_users: Option<u64>,
+    /// Current topic or server-provided list description.
+    pub topic: Option<String>,
+}
+
+/// Typed LIST result plus the lossless correlated command envelope.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct ListOutput {
+    /// Visible channel entries.
+    pub channels: Vec<ChannelListEntry>,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// Read user or channel modes through a command-specific MCP schema.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModeGetInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Nickname or channel whose modes are requested.
+    pub target: Target,
+    /// Optional list-mode selector such as `b`.
+    pub mode: Option<String>,
+    /// Milliseconds to wait for the MODE reply sequence, between 1 and the
+    /// configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// One server mode reply with the client nickname removed.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct ModeReply {
+    /// Numeric or standard reply command.
+    pub command: String,
+    /// Ordered reply parameters.
+    pub parameters: Vec<String>,
+    /// Optional trailing description.
+    pub text: Option<String>,
+}
+
+/// Typed MODE query result plus the lossless correlated command envelope.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct ModeGetOutput {
+    /// Requested nickname or channel.
+    pub target: Target,
+    /// Mode-specific replies.
+    pub modes: Vec<ModeReply>,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// Read the HELP index or one subject through a command-specific MCP schema.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HelpInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Optional command or help subject.
+    pub subject: Option<String>,
+    /// Milliseconds to wait for the complete HELP reply sequence, between 1
+    /// and the configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// One typed HELP line.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct HelpLine {
+    /// Reply command or numeric.
+    pub command: String,
+    /// Help subject reported on this line, when present.
+    pub subject: Option<String>,
+    /// Human-facing help text.
+    pub text: Option<String>,
+}
+
+/// Typed HELP result plus the lossless correlated command envelope.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct HelpOutput {
+    /// Requested subject.
+    pub subject: Option<String>,
+    /// Ordered help lines.
+    pub lines: Vec<HelpLine>,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// Read one channel topic through a command-specific MCP schema.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TopicGetInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Channel whose current topic is requested.
+    pub channel: ChannelName,
+    /// Milliseconds to wait for the topic reply sequence, between 1 and the
+    /// configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Change one channel topic through a command-specific MCP schema.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TopicSetInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Channel whose topic is changed.
+    pub channel: ChannelName,
+    /// New topic; an empty string clears it.
+    pub topic: String,
+    /// Milliseconds to wait for a server reply or echo, between 1 and the
+    /// configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Typed topic query or mutation result.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct TopicOutput {
+    /// Case-preserved channel name.
+    pub channel: ChannelName,
+    /// Topic confirmed by the reply, or requested by a successful mutation.
+    pub topic: Option<String>,
+    /// Nickname or server identity that set the topic when disclosed.
+    pub set_by: Option<String>,
+    /// Unix timestamp supplied by RPL_TOPICWHOTIME.
+    pub set_at: Option<u64>,
+    /// Stable channel-resource URI.
+    pub resource: String,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// Change this guest's nickname through a command-specific MCP schema.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NickSetInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// New nickname.
+    pub nickname: Nickname,
+    /// Milliseconds to wait for the server echo or rejection, between 1 and
+    /// the configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Typed nickname-change result.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct NickSetOutput {
+    /// Requested nickname.
+    pub nickname: Nickname,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// Set or clear this guest's away state.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AwaySetInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Away message; omit or provide an empty string to clear away state.
+    pub message: Option<String>,
+    /// Milliseconds to wait for RPL_NOWAWAY or RPL_UNAWAY, between 1 and the
+    /// configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Typed away-state result.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct AwaySetOutput {
+    /// Whether away state was requested rather than cleared.
+    pub away: bool,
+    /// Normalized requested away message.
+    pub message: Option<String>,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// Remove one member from a channel.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KickInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Channel from which the member is removed.
+    pub channel: ChannelName,
+    /// Nickname to remove.
+    pub nickname: Nickname,
+    /// Optional server-visible reason.
+    pub reason: Option<String>,
+    /// Milliseconds to wait for the server echo or rejection, between 1 and
+    /// the configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Typed KICK result.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct KickOutput {
+    /// Affected channel.
+    pub channel: ChannelName,
+    /// Requested member nickname.
+    pub nickname: Nickname,
+    /// Stable channel-resource URI.
+    pub resource: String,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// Invite one nickname to a channel.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InviteInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Nickname to invite.
+    pub nickname: Nickname,
+    /// Destination channel.
+    pub channel: ChannelName,
+    /// Milliseconds to wait for server confirmation or rejection, between 1
+    /// and the configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Typed INVITE result.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct InviteOutput {
+    /// Invited nickname.
+    pub nickname: Nickname,
+    /// Destination channel.
+    pub channel: ChannelName,
+    /// Stable channel-resource URI.
+    pub resource: String,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// Server-side MONITOR list mutation.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorUpdateKind {
+    /// Add nicknames to the monitor list.
+    Add,
+    /// Remove nicknames from the monitor list.
+    Remove,
+    /// Clear the complete monitor list; `nicknames` must be empty.
+    Clear,
+}
+
+/// Update the server-side MONITOR list through a capability-checked schema.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MonitorUpdateInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Add, remove, or clear operation.
+    pub operation: MonitorUpdateKind,
+    /// Nicknames for add/remove; empty only for clear.
+    #[serde(default)]
+    pub nicknames: Vec<Nickname>,
+    /// Milliseconds to wait for any server response, between 1 and the
+    /// configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Typed MONITOR mutation result.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct MonitorUpdateOutput {
+    /// Applied operation.
+    pub operation: MonitorUpdateKind,
+    /// Affected nicknames.
+    pub nicknames: Vec<Nickname>,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
+}
+
+/// Change user or channel modes through a command-specific MCP schema.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModeSetInput {
+    /// Opaque handle returned by `irc.connect`.
+    pub agent_id: AgentId,
+    /// Nickname or channel whose modes are changed.
+    pub target: Target,
+    /// Mode change string such as `+o` or `-b`.
+    pub modes: String,
+    /// Ordered mode arguments.
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    /// Milliseconds to wait for server confirmation or rejection, between 1
+    /// and the configured maximum of 30000 by default.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Amount of duplicate wire/semantic detail retained in `result`.
+    #[serde(default = "default_full_result_detail")]
+    pub result_detail: ToolResultDetail,
+}
+
+/// Typed MODE mutation result.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct ModeSetOutput {
+    /// Affected nickname or channel.
+    pub target: Target,
+    /// Requested mode change string.
+    pub modes: String,
+    /// Requested mode arguments.
+    pub arguments: Vec<String>,
+    /// Stable channel-resource URI when the target is a channel.
+    pub resource: Option<String>,
+    /// Lossless correlated command result.
+    pub result: CommandResult,
 }
 
 /// Completion behavior requested from `irc.execute`.
