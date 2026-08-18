@@ -978,7 +978,9 @@ watches.
 The result contains the watch descriptor, caller-owned `initial_cursor`, a
 subscription-filter addition, and a client-neutral recurring-check recipe. The
 client maintains one consolidated `subscriptions/listen` stream for everything
-it needs. It merges the returned `filterAddition` under
+it needs. This is a host-issued MCP request, not a model-callable tool; it never
+appears in `tools/list`, and that absence carries no capability information. The
+host merges the returned `filterAddition` under
 `params.notifications`, preserving any `toolsListChanged`,
 `promptsListChanged`, or other resource entries already needed by the client.
 The addition requests `resourcesListChanged` plus updates for the attention
@@ -1002,7 +1004,12 @@ reserved for direct host integrations. Its compact states are `quiet`, `events`,
 `stream_reset`, and `event_gap`. Conversational attention events retain
 `source_account`; non-conversational critical events use the same compact shape
 with a short action-oriented `summary`. The ordinary quiet result has no
-`events` property, resource link, or redundant `activity` hint.
+`events` property, resource link, or redundant `activity` hint. Every result
+does contain `delivery`, sampled from the server's registry of live accepted
+listen filters for the authenticated owner. `mode: notification` proves a live
+stream covers the watch's model-resume URI. `mode: polling` means the fallback
+must continue; it may simply have raced stream activation and does not prove
+the client lacks support.
 
 The returned `resume_cursor` is attention-specific. When another selected page
 remains it is the last delivered match; when the immutable selection is fully
@@ -1023,6 +1030,9 @@ waiting; Codex must use notification mode or an actual scheduled task that
 honors `intervalSeconds`. Such a quiet recurring turn still invokes a model and
 consumes tokens; the compact result only minimizes that cost. The result's
 `deliveryModes` explains both choices without assuming a particular client.
+Recurring checks are cancelled only after a check positively reports
+`delivery.mode: notification`; a polling observation keeps the fallback in
+force.
 Delivery is stopped and the watch closed on done, abandonment, or disconnect.
 
 Multi Round-Trip Requests are complementary, not another delivery path. MRTR

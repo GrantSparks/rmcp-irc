@@ -9,8 +9,8 @@ transport = "plain"
 
 [onboarding]
 nickname_instruction = "Choose a nickname based on a mythological character."
-username_template = "mcp-{agent_id}"
-real_name_template = "rmcp-irc guest {nickname}"
+username_template = "{client}-{agent_short}"
+real_name_template = "rmcp-irc guest {nickname} [{client_full}]"
 initial_channels = []
 nickname_attempts = 8
 connect_timeout_ms = 15000

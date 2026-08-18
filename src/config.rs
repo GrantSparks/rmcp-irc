@@ -74,12 +74,18 @@ impl Config {
         validate_template(
             &self.onboarding.username_template,
             "onboarding.username_template",
-            &["{agent_id}"],
+            &["{agent_id}", "{agent_short}", "{client}"],
         )?;
         validate_template(
             &self.onboarding.real_name_template,
             "onboarding.real_name_template",
-            &["{agent_id}", "{nickname}"],
+            &[
+                "{agent_id}",
+                "{agent_short}",
+                "{nickname}",
+                "{client}",
+                "{client_full}",
+            ],
         )?;
         for channel in &self.onboarding.initial_channels {
             if channel.trim().is_empty()
@@ -381,8 +387,8 @@ impl Default for OnboardingConfig {
     fn default() -> Self {
         Self {
             nickname_instruction: "Choose a nickname based on a mythological character.".into(),
-            username_template: "mcp-{agent_id}".into(),
-            real_name_template: "rmcp-irc guest {nickname}".into(),
+            username_template: "{client}-{agent_short}".into(),
+            real_name_template: "rmcp-irc guest {nickname} [{client_full}]".into(),
             initial_channels: Vec::new(),
             nickname_attempts: 8,
             connect_timeout_ms: 15_000,
@@ -392,16 +398,123 @@ impl Default for OnboardingConfig {
 
 impl OnboardingConfig {
     /// Expand the default username for one provisional agent.
-    pub fn username(&self, agent_id: &str) -> String {
-        self.username_template.replace("{agent_id}", agent_id)
+    pub fn username(&self, agent_id: &str, client: Option<&ClientIdentity>) -> String {
+        self.username_template
+            .replace("{agent_id}", agent_id)
+            .replace("{agent_short}", &agent_short(agent_id))
+            .replace("{client}", &ClientIdentity::label(client))
     }
 
     /// Expand the default real name for one provisional agent.
-    pub fn real_name(&self, agent_id: &str, nickname: &str) -> String {
+    pub fn real_name(
+        &self,
+        agent_id: &str,
+        nickname: &str,
+        client: Option<&ClientIdentity>,
+    ) -> String {
         self.real_name_template
             .replace("{agent_id}", agent_id)
+            .replace("{agent_short}", &agent_short(agent_id))
             .replace("{nickname}", nickname)
+            .replace("{client}", &ClientIdentity::label(client))
+            .replace("{client_full}", &ClientIdentity::full(client))
     }
+}
+
+/// Longest client label kept in a username.
+///
+/// A server truncates `USER` to its own `USERLEN` (commonly around 20) and the
+/// agent discriminator has to survive alongside it, so the runtime name is
+/// clamped here rather than left for the server to cut at an arbitrary point.
+const CLIENT_LABEL_MAX: usize = 12;
+
+/// Hex characters of the agent handle kept by `{agent_short}`.
+const AGENT_SHORT_LEN: usize = 6;
+
+/// Who is driving this MCP session, as declared in the `initialize` handshake.
+///
+/// This is the only place the runtime identifies itself. The nickname is chosen
+/// by the model and the agent handle is a random UUID, so without this a human
+/// reading `WHOIS` cannot tell a Claude Code session from a Codex one.
+#[derive(Clone, Debug)]
+pub struct ClientIdentity {
+    /// `clientInfo.name`, verbatim.
+    pub name: String,
+    /// `clientInfo.version`, verbatim.
+    pub version: String,
+}
+
+impl ClientIdentity {
+    /// Wire-safe short form for the username field.
+    ///
+    /// Unknown clients collapse to `mcp` so the field never renders empty and
+    /// the resulting username stays a legal IRC user string.
+    fn label(client: Option<&Self>) -> String {
+        let Some(client) = client else {
+            return "mcp".into();
+        };
+        let sanitized = sanitize_label(&client.name);
+        if sanitized.is_empty() {
+            "mcp".into()
+        } else {
+            sanitized
+        }
+    }
+
+    /// Human-facing form for the real-name field, which permits spaces.
+    fn full(client: Option<&Self>) -> String {
+        let Some(client) = client else {
+            return "unidentified MCP client".into();
+        };
+        let name = sanitize_realname_fragment(&client.name);
+        let version = sanitize_realname_fragment(&client.version);
+        match (name.is_empty(), version.is_empty()) {
+            (true, _) => "unidentified MCP client".into(),
+            (false, true) => name,
+            (false, false) => format!("{name} {version}"),
+        }
+    }
+}
+
+/// Reduce a client name to lowercase alphanumerics and single hyphens.
+fn sanitize_label(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+        if out.len() >= CLIENT_LABEL_MAX {
+            break;
+        }
+    }
+    out.truncate(CLIENT_LABEL_MAX);
+    out.trim_matches('-').to_owned()
+}
+
+/// Strip only what cannot ride in a real name; spaces are legal there.
+fn sanitize_realname_fragment(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !matches!(ch, '\0' | '\r' | '\n'))
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// The distinguishing tail of an agent handle.
+///
+/// Handles look like `agent-104f9e07-...`; the constant prefix carries no
+/// information, so `{agent_short}` starts after it.
+fn agent_short(agent_id: &str) -> String {
+    agent_id
+        .strip_prefix("agent-")
+        .unwrap_or(agent_id)
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(AGENT_SHORT_LEN)
+        .collect()
 }
 
 /// Exponential reconnect policy.
@@ -764,5 +877,100 @@ mod tests {
             format!("{reference:?}"),
             "CredentialRef { env: \"ERGO_PASSWORD\", .. }"
         );
+    }
+
+    fn claude() -> ClientIdentity {
+        ClientIdentity {
+            name: "claude-code".into(),
+            version: "2.1.0".into(),
+        }
+    }
+
+    #[test]
+    fn default_username_names_the_runtime_and_stays_within_userlen() {
+        let onboarding = OnboardingConfig::default();
+        let username = onboarding.username("agent-104f9e07-6d49-4474-a402", Some(&claude()));
+
+        assert_eq!(username, "claude-code-104f9e");
+        // Ergo truncates USER at its USERLEN; staying under keeps the
+        // discriminator, which is the half that makes the name unique.
+        assert!(username.len() <= 19, "username too long: {username}");
+    }
+
+    #[test]
+    fn default_username_distinguishes_two_runtimes_sharing_a_handle_prefix() {
+        let onboarding = OnboardingConfig::default();
+        let codex = ClientIdentity {
+            name: "codex".into(),
+            version: "0.9".into(),
+        };
+
+        assert_eq!(
+            onboarding.username("agent-104f9e07-6d49", Some(&codex)),
+            "codex-104f9e"
+        );
+        assert_eq!(
+            onboarding.username("agent-104f9e07-6d49", Some(&claude())),
+            "claude-code-104f9e"
+        );
+    }
+
+    #[test]
+    fn an_unidentified_client_still_yields_a_legal_username() {
+        let onboarding = OnboardingConfig::default();
+        let username = onboarding.username("agent-104f9e07", None);
+
+        assert_eq!(username, "mcp-104f9e");
+        assert!(!username.contains(' '));
+        assert!(!username.is_empty());
+    }
+
+    #[test]
+    fn real_name_carries_the_runtime_and_its_version() {
+        let onboarding = OnboardingConfig::default();
+
+        assert_eq!(
+            onboarding.real_name("agent-104f9e07", "Ilmarinen", Some(&claude())),
+            "rmcp-irc guest Ilmarinen [claude-code 2.1.0]"
+        );
+        assert_eq!(
+            onboarding.real_name("agent-104f9e07", "Ilmarinen", None),
+            "rmcp-irc guest Ilmarinen [unidentified MCP client]"
+        );
+    }
+
+    #[test]
+    fn client_labels_are_sanitized_and_clamped() {
+        // Spaces and punctuation cannot ride in a username, and an
+        // over-long runtime name must not eat the whole field.
+        assert_eq!(sanitize_label("Visual Studio Code"), "visual-studi");
+        assert_eq!(sanitize_label("Claude_Code/2"), "claude-code");
+        assert_eq!(sanitize_label("!!!"), "");
+        assert!(sanitize_label("Visual Studio Code").len() <= CLIENT_LABEL_MAX);
+    }
+
+    #[test]
+    fn a_real_name_never_carries_wire_breaking_characters() {
+        let hostile = ClientIdentity {
+            name: "evil\r\nQUIT".into(),
+            version: "1.0".into(),
+        };
+        let real_name = onboarding_default().real_name("agent-1", "Nick", Some(&hostile));
+
+        assert!(!real_name.contains('\r'));
+        assert!(!real_name.contains('\n'));
+    }
+
+    fn onboarding_default() -> OnboardingConfig {
+        OnboardingConfig::default()
+    }
+
+    #[test]
+    fn templates_accept_the_client_placeholders() {
+        let mut config = Config::default();
+        config.onboarding.username_template = "{client}-{agent_short}".into();
+        config.onboarding.real_name_template = "{nickname} via {client_full}".into();
+
+        assert!(config.validate().is_ok());
     }
 }

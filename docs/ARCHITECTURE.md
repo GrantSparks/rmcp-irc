@@ -154,11 +154,15 @@ that warrants a model turn; other notifications in the same host stream can
 update cache, UI, or resynchronization state without invoking a model. A capable
 host can resume the model only on that signal and therefore spends no model
 tokens while IRC is quiet. Otherwise the client must run the fallback in the
-same conversation immediately and at least every
-60 seconds, using nonblocking `irc.attention.check` calls and a caller-owned
+same conversation immediately and then every 60 seconds, using nonblocking
+`irc.attention.check` calls and a caller-owned
 checkpoint. The check explicitly aligns the separate activity-hint anchor after
 each page, so already handled activity does not remain advertised on later tool
-results. Quiet scheduled model turns still consume tokens.
+results. It also reports whether the server currently observes an authenticated
+live listen filter covering the model-resume URI. Only that positive observation
+stops polling; a negative result may race activation. `subscriptions/listen` is
+a host protocol request and never appears in the tool registry. Quiet scheduled
+model turns still consume tokens.
 
 Top-level Multi Round-Trip Requests are complementary: they may request more
 input while the server is already processing a client request, but cannot

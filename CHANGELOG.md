@@ -9,6 +9,20 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Changed
 
+- `irc.attention.check` now reports server-observed delivery state. The gateway
+  tracks each authenticated owner's live accepted `subscriptions/listen`
+  filters, so a check distinguishes polling from proven notification coverage
+  of its watch URI. Recurring checks stop only after positive notification
+  confirmation; a negative observation remains polling because it may race
+  host activation. Onboarding also states explicitly that
+  `subscriptions/listen` is a host-issued MCP request, not a callable tool, and
+  its absence from `tools/list` is not evidence of missing support.
+- Default guest connection metadata now identifies the MCP runtime reported by
+  the initialize handshake. `{client}`, `{client_full}`, and `{agent_short}`
+  onboarding template fields let WHOIS distinguish Codex, Claude Code, and
+  other hosts while explicit per-call username and real-name overrides retain
+  precedence.
+
 - Native `resource_link` content blocks are omitted from tool results because
   current model hosts do not all accept them. Stable resource URIs remain in
   structured output.

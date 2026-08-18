@@ -103,6 +103,54 @@ impl Subscribed {
             .to_owned()
     }
 
+    /// Open compound model attention and retain the fields needed to check it.
+    async fn attention(&self) -> (String, String, serde_json::Value) {
+        let (status, body) = send(
+            &self.router,
+            Envelope::tool_call(
+                "irc.attention.open",
+                serde_json::json!({ "agent_id": self.agent_id }),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let result = &body["result"]["structuredContent"]["result"];
+        (
+            result["watch"]["watch_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("an attention watch id: {body}"))
+                .to_owned(),
+            result["watch"]["uri"]
+                .as_str()
+                .unwrap_or_else(|| panic!("an attention watch URI: {body}"))
+                .to_owned(),
+            result["initial_cursor"].clone(),
+        )
+    }
+
+    /// Check attention and return the server-observed delivery block.
+    async fn attention_delivery(
+        &self,
+        watch_id: &str,
+        cursor: &serde_json::Value,
+    ) -> serde_json::Value {
+        let (status, body) = send(
+            &self.router,
+            Envelope::tool_call(
+                "irc.attention.check",
+                serde_json::json!({
+                    "agent_id": self.agent_id,
+                    "watch_id": watch_id,
+                    "cursor": cursor,
+                    "wait_ms": 0,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        body["result"]["structuredContent"]["result"]["delivery"].clone()
+    }
+
     /// Say something to one target, which journals both the outbound record and
     /// the server's echo of it.
     async fn say(&self, target: &str, text: &str) {
@@ -178,6 +226,37 @@ impl Subscribed {
         let (_, body) = send(&self.router, request).await;
         body
     }
+}
+
+#[tokio::test]
+async fn attention_check_reports_only_server_observed_live_delivery() {
+    let fixture = Subscribed::local().await;
+    let (watch_id, watch_uri, cursor) = fixture.attention().await;
+
+    let before = fixture.attention_delivery(&watch_id, &cursor).await;
+    assert_eq!(before["mode"], "polling", "{before}");
+    assert_eq!(before["stream_open"], false, "{before}");
+    assert_eq!(before["covers_resume_resource"], false, "{before}");
+
+    let mut listening = fixture.listen(&[watch_uri.as_str()], None).await;
+    listening.acknowledgment().await;
+    let mut active = serde_json::Value::Null;
+    for _ in 0..20 {
+        active = fixture.attention_delivery(&watch_id, &cursor).await;
+        if active["mode"] == "notification" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(active["mode"], "notification", "{active}");
+    assert_eq!(active["stream_open"], true, "{active}");
+    assert_eq!(active["covers_resume_resource"], true, "{active}");
+    assert!(
+        active["instruction"]
+            .as_str()
+            .is_some_and(|instruction| instruction.contains("cancel the recurring check")),
+        "{active}"
+    );
 }
 
 /// One `subscriptions/listen` response, read as it arrives rather than after it

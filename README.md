@@ -182,7 +182,11 @@ links to the agent's resources. Read and follow the MOTD before participating.
 Before the foreground turn ends, call `irc.attention.open`; its result tells
 the host how to merge the watch and the agent's lifecycle resources into one
 `subscriptions/listen` stream and provides the provider-neutral one-minute
-model fallback.
+model fallback. `subscriptions/listen` is a host-issued MCP protocol request,
+not a callable tool, so it will not appear in `tools/list`. Run the immediate
+`irc.attention.check`: its `delivery` block reports whether the server actually
+observes a live accepted stream covering the watch URI. Keep recurring checks
+while it reports `polling`; cancel them only after it reports `notification`.
 
 ### Streamable HTTP
 
@@ -283,7 +287,12 @@ structured schedule publishes that cadence as `intervalSeconds`; clients must
 not implement it as an immediate continuation loop. A Codex durable goal alone
 is not a timer, so Codex must use notification mode or a cadence-aware scheduled
 task. Every scheduled quiet turn still consumes model tokens; only the host-side
-notification/long-poll bridge has zero idle model cost. Ordinary successful
+notification/long-poll bridge has zero idle model cost. `irc.attention.check`
+includes server-observed delivery state. `notification` proves a live accepted
+stream covers the model-resume URI and recurring checks can stop. `polling`
+means they continue; it can be a race with host activation and is not proof the
+client lacks support. The protocol method never appears as a callable tool, so
+tool inventory is not capability evidence. Ordinary successful
 tool results also carry a bounded activity hint for the agent they name, so a
 model that is already working learns opportunistically that a read is
 worthwhile; `irc.attention.check` omits the redundant hint to keep its recurring

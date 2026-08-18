@@ -406,10 +406,14 @@ unrelated traffic from aging a quiet attention cursor into a gap.
 A direct host bridge consumes the listen stream and resumes a model only on a
 matching watch update; that spends no model tokens while quiet. Where the model
 cannot be resumed by a notification, the same conversation runs the
-ordinary prompt returned by `irc.attention.open` immediately and at least every
+ordinary prompt returned by `irc.attention.open` immediately and then every
 60 seconds, calling `irc.attention.check` with `wait_ms: 0` and
 `set_activity_anchor: true`. A scheduled quiet turn still consumes model tokens
-and must not be described as token-free. The check omits a redundant `activity`
+and must not be described as token-free. Each check reports server-observed
+delivery coverage for the authenticated caller. Polling stops only after a
+positive notification observation; polling can be an activation race and is
+not a client-capability verdict. `subscriptions/listen` is issued by the host,
+never exposed as a callable tool. The check omits a redundant `activity`
 hint because its own result is the authoritative selected read. While a model is
 already running, bounded activity hints on other successful tool results provide
 an opportunistic signal without another round trip; they cannot start the turn

@@ -40,6 +40,7 @@ use crate::{
         actor::{CompletionMode, ConnectMilestone},
         journal::{EventClass, EventCursor, EventFilter, EventOrigin},
     },
+    config::ClientIdentity,
     dcc::session::{DccDirection, DccSession, DccSessionId, DccState},
     error::{ErrorKind, GatewayError},
     gateway::{ConnectRequest, ConversationWindow, Gateway},
@@ -52,7 +53,8 @@ use crate::{
     mcp::{
         attention::{
             ATTENTION_ONBOARDING, AttentionCheckInput, AttentionCheckOutput, AttentionCheckState,
-            AttentionOpenInput, AttentionOpenOutput, AttentionSchedule, AttentionSubscription,
+            AttentionDelivery, AttentionOpenInput, AttentionOpenOutput, AttentionSchedule,
+            AttentionSubscription,
         },
         authorization::{CallerPolicy, OwnerId},
         confirm_action, connect_nickname, dcc_accept,
@@ -253,7 +255,7 @@ impl IrcMcpService {
     /// Maintain model responsiveness after the foreground turn ends.
     #[prompt(
         name = "irc-maintain-attention",
-        description = "Open compound IRC attention, merge it into the client's listen stream, and arrange the one-minute model fallback."
+        description = "Open compound IRC attention, give the host a listen-stream recipe, and arrange checks until the server confirms notification delivery."
     )]
     async fn prompt_maintain_attention(
         &self,
@@ -266,7 +268,7 @@ impl IrcMcpService {
         vec![PromptMessage::new_text(
             Role::User,
             format!(
-                "For IRC agent `{}`, call `irc.attention.open`. {targets} Follow the returned delivery instructions and establish one mode before claiming to watch or stand by. Notification mode keeps the returned filter merged into one `subscriptions/listen` stream and resumes this same conversation when modelResumeResource changes. Recurring-check mode runs the returned prompt immediately, then every 60 seconds in this same conversation. Treat `intervalSeconds` as the cadence and never use an immediate continuation loop; in Codex, a durable goal alone is not a timer. Persist `resume_cursor` only after handling returned events, drain immediately while `has_more` is true, and stop delivery, close the watch, and disconnect when the work ends. Quiet recurring checks consume model tokens; notification mode does not invoke the model while quiet. Successful tool results may report bounded activity while the model is already running, but cannot wake it.",
+                "For IRC agent `{}`, call `irc.attention.open`. {targets} Follow the returned delivery instructions and establish one mode before claiming to watch or stand by. `subscriptions/listen` is a host-issued MCP request, never a tool, so its absence from tools/list says nothing about support. Notification mode keeps the returned filter merged into one stream and resumes this conversation when modelResumeResource changes. Recurring-check mode runs the immediate check, then every 60 seconds while its server-observed delivery.mode is polling; polling may be an activation race. Cancel recurring checks only after delivery.mode is notification. Treat intervalSeconds as the cadence and never use an immediate continuation loop; in Codex, a durable goal alone is not a timer. Persist resume_cursor only after handling events, drain while has_more, and stop delivery, close the watch, and disconnect when work ends. Quiet recurring checks consume model tokens; notification mode does not.",
                 input.agent_id,
             ),
         )]
@@ -429,7 +431,7 @@ impl IrcMcpService {
             return Ok(elicit_needs_a_way_to_ask().into());
         }
 
-        let request = connect_request(&input, chosen);
+        let request = connect_request(&input, chosen, client_identity(&context));
         Ok(
             match self
                 .connect_reporting_progress(owner.clone(), request, &context)
@@ -488,8 +490,10 @@ impl IrcMcpService {
     /// and by the portable one-minute model-scheduler fallback.
     #[tool(
         name = "irc.attention.open",
-        description = "Open model attention for one IRC guest, combining direct/addressed messages, \
-                       account-identified humans, and complete traffic in selected task targets.",
+        description = "Open model attention for one IRC guest and return a host-level \
+                       subscriptions/listen recipe plus recurring checks. subscriptions/listen is \
+                       an MCP protocol request, not a callable tool; use attention.check delivery \
+                       state rather than tools/list to determine whether notification mode is live.",
         output_schema = envelope_schema::<AttentionOpenOutput>(),
         annotations(
             title = "Open IRC model attention",
@@ -509,13 +513,12 @@ impl IrcMcpService {
                 let resources = ResourceUris::for_agent(&created.watch.agent_id);
                 let subscription = AttentionSubscription::new(&created.watch, &resources);
                 let summary = format!(
-                    "Attention opened for {} at {}. Establish one returned delivery mode now: keep \
-                     the subscriptions/listen filter active and resume this same conversation when \
-                     modelResumeResource changes, or run the recurring-check prompt immediately in \
-                     this same conversation and then every 60 seconds. Do not use an immediate \
-                     continuation loop; in Codex, a durable goal alone is not a timer. If neither \
-                     notification mode nor a cadence-aware scheduler is available, \
-                     disclose that responsiveness is best-effort.",
+                    "Attention opened for {} at {}. The host, not the model, opens \
+                     subscriptions/listen; it is not a tool and absence from tools/list proves \
+                     nothing. Run the returned prompt immediately and every 60 seconds while \
+                     attention.check reports delivery.mode polling. Cancel recurring checks only \
+                     after the server observes notification mode. Do not use an immediate \
+                     continuation loop; in Codex, a durable goal alone is not a timer.",
                     created.watch.agent_id, created.watch.uri,
                 );
                 let link = ContentBlock::ResourceLink(watch_resource_entry(&created.watch));
@@ -547,48 +550,59 @@ impl IrcMcpService {
     async fn irc_attention_check(
         &self,
         Parameters(input): Parameters<AttentionCheckInput>,
-    ) -> CallToolResult {
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let owner = self.callers.identify(&context)?;
+        self.gateway
+            .authorize_agent(&owner, &input.agent_id)
+            .await?;
         let wait = Duration::from_millis(input.wait_ms);
-        match self
-            .gateway
-            .read_attention_events(
-                &input.agent_id,
-                &input.watch_id,
-                input.cursor,
-                input.limit,
-                wait,
-            )
-            .await
-        {
-            Ok(page) => {
-                let output = AttentionCheckOutput::from_page(page);
-                // Like the opt-in flag on `irc.events.read`, this acknowledges
-                // only the courtesy activity hint. It never moves a watch or
-                // delivery cursor, so retrying the caller's previous attention
-                // cursor remains at-least-once even if this response is lost.
-                if input.set_activity_anchor {
-                    self.gateway
-                        .set_activity_anchor(&input.agent_id, output.resume_cursor.clone())
-                        .await;
+        Ok(
+            match self
+                .gateway
+                .read_attention_events(
+                    &input.agent_id,
+                    &input.watch_id,
+                    input.cursor,
+                    input.limit,
+                    wait,
+                )
+                .await
+            {
+                Ok(page) => {
+                    let mut output = AttentionCheckOutput::from_page(page);
+                    let resume_resource = format!("{WATCH_URI_PREFIX}{}", input.watch_id);
+                    let coverage = self.gateway.subscription_coverage(&owner, &resume_resource);
+                    output.delivery =
+                        AttentionDelivery::observed(coverage.stream_open, coverage.covers_resource);
+                    // Like the opt-in flag on `irc.events.read`, this acknowledges
+                    // only the courtesy activity hint. It never moves a watch or
+                    // delivery cursor, so retrying the caller's previous attention
+                    // cursor remains at-least-once even if this response is lost.
+                    if input.set_activity_anchor {
+                        self.gateway
+                            .set_activity_anchor(&input.agent_id, output.resume_cursor.clone())
+                            .await;
+                    }
+                    let summary = match output.state {
+                        AttentionCheckState::Quiet => "quiet".into(),
+                        AttentionCheckState::Events => format!(
+                            "{} attention event(s){}",
+                            output.events.len(),
+                            if output.has_more { "; drain again" } else { "" }
+                        ),
+                        AttentionCheckState::StreamReset => {
+                            "stream_reset: report lost continuity and recover".into()
+                        }
+                        AttentionCheckState::EventGap => {
+                            "event_gap: report lost records and recover".into()
+                        }
+                    };
+                    tool_success(summary, &output).into()
                 }
-                let summary = match output.state {
-                    AttentionCheckState::Quiet => "quiet".into(),
-                    AttentionCheckState::Events => format!(
-                        "{} attention event(s){}",
-                        output.events.len(),
-                        if output.has_more { "; drain again" } else { "" }
-                    ),
-                    AttentionCheckState::StreamReset => {
-                        "stream_reset: report lost continuity and recover".into()
-                    }
-                    AttentionCheckState::EventGap => {
-                        "event_gap: report lost records and recover".into()
-                    }
-                };
-                tool_success(summary, &output)
-            }
-            Err(error) => tool_error(error),
-        }
+                Err(error) => tool_error(error).into(),
+            },
+        )
     }
 
     /// Disconnect and destroy one actor and all of its direct sessions.
@@ -2960,10 +2974,18 @@ impl ServerHandler for IrcMcpService {
         let owner = self.callers.identify(context.request_context())?;
         self.authorize_resource_subscriptions(&owner, context.accepted())
             .await?;
+        let _subscription = self.gateway.register_live_subscription(
+            owner.clone(),
+            context
+                .accepted()
+                .resource_subscriptions
+                .clone()
+                .unwrap_or_default(),
+        );
         let mut updates = self.gateway.subscribe_resource_updates();
         loop {
             tokio::select! {
-                () = context.cancelled() => return Ok(()),
+                () = context.cancelled() => break Ok(()),
                 update = updates.recv() => match update {
                     Ok(uri) if uri == "irc://agents" => {
                         let _ = context.sink().notify_resource_list_changed().await;
@@ -2988,7 +3010,7 @@ impl ServerHandler for IrcMcpService {
                         );
                         self.notify_resynchronization(&context, &owner).await;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break Ok(()),
                 }
             }
         }
@@ -4055,7 +4077,11 @@ fn watch_resource_entry(watch: &WatchDescriptor) -> Resource {
 /// re-offering those names would spend attempts on known collisions and could
 /// register one of them after all. The policy is carried through unchanged, so a
 /// chosen name that collides in turn asks again.
-fn connect_request(input: &ConnectInput, chosen: Option<Nickname>) -> ConnectRequest {
+fn connect_request(
+    input: &ConnectInput,
+    chosen: Option<Nickname>,
+    client: Option<ClientIdentity>,
+) -> ConnectRequest {
     let (nickname, nickname_fallbacks) = match chosen {
         Some(nickname) => (nickname, Vec::new()),
         None => (input.nickname.clone(), input.nickname_fallbacks.clone()),
@@ -4068,7 +4094,20 @@ fn connect_request(input: &ConnectInput, chosen: Option<Nickname>) -> ConnectReq
         real_name: input.real_name.clone(),
         channels: input.channels.iter().cloned().collect::<BTreeSet<_>>(),
         activity: input.activity,
+        client,
     }
+}
+
+/// Read the runtime identity declared by this session's `initialize`.
+///
+/// Absent for a peer that never completed a handshake, which is why every
+/// consumer treats it as optional rather than defaulting to a guess.
+fn client_identity(context: &RequestContext<RoleServer>) -> Option<ClientIdentity> {
+    let info = context.peer.peer_info()?;
+    Some(ClientIdentity {
+        name: info.client_info.name.clone(),
+        version: info.client_info.version.clone(),
+    })
 }
 
 fn query_message(query: Query) -> Result<OutboundMessage, GatewayError> {

@@ -2,11 +2,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, RwLock as StdRwLock},
     time::Duration,
 };
 
 use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
+use uuid::Uuid;
 
 use crate::{
     agent::{
@@ -17,7 +18,7 @@ use crate::{
         },
         journal::{CursorQuery, EventCursor, EventFilter, EventPage, EventVerbosity, RecentQuery},
     },
-    config::Config,
+    config::{ClientIdentity, Config},
     dcc::{
         confine::ReceiveChoice,
         session::{DccKind, DccSession, DccSessionId, DccState},
@@ -63,6 +64,12 @@ pub struct ConnectRequest {
     pub channels: BTreeSet<ChannelName>,
     /// How this agent's tool results should carry activity hints.
     pub activity: ActivityPreference,
+    /// Runtime that opened this MCP session, from the `initialize` handshake.
+    ///
+    /// Only used to expand the default username and real name; an explicit
+    /// `username`/`real_name` override still wins, because a caller that named
+    /// its own identity has said what it wants to be seen as.
+    pub client: Option<ClientIdentity>,
 }
 
 /// Which conversational window a resource read wants.
@@ -112,6 +119,40 @@ struct OwnedAgent {
     activity_anchor: EventCursor,
 }
 
+/// One client-opened MCP notification stream whose accepted filter is live.
+#[derive(Clone, Debug)]
+struct LiveSubscription {
+    owner: OwnerId,
+    resource_subscriptions: BTreeSet<String>,
+}
+
+type LiveSubscriptionRegistry = Arc<StdRwLock<BTreeMap<Uuid, LiveSubscription>>>;
+
+/// Removes one live-stream registration even when its request future is dropped.
+#[derive(Debug)]
+pub struct LiveSubscriptionGuard {
+    id: Uuid,
+    registry: LiveSubscriptionRegistry,
+}
+
+impl Drop for LiveSubscriptionGuard {
+    fn drop(&mut self) {
+        self.registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
+/// Server-observed notification coverage for one resource at one instant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubscriptionCoverage {
+    /// Whether this owner currently has any `subscriptions/listen` stream.
+    pub stream_open: bool,
+    /// Whether one live accepted filter contains the requested resource URI.
+    pub covers_resource: bool,
+}
+
 /// Shared in-memory gateway for all MCP transports.
 #[derive(Debug)]
 pub struct Gateway {
@@ -119,6 +160,7 @@ pub struct Gateway {
     agents: RwLock<BTreeMap<AgentId, OwnedAgent>>,
     capacity: Arc<Semaphore>,
     resource_updates: broadcast::Sender<String>,
+    live_subscriptions: LiveSubscriptionRegistry,
     watches: Arc<WatchRegistry>,
     request_states: RequestStateSealer,
     redeemed_confirmations: RedeemedConfirmations,
@@ -144,6 +186,7 @@ impl Gateway {
             agents: RwLock::new(BTreeMap::new()),
             capacity,
             resource_updates,
+            live_subscriptions: Arc::new(StdRwLock::new(BTreeMap::new())),
             watches,
             request_states: RequestStateSealer::generate(),
             redeemed_confirmations: RedeemedConfirmations::default(),
@@ -207,6 +250,51 @@ impl Gateway {
         self.resource_updates.subscribe()
     }
 
+    /// Record one accepted notification stream after authorization succeeds.
+    pub fn register_live_subscription(
+        &self,
+        owner: OwnerId,
+        resource_subscriptions: impl IntoIterator<Item = String>,
+    ) -> LiveSubscriptionGuard {
+        let id = Uuid::new_v4();
+        self.live_subscriptions
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                id,
+                LiveSubscription {
+                    owner,
+                    resource_subscriptions: resource_subscriptions.into_iter().collect(),
+                },
+            );
+        LiveSubscriptionGuard {
+            id,
+            registry: self.live_subscriptions.clone(),
+        }
+    }
+
+    /// Observe whether an authenticated caller currently has delivery for a URI.
+    pub fn subscription_coverage(
+        &self,
+        owner: &OwnerId,
+        resource_uri: &str,
+    ) -> SubscriptionCoverage {
+        let subscriptions = self
+            .live_subscriptions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stream_open = false;
+        let mut covers_resource = false;
+        for subscription in subscriptions.values().filter(|item| item.owner == *owner) {
+            stream_open = true;
+            covers_resource |= subscription.resource_subscriptions.contains(resource_uri);
+        }
+        SubscriptionCoverage {
+            stream_open,
+            covers_resource,
+        }
+    }
+
     /// Number of published guest actors.
     #[cfg(test)]
     pub async fn agent_count(&self) -> usize {
@@ -243,13 +331,14 @@ impl Gateway {
             .try_acquire_owned()
             .map_err(|_| GatewayError::ResourceLimit("maximum agent count reached".into()))?;
         let agent_id = AgentId::new();
+        let client = request.client.as_ref();
         let username = request
             .username
-            .unwrap_or_else(|| self.config.onboarding.username(agent_id.as_str()));
+            .unwrap_or_else(|| self.config.onboarding.username(agent_id.as_str(), client));
         let real_name = request.real_name.unwrap_or_else(|| {
             self.config
                 .onboarding
-                .real_name(agent_id.as_str(), request.nickname.as_str())
+                .real_name(agent_id.as_str(), request.nickname.as_str(), client)
         });
         let channels = self
             .config
@@ -854,5 +943,52 @@ mod tests {
         assert!(validate_identity_field(Some("bad\nname"), "username", false).is_err());
         assert!(validate_identity_field(Some("two words"), "username", false).is_err());
         assert!(validate_identity_field(Some("two words"), "real name", true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn live_subscription_coverage_is_owner_scoped_and_removed_on_exit() {
+        let gateway = Gateway::new(Config::default());
+        let mine = OwnerId::from_bearer("mine");
+        let theirs = OwnerId::from_bearer("theirs");
+        let uri = "irc://watches/example";
+
+        let before = gateway.subscription_coverage(&mine, uri);
+        assert_eq!(
+            before,
+            SubscriptionCoverage {
+                stream_open: false,
+                covers_resource: false,
+            }
+        );
+
+        let unrelated = gateway
+            .register_live_subscription(mine.clone(), ["irc://agents/example/status".into()]);
+        let covered = gateway.register_live_subscription(mine.clone(), [uri.to_owned()]);
+
+        assert_eq!(
+            gateway.subscription_coverage(&mine, uri),
+            SubscriptionCoverage {
+                stream_open: true,
+                covers_resource: true,
+            }
+        );
+        assert_eq!(
+            gateway.subscription_coverage(&theirs, uri),
+            SubscriptionCoverage {
+                stream_open: false,
+                covers_resource: false,
+            }
+        );
+
+        drop(covered);
+        assert_eq!(
+            gateway.subscription_coverage(&mine, uri),
+            SubscriptionCoverage {
+                stream_open: true,
+                covers_resource: false,
+            }
+        );
+        drop(unrelated);
+        assert!(!gateway.subscription_coverage(&mine, uri).stream_open);
     }
 }

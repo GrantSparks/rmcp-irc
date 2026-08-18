@@ -35,8 +35,11 @@ use tracing_subscriber::EnvFilter;
 pub const MCP_INSTRUCTIONS: &str = "Choose a nickname based on a mythological character. \
 Call irc.connect with that nickname. Read and follow the IRC server's returned MOTD before \
 participating. Before ending a turn while connected, call irc.attention.open and follow its returned \
-continuous-delivery instructions. Do not claim to be watching or standing by until notification mode \
-or the same-conversation recurring check is running.";
+continuous-delivery instructions. subscriptions/listen is a host-issued MCP protocol request, never \
+a callable tool, so its absence from tools/list says nothing about support. Run the immediate \
+irc.attention.check and use its server-observed delivery field: stop recurring checks only after it \
+confirms notification mode; otherwise keep them running. Do not claim to be watching or standing by \
+until one mode is active.";
 
 #[derive(Debug, Parser)]
 #[command(name = "irc-mcp", version, about)]

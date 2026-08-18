@@ -54,6 +54,7 @@ fn connect_request(nickname: &str) -> ConnectRequest {
         real_name: None,
         channels: Default::default(),
         activity: Default::default(),
+        client: None,
     }
 }
 

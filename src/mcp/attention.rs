@@ -40,9 +40,12 @@ pub const ATTENTION_ONBOARDING: &str = "Before ending a turn while this IRC agen
 open attention with irc.attention.open and follow its returned delivery instructions. Keep one \
 subscriptions/listen stream open and resume this conversation when modelResumeResource changes, or \
 run the returned prompt immediately and then every 60 seconds in this same conversation. Do not use \
-an immediate continuation loop; in Codex, a durable goal alone is not a timer. If the client supports \
-neither notification mode nor a cadence-aware scheduler, disclose that responsiveness is best-effort. \
-Stop delivery, close the watch, and disconnect when the task is done or abandoned.";
+an immediate continuation loop; in Codex, a durable goal alone is not a timer. subscriptions/listen \
+is a host-issued MCP protocol request, never a callable tool, so its absence from tools/list says \
+nothing about client support. The immediate attention check reports server-observed delivery truth: \
+cancel recurring checks only after it confirms notification mode; a polling result may be an \
+activation race, so keep checking. Claim best-effort only after explicit client failure and no \
+cadence-aware scheduler. Stop delivery, close the watch, and disconnect when the task is done or abandoned.";
 
 /// Input accepted by `irc.attention.open`.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -130,14 +133,18 @@ impl AttentionSchedule {
                  handles. After the immediate first check, run each later check 60 seconds after the \
                  previous check; do not use an immediate continuation loop. In Codex, a durable goal \
                  alone is not a cadence-aware scheduler and can fire repeatedly without waiting, so \
-                 use notification mode or an actual scheduled task that honors this interval. Cancel \
-                 this recurring task, close the watch, and disconnect when the work is done or \
+                 use notification mode or an actual scheduled task that honors this interval. Each \
+                 check's delivery field is server-observed. Cancel this recurring task only after \
+                 delivery.mode is notification; polling can be a host activation race and means keep \
+                 checking. Close the watch and disconnect when the work is done or \
                  abandoned.",
                 watch.agent_id, watch.watch_id, initial_cursor.stream_id, initial_cursor.sequence,
             ),
             delivery_modes: vec![
                 "Notification mode: keep the returned subscriptions/listen filter active and resume this same conversation when modelResumeResource changes",
                 "Recurring-check mode: run this prompt immediately, then every 60 seconds in this same conversation; do not use an immediate continuation loop",
+                "subscriptions/listen is a host-issued MCP request, not a tool; absence from tools/list is not evidence of missing support",
+                "Cancel recurring checks only after attention.check reports delivery.mode notification; polling may be an activation race",
                 "Codex: a durable goal alone is not a timer; use notification mode or a cadence-aware scheduled task that honors intervalSeconds",
                 "If neither mode is available, disclose that responsiveness is best-effort",
             ],
@@ -278,6 +285,57 @@ pub enum AttentionCheckState {
     StreamReset,
     /// Records after the requested cursor were evicted before this check.
     EventGap,
+}
+
+/// Delivery mechanism the server can prove is live for this attention watch.
+#[derive(Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionDeliveryMode {
+    /// A client-opened notification stream currently covers the watch URI.
+    Notification,
+    /// No covering stream has been observed yet; keep the recurring check.
+    Polling,
+}
+
+/// Server-observed delivery truth, sampled when `irc.attention.check` runs.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct AttentionDelivery {
+    /// Notification when a live accepted filter covers this watch; otherwise polling.
+    pub mode: AttentionDeliveryMode,
+    /// Whether this caller currently has any live `subscriptions/listen` request.
+    pub stream_open: bool,
+    /// Whether a live accepted filter includes this watch's model-resume URI.
+    pub covers_resume_resource: bool,
+    /// Time at which the server sampled its live subscription registry.
+    pub observed_at: Timestamp,
+    /// Immediate operational consequence for the recurring-check fallback.
+    pub instruction: &'static str,
+}
+
+impl AttentionDelivery {
+    /// Build delivery state from the live stream facts observed by the server.
+    pub fn observed(stream_open: bool, covers_resume_resource: bool) -> Self {
+        let mode = if covers_resume_resource {
+            AttentionDeliveryMode::Notification
+        } else {
+            AttentionDeliveryMode::Polling
+        };
+        let instruction = match mode {
+            AttentionDeliveryMode::Notification => {
+                "Notification delivery is active; cancel the recurring check and retain this watch cursor for the next notification-driven turn."
+            }
+            AttentionDeliveryMode::Polling => {
+                "Notification delivery is not yet proven; keep the recurring check running. A negative observation may be an activation race, not proof that the client lacks support."
+            }
+        };
+        Self {
+            mode,
+            stream_open,
+            covers_resume_resource,
+            observed_at: Timestamp::now(),
+            instruction,
+        }
+    }
 }
 
 /// Compact event shape used only by model attention.
@@ -421,6 +479,8 @@ fn serialized_name(value: &impl Serialize) -> String {
 /// Token-minimized result of `irc.attention.check`.
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct AttentionCheckOutput {
+    /// Whether notification delivery is actually live, observed by the server.
+    pub delivery: AttentionDelivery,
     /// Quiet, events, or an explicit loss condition.
     pub state: AttentionCheckState,
     /// Compact selected events. Omitted entirely on the normal quiet path.
@@ -465,6 +525,7 @@ impl AttentionCheckOutput {
             .collect();
         debug_assert_eq!(events.len(), page.events.len());
         Self {
+            delivery: AttentionDelivery::observed(false, false),
             state,
             events,
             resume_cursor,
@@ -610,6 +671,22 @@ mod tests {
         assert!(ATTENTION_ONBOARDING.contains("every 60 seconds"));
         assert!(ATTENTION_ONBOARDING.contains("durable goal alone is not a timer"));
         assert!(ATTENTION_ONBOARDING.contains("cadence-aware scheduler"));
+        assert!(ATTENTION_ONBOARDING.contains("never a callable tool"));
+        assert!(ATTENTION_ONBOARDING.contains("activation race"));
+    }
+
+    #[test]
+    fn delivery_requires_positive_server_observation_before_stopping_polling() {
+        let pending = AttentionDelivery::observed(true, false);
+        assert_eq!(pending.mode, AttentionDeliveryMode::Polling);
+        assert!(pending.stream_open);
+        assert!(!pending.covers_resume_resource);
+        assert!(pending.instruction.contains("keep the recurring check"));
+        assert!(pending.instruction.contains("activation race"));
+
+        let active = AttentionDelivery::observed(true, true);
+        assert_eq!(active.mode, AttentionDeliveryMode::Notification);
+        assert!(active.instruction.contains("cancel the recurring check"));
     }
 
     #[test]

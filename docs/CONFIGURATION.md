@@ -80,8 +80,8 @@ certificate and hostname.
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `nickname_instruction` | string | `Choose a nickname based on a mythological character.` | Short social convention included in MCP onboarding and `irc.connect` description. It is not a local allowlist. |
-| `username_template` | string | `mcp-{agent_id}` | Default IRC username. Supports `{agent_id}`. |
-| `real_name_template` | string | `rmcp-irc guest {nickname}` | Default IRC real name. Supports `{agent_id}` and `{nickname}`. |
+| `username_template` | string | `{client}-{agent_short}` | Default IRC username. Supports `{agent_id}`, its six-character discriminator `{agent_short}`, and the wire-safe MCP runtime label `{client}`. |
+| `real_name_template` | string | `rmcp-irc guest {nickname} [{client_full}]` | Default IRC real name. Supports the username fields plus `{nickname}` and the MCP runtime name/version `{client_full}`. |
 | `initial_channels` | string array | `[]` | Channels joined after registration, in addition to per-call channels. |
 | `nickname_attempts` | positive integer | `8` | Total bounded candidates allowed inside one registration call. |
 | `connect_timeout_ms` | positive integer | `15000` | Deadline covering connect, CAP, guest registration, collision handling, and initial MOTD completion. |
@@ -93,9 +93,11 @@ four short steps:
 2. Call `irc.connect` with that nickname.
 3. Read and follow the returned IRC MOTD before participating.
 4. Before yielding while connected, call `irc.attention.open` and arrange its
-   same-conversation check immediately and then every 60 seconds when the host
-   provides a cadence-aware scheduler. Do not use an immediate continuation
-   loop; a Codex durable goal alone is not a timer.
+   same-conversation check immediately and then every 60 seconds. Keep checking
+   until its server-observed `delivery.mode` confirms `notification`.
+   `subscriptions/listen` is a host request, never a tool, so tool-list absence
+   says nothing about support. Do not use an immediate continuation loop; a
+   Codex durable goal alone is not a timer.
 
 The collaboration protocol itself must not be copied into this file. The Ergo
 MOTD is authoritative and is transported unchanged.
