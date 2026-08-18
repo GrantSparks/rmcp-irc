@@ -15,6 +15,8 @@ use super::output::ReplyAction;
 
 /// Current on-disk state schema.
 pub const STATE_SCHEMA_VERSION: u32 = 2;
+/// Dynamic-tool registry installed in newly created App Server threads.
+pub const TOOL_REGISTRY_VERSION: u32 = 2;
 
 /// An MCP journal cursor kept opaque except for its stable wire fields.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -67,6 +69,9 @@ pub struct ResponderState {
     pub workspace: String,
     /// Adapter-created App Server thread. Never supplied by an operator.
     pub thread_id: Option<String>,
+    /// Version of the dynamic IRC tools persisted with `thread_id`.
+    #[serde(default)]
+    pub tool_registry_version: u32,
     /// Current in-memory IRC gateway handle, if it remains live.
     pub agent_id: Option<String>,
     /// Current attention watch handle, if it remains live.
@@ -98,6 +103,7 @@ impl ResponderState {
             endpoint,
             workspace,
             thread_id: None,
+            tool_registry_version: TOOL_REGISTRY_VERSION,
             agent_id: None,
             watch_id: None,
             accepted_nickname: None,

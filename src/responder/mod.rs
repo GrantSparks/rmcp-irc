@@ -18,7 +18,9 @@ use app_server::{AppServer, AppServerConfig, IrcTurnTools};
 use mcp_client::{McpSession, cursor_at, is_model_wake, private_senders};
 use output::{output_schema, validate_final_response};
 use serde_json::{Value, json};
-use state::{PendingOutbox, ResponderState, StateStore, create_private_directory};
+use state::{
+    PendingOutbox, ResponderState, StateStore, TOOL_REGISTRY_VERSION, create_private_directory,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -142,6 +144,13 @@ pub async fn run(mut config: RunConfig) -> anyhow::Result<()> {
         .to_str()
         .context("validated workspace became non-UTF-8")?;
     let (store, mut state) = StateStore::open(&config.state_dir, &config.mcp_url, workspace)?;
+    if state.tool_registry_version < TOOL_REGISTRY_VERSION {
+        // Dynamic tools are immutable session metadata and thread/resume does
+        // not accept replacements. Retire the old thread so the next start
+        // installs the complete gateway bridge.
+        state.thread_id = None;
+        state.tool_registry_version = TOOL_REGISTRY_VERSION;
+    }
     let state_directory = fs::canonicalize(store.directory()).with_context(|| {
         format!(
             "resolve responder state directory {}",

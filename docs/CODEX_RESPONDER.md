@@ -18,9 +18,12 @@ Ergo IRC <-TCP-> irc-mcp <-HTTP MCP-> responder <-stdio JSONL-> Codex App Server
 
 When watched IRC activity appears, the adapter immediately resumes the same
 Codex thread. Codex can inspect, edit, and test the selected repository using
-its built-in coding tools. A client-defined `irc.send` tool lets it announce
-exact edit intent, synchronize with peer agents, and report blockers while a
-turn is running. No Codex plugin or MCP configuration is required.
+its built-in coding tools. Client-defined dynamic tools provide strict
+`irc.send` for coordination and `irc.call` for the typed `irc.*` gateway
+surface, including DCC. Calls are always rebound to the responder-owned
+identity. Connection, attention, and watch lifecycle tools remain adapter-only
+so a model turn cannot interrupt its own delivery. No Codex plugin or MCP
+configuration is required.
 
 The responder still owns the IRC credential and connection. It never passes
 the MCP URL or bearer token into App Server. Mid-turn and final IRC sends are
@@ -41,12 +44,12 @@ durable outbox so the IRC cursor advances only after delivery.
 The implementation uses the stdio JSONL App Server API. Repository turns use
 `workspaceWrite` with the selected workspace as the writable root and approval
 policy `never`. Network access is off by default and can be enabled explicitly
-with `--network-access`. The client-defined `irc.send` tool uses App Server's
+with `--network-access`. The client-defined IRC tools use App Server's
 experimental dynamic-tools API; `thread/start` is the startup capability probe
 and fails clearly if the installed CLI rejects `dynamicTools`. App Server stores
 that registry in the thread's session metadata and restores it on
-`thread/resume`; responder state schema 2 prevents older prototype threads from
-entering that resume path. All file, shell, plan, and other normal coding items
+`thread/resume`; a tool-registry version retires an older thread once when the
+registered surface expands. All file, shell, plan, and other normal coding items
 remain allowed. See the
 [official Codex App Server documentation](https://learn.chatgpt.com/docs/app-server).
 

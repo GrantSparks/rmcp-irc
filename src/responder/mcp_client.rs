@@ -271,14 +271,25 @@ impl McpSession {
         let _ = self.service.cancel().await;
     }
 
-    async fn call(&self, name: &'static str, arguments: Value) -> anyhow::Result<Value> {
+    /// Invoke any typed gateway tool on behalf of the responder thread.
+    pub async fn call_gateway_tool(
+        &self,
+        name: &str,
+        agent_id: &str,
+        arguments: Value,
+    ) -> anyhow::Result<Value> {
+        self.call(name, bind_responder_agent(name, agent_id, arguments)?)
+            .await
+    }
+
+    async fn call(&self, name: &str, arguments: Value) -> anyhow::Result<Value> {
         let arguments: Map<String, Value> = arguments
             .as_object()
             .cloned()
             .context("internal MCP tool arguments were not an object")?;
         let response = self
             .service
-            .call_tool(CallToolRequestParams::new(name).with_arguments(arguments))
+            .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments))
             .await
             .with_context(|| format!("call MCP tool {name}"))?;
         if response.is_error == Some(true) {
@@ -300,6 +311,33 @@ impl McpSession {
             .cloned()
             .with_context(|| format!("MCP tool {name} omitted structured result"))
     }
+}
+
+fn bind_responder_agent(name: &str, agent_id: &str, arguments: Value) -> anyhow::Result<Value> {
+    ensure!(
+        name.starts_with("irc."),
+        "gateway tool must be in the irc namespace"
+    );
+    ensure!(
+        !matches!(
+            name,
+            "irc.connect"
+                | "irc.disconnect"
+                | "irc.attention.open"
+                | "irc.attention.check"
+                | "irc.watch.create"
+                | "irc.watch.close"
+        ),
+        "gateway tool {name} is owned by the responder lifecycle"
+    );
+    let mut arguments = arguments
+        .as_object()
+        .cloned()
+        .context("gateway tool arguments must be an object")?;
+    // Every remaining tool is agent scoped. Always replace a caller-supplied
+    // handle with the responder-owned identity.
+    arguments.insert("agent_id".into(), json!(agent_id));
+    Ok(Value::Object(arguments))
 }
 
 /// Whether one subscription notification is the model wake resource.
@@ -396,5 +434,36 @@ mod tests {
             }
         );
         assert!(cursor_at(&json!({"resume_cursor":{"sequence":7}}), "/resume_cursor").is_err());
+    }
+
+    #[test]
+    fn gateway_calls_are_bound_to_the_responder_identity() {
+        let bound = bind_responder_agent(
+            "irc.dcc.send",
+            "owned-agent",
+            json!({"agent_id":"spoofed-agent", "target":"grant"}),
+        )
+        .expect("bind call");
+        assert_eq!(bound["agent_id"], "owned-agent");
+        assert_eq!(bound["target"], "grant");
+
+        for denied in [
+            "irc.connect",
+            "irc.disconnect",
+            "irc.attention.open",
+            "irc.attention.check",
+            "irc.watch.create",
+            "irc.watch.close",
+        ] {
+            let error = bind_responder_agent(denied, "owned-agent", json!({}))
+                .expect_err("responder lifecycle tool must be denied");
+            assert!(error.to_string().contains("responder lifecycle"));
+        }
+    }
+
+    #[test]
+    fn gateway_bridge_rejects_invalid_calls() {
+        assert!(bind_responder_agent("filesystem.read", "agent", json!({})).is_err());
+        assert!(bind_responder_agent("irc.status", "agent", json!([])).is_err());
     }
 }

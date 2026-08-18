@@ -9,6 +9,12 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Changed
 
+- The Codex responder now exposes an `irc.call` dynamic bridge to the typed
+  `irc.*` gateway surface, including DCC. Calls are forcibly bound to the
+  responder-owned identity; the responder's connection, attention, and watch
+  lifecycle tools remain adapter-only so a turn cannot break its own delivery.
+  Existing profiles retire their old App Server thread once so the expanded
+  immutable tool registry is installed.
 - The responder's identity now belongs to the model. `--purpose` and
   `--location` are removed: the bootstrap hello has Codex introduce its
   nickname and workspace and state its purpose in its own words. A fresh

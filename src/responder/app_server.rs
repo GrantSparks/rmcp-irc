@@ -617,19 +617,58 @@ fn dynamic_tools() -> Value {
                 "required": ["target", "text"],
                 "additionalProperties": false
             }
+        }, {
+            "type": "function",
+            "name": "call",
+            "description": "Call any typed rmcp-irc gateway tool except the responder-owned connection, attention, and watch lifecycle. Supply its full name (for example irc.dcc.send, irc.join, or irc.history) and its normal arguments. Calls are bound to the responder's IRC identity. Use only when the authenticated-human authority rules permit the IRC effect.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tool": {"type": "string", "pattern": "^irc\\."},
+                    "arguments": {"type": "object"}
+                },
+                "required": ["tool", "arguments"],
+                "additionalProperties": false
+            }
         }]
     }])
 }
 
 async fn call_irc_tool(params: &Value, irc: IrcTurnTools<'_>) -> anyhow::Result<String> {
     ensure!(
-        params.get("namespace").and_then(Value::as_str) == Some("irc")
-            && params.get("tool").and_then(Value::as_str) == Some("send"),
-        "unknown dynamic tool request"
+        params.get("namespace").and_then(Value::as_str) == Some("irc"),
+        "unknown dynamic tool namespace"
     );
+    let dynamic_tool = params
+        .get("tool")
+        .and_then(Value::as_str)
+        .context("dynamic IRC tool omitted its name")?;
     let arguments = params
         .get("arguments")
-        .context("irc.send omitted arguments")?;
+        .context("dynamic IRC tool omitted arguments")?;
+    if dynamic_tool == "call" {
+        let tool = arguments
+            .get("tool")
+            .and_then(Value::as_str)
+            .context("irc.call tool must be a string")?;
+        let gateway_arguments = arguments
+            .get("arguments")
+            .cloned()
+            .context("irc.call arguments must be an object")?;
+        ensure!(
+            gateway_arguments.is_object(),
+            "irc.call arguments must be an object"
+        );
+        let result = irc
+            .mcp
+            .call_gateway_tool(tool, irc.agent_id, gateway_arguments)
+            .await?;
+        return serde_json::to_string(&result).context("serialize IRC gateway result");
+    }
+    ensure!(
+        dynamic_tool == "send",
+        "unknown dynamic IRC tool {dynamic_tool:?}"
+    );
     let target = arguments
         .get("target")
         .and_then(Value::as_str)
@@ -1203,5 +1242,10 @@ done
         let tools = dynamic_tools();
         assert_eq!(tools[0]["name"], "irc");
         assert_eq!(tools[0]["tools"][0]["name"], "send");
+        assert_eq!(tools[0]["tools"][1]["name"], "call");
+        assert_eq!(
+            tools[0]["tools"][1]["inputSchema"]["properties"]["tool"]["pattern"],
+            "^irc\\."
+        );
     }
 }
