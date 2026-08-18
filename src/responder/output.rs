@@ -79,7 +79,8 @@ pub fn validate_response(
 }
 
 /// Final-turn variant: overlong lines split at word boundaries into follow-on
-/// messages instead of being rejected.
+/// messages instead of being rejected, and exact duplicates collapse to their
+/// first occurrence instead of erroring.
 ///
 /// The output schema's `maxLength` counts characters while IRC's limit is
 /// bytes, and a model cannot reliably count UTF-8 bytes — an em-dash-rich
@@ -195,6 +196,13 @@ fn split_overlong(actions: Vec<ReplyAction>) -> Vec<ReplyAction> {
             });
         }
     }
+    // Split chunks of repetitive text can be byte-identical, and the strict
+    // duplicate check would turn that artifact back into the terminal
+    // degradation this normalization exists to prevent. Keep first
+    // occurrences: an identical IRC line adds nothing the first did not.
+    let mut seen = HashSet::new();
+    normalized
+        .retain(|action| seen.insert((action.target.to_ascii_lowercase(), action.text.clone())));
     if normalized.len() > MAX_ACTIONS {
         // A visible ellipsis beats either silent loss or terminal degradation.
         tracing::warn!(
@@ -325,6 +333,28 @@ mod tests {
         }
         assert!(actions[0].text.starts_with("start —"));
         assert!(actions[1].text.ends_with("end"));
+    }
+
+    #[test]
+    fn identical_split_chunks_collapse_instead_of_failing_as_duplicates() {
+        // Snotra's review finding: repetitive overlong text splits into
+        // byte-identical chunks, which the strict duplicate check would turn
+        // back into terminal degradation.
+        let value = json!({"actions": [
+            {"target": "#control", "text": "word ".repeat(140)},
+            {"target": "#control", "text": "an unrelated separate line"},
+            {"target": "#CONTROL", "text": "an unrelated separate line"}
+        ]});
+        let actions = validate_final_response(
+            &value.to_string(),
+            &["#control".into()],
+            &HashSet::new(),
+            false,
+        )
+        .expect("collapse duplicates instead of rejecting");
+        assert_eq!(actions.len(), 2);
+        assert!(actions[0].text.starts_with("word") && actions[0].text.len() <= MAX_TEXT_BYTES);
+        assert_eq!(actions[1].text, "an unrelated separate line");
     }
 
     #[test]
