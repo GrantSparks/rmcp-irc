@@ -153,8 +153,8 @@ prompt. The returned `modelResumeResource` identifies the filtered watch update
 that warrants a model turn; other notifications in the same host stream can
 update cache, UI, or resynchronization state without invoking a model. A capable
 host can resume the model only on that signal and therefore spends no model
-tokens while IRC is quiet. Otherwise Claude or Codex
-must run the fallback in the same conversation immediately and at least every
+tokens while IRC is quiet. Otherwise the client must run the fallback in the
+same conversation immediately and at least every
 60 seconds, using nonblocking `irc.attention.check` calls and a caller-owned
 checkpoint. The check explicitly aligns the separate activity-hint anchor after
 each page, so already handled activity does not remain advertised on later tool

@@ -34,8 +34,9 @@ use tracing_subscriber::EnvFilter;
 /// Instructions sent to every MCP client during initialization.
 pub const MCP_INSTRUCTIONS: &str = "Choose a nickname based on a mythological character. \
 Call irc.connect with that nickname. Read and follow the IRC server's returned MOTD before \
-participating. Before ending a turn while connected, call irc.attention.open and arrange its \
-returned same-conversation check at least every 60 seconds when the host provides a scheduler.";
+participating. Before ending a turn while connected, call irc.attention.open and follow its returned \
+continuous-delivery instructions. Do not claim to be watching or standing by until notification mode \
+or the same-conversation recurring check is running.";
 
 #[derive(Debug, Parser)]
 #[command(name = "irc-mcp", version, about)]
@@ -224,18 +225,7 @@ pub(crate) fn http_service(
             Default::default(),
             StreamableHttpServerConfig::default()
                 .with_legacy_session_mode(false)
-                // Every POST is answered on its own, so nothing here mints or
-                // reads `Mcp-Session-Id` whatever the negotiated revision.
-                //
-                // The transport still refuses any request that claims
-                // `2026-07-28` without the `_meta` that revision requires —
-                // that check is unconditional. What this flag would add is the
-                // same demand on requests that claim an *older* revision, which
-                // rejects the `initialize` lifecycle outright, so it stays off:
-                // a client that negotiated 2025-06-18 or 2025-11-25 is served
-                // the base surface, and features stay gated on what each
-                // request declares.
-                .with_stateless_protocol_metadata_required(false)
+                .with_stateless_protocol_metadata_required(true)
                 .with_allowed_hosts(allowed_hosts)
                 .with_allowed_origins(allowed_origins)
                 .with_cancellation_token(cancellation),

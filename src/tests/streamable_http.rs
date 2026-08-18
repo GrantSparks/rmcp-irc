@@ -9,12 +9,10 @@
 //! through it in-process, so a regression in the request envelope is a failing
 //! test rather than a client that cannot connect.
 //!
-//! Unless a test is about what happens without one, every request here is a
-//! complete 2026-07-28 request: no session header, the `MCP-Protocol-Version`
-//! header matching `_meta`, `Mcp-Method` (and `Mcp-Name` where the method
-//! carries one), and both required `_meta` fields. The exception worth naming is
-//! [`a_client_that_negotiates_through_initialize_is_served`], which sends what a
-//! session-lifecycle client sends instead.
+//! Unless a test is about rejecting an incomplete request, every request here
+//! is a complete 2026-07-28 request: no session header, the
+//! `MCP-Protocol-Version` header matching `_meta`, `Mcp-Method` (and `Mcp-Name`
+//! where the method carries one), and both required `_meta` fields.
 
 use std::{str::FromStr, sync::Arc, time::Duration};
 
@@ -444,53 +442,10 @@ async fn a_request_declaring_another_protocol_version_is_refused() {
 }
 
 #[tokio::test]
-async fn a_client_that_negotiates_through_initialize_is_served() {
-    // Codex, and every other host still on the `initialize` lifecycle, asks for
-    // an older revision and then sends ordinary requests carrying no `_meta` at
-    // all. Answering such a handshake with `2026-07-28` stranded it: the first
-    // call after the handshake was refused for metadata its own revision never
-    // defined, which the client reports as a server that failed to start.
-    let router = router(CallerPolicy::Local);
-    let mut handshake = Envelope::new("initialize").with_meta(None);
-    handshake.params = serde_json::json!({
-        "protocolVersion": ProtocolVersion::V_2025_06_18.as_str(),
-        "capabilities": { "elicitation": { "form": {}, "url": {} } },
-        "clientInfo": { "name": "codex-mcp-client", "version": "0.0.0" },
-    });
-    handshake.protocol_version_header = None;
-    let (status, body) = send(&router, handshake).await;
-    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-    assert_eq!(
-        body["result"]["protocolVersion"],
-        ProtocolVersion::V_2025_06_18.as_str(),
-        "negotiation must land on a revision the client actually speaks: {body}"
-    );
-
-    // What the client sends next: the negotiated revision in the header, and
-    // nothing in `_meta` but the progress token it opted in with.
-    let mut listing = Envelope::new("tools/list").with_meta(Some(serde_json::json!({
-        "progressToken": 0,
-    })));
-    listing.protocol_version_header = Some(ProtocolVersion::V_2025_06_18.as_str().to_owned());
-    let (status, body) = send(&router, listing).await;
-    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-    assert!(body["error"].is_null(), "{body}");
-    assert!(
-        body["result"]["tools"]
-            .as_array()
-            .is_some_and(|tools| !tools.is_empty()),
-        "a client that negotiated an older revision still gets the tool surface: {body}"
-    );
-}
-
-#[tokio::test]
-async fn a_session_lifecycle_client_receives_connect_without_native_resource_links() {
+async fn a_modern_client_receives_connect_without_native_resource_links() {
     let server = FakeErgo::spawn().await;
     let router = router_for(Arc::new(Gateway::new(server.config())), CallerPolicy::Local);
-    let mut connect =
-        Envelope::tool_call("irc.connect", serde_json::json!({ "nickname": "Ariadne" }))
-            .with_meta(Some(serde_json::json!({ "progressToken": 0 })));
-    connect.protocol_version_header = Some(ProtocolVersion::V_2025_06_18.as_str().to_owned());
+    let connect = Envelope::tool_call("irc.connect", serde_json::json!({ "nickname": "Ariadne" }));
 
     let (status, body) = send(&router, connect).await;
 
@@ -504,7 +459,7 @@ async fn a_session_lifecycle_client_receives_connect_without_native_resource_lin
         body["result"]["content"]
             .as_array()
             .is_some_and(|content| content.iter().all(|block| block["type"] != "resource_link")),
-        "the legacy client must not receive the content variant it cannot decode: {body}"
+        "portable tool results must not include a content variant current hosts reject: {body}"
     );
 }
 
@@ -2195,13 +2150,8 @@ async fn server_discover_reports_this_servers_capabilities_and_the_revision_it_s
     let result = &body["result"];
     assert_eq!(
         result["supportedVersions"],
-        serde_json::json!([
-            VERSION,
-            ProtocolVersion::V_2025_11_25.as_str(),
-            ProtocolVersion::V_2025_06_18.as_str(),
-        ]),
-        "discovery names the preferred revision first and the session-lifecycle \
-         revisions negotiation may still agree to: {body}"
+        serde_json::json!([VERSION]),
+        "discovery names the one revision this server implements: {body}"
     );
     for capability in ["tools", "resources", "prompts", "completions"] {
         assert!(

@@ -8,48 +8,19 @@ The stdio and Streamable HTTP transports expose the same service, tools,
 resources, schemas, event model, and error semantics. An MCP transport
 connection is never an IRC identity.
 
-## Protocol revisions
+## Protocol revision
 
-This service is designed around MCP `2026-07-28`: identity and capabilities are
-read per request from `_meta`, no session is minted or read, and features are
-enabled by what a request declares. That is the preferred revision, and a client
-that speaks it gets the whole surface.
+This service implements MCP `2026-07-28` exclusively. Identity and capabilities
+are read per request from `_meta`; no session is minted or read. A request must
+carry the revision's complete metadata and headers, and any other revision is
+refused with `-32022`.
 
-Negotiation is exact-match, so `2025-11-25` and `2025-06-18` are also offered —
-a client that speaks only the `initialize` lifecycle negotiates one of those
-instead of being handed `2026-07-28` and then refused on its first ordinary
-call. Anything older is declined, and a request whose `_meta` declares a
-revision outside the offered set is refused with `-32022`.
-
-What a client that negotiated `2025-11-25` or `2025-06-18` gets is the base
-surface: tools, resources, prompts, completions, progress notifications, and the
-full two-branch result envelope in `structuredContent`. What it does not get is
-everything keyed to a per-request declaration or to `2026-07-28` itself:
-
-- **No tasks.** `irc.dcc.send` and `irc.dcc.accept` run inline for the life of
-  the call, reporting progress, instead of returning a task handle.
-- **No input round trips.** The four flows under [Input round
-  trips](#input-round-trips) take their fallback instead: a structured error,
-  the ordinary rejection, or a refusal. With `mcp.confirm_destructive` enabled,
-  `irc.kick` and `irc.message.redact` are refused rather than confirmed, so
-  leave it off for such a client or drive those operations from one that
-  declares `elicitation`.
-- **No top-level MRTR fields.** Results carry no `resultType`, `ttlMs`, or
-  `cacheScope`; the payload itself is unchanged.
-- **No native resource-link content blocks.** Stable resource URIs remain in
-  each tool's `structuredContent`, but `resource_link` blocks are omitted
-  because session-lifecycle bridges in current Codex releases reject that
-  otherwise valid content variant instead of returning the tool result.
-- **No asynchronous notifications.** `subscriptions/listen` is refused below
-  `2026-07-28`, and the older `resources/subscribe` is not implemented here, so
-  event delivery is the polling path described under [`irc.attention.open` and
-  `irc.attention.check`](#ircattentionopen-and-ircattentioncheck) — already the
-  documented fallback for hosts a notification cannot resume. `server/discover`
-  is likewise `2026-07-28` only.
-
-A declaration is per request, never per connection, so these are properties of
-each call: the same client can send a complete `2026-07-28` request and get the
-full surface for it.
+Clients receive the full surface: tools, resources, prompts, completions,
+progress notifications, tasks, input round trips, and asynchronous
+`subscriptions/listen` notifications according to the capabilities each request
+declares. Stable follow-up resource URIs are present in `structuredContent`.
+Native `resource_link` content blocks are omitted because current model hosts do
+not all accept that result variant even when they speak `2026-07-28`.
 
 ## General conventions
 
@@ -66,12 +37,8 @@ full surface for it.
   under `error`. The structured result is authoritative, and every tool's
   advertised `outputSchema` is a `oneOf` over exactly those two branches, so a
   failure is as conformant as a success. Tools that expose a follow-up resource
-  append native MCP `resource_link` content blocks after the text summary for a
-  self-describing `2026-07-28` request; clients do not need to rediscover or
-  reinterpret a URI string before attaching or subscribing to it. Older
-  session-lifecycle clients receive the same links in `structuredContent`
-  without the native content blocks, as described under [Protocol
-  revisions](#protocol-revisions).
+  include its URI in `structuredContent`; clients do not need to rediscover or
+  reinterpret it before reading or subscribing.
 - `irc.connect`, `irc.status`, and `irc.history` default `result_detail` to
   `compact` so equivalent presentation, parsed-wire, and semantic data is not
   repeated in one response. Callers that need the legacy inline forms can set
@@ -857,7 +824,7 @@ Typed query tools are:
 | `irc.list` | Channel, visible-member count, and topic entries. |
 | `irc.mode.get` | Ordered mode numerics/standard replies with the client nickname removed. |
 | `irc.help` | Ordered help subject/text lines. |
-| `irc.topic.get` | Topic, setter, timestamp, and a native channel resource link. |
+| `irc.topic.get` | Topic, setter, timestamp, and a structured channel resource URI. |
 
 Typed mutation tools are:
 
@@ -1009,7 +976,7 @@ that would result from combining a mentions watch with separate task-channel
 watches.
 
 The result contains the watch descriptor, caller-owned `initial_cursor`, a
-subscription-filter addition, and a provider-neutral scheduling recipe. The
+subscription-filter addition, and a client-neutral recurring-check recipe. The
 client maintains one consolidated `subscriptions/listen` stream for everything
 it needs. It merges the returned `filterAddition` under
 `params.notifications`, preserving any `toolsListChanged`,
@@ -1045,21 +1012,13 @@ retained window. The caller adopts `resume_cursor` only after handling returned
 events, so retrying the previous cursor preserves at-least-once delivery. This
 does not change the general `irc.events.read` rule below.
 
-Hosts that can resume a model from the listen notification need no model poll
-and spend zero model tokens while IRC is quiet. Claude/Codex hosts that cannot
-do so schedule the returned ordinary prompt immediately and in the same
-conversation at least every 60 seconds. Such a quiet scheduled turn still
-invokes a model and consumes tokens; the tiny result only minimizes that cost.
-The schedule is removed and the watch closed on done, abandonment, or
-disconnect.
-
-The result includes current provider hints without making either provider part
-of the wire contract. In Claude Code, use `/loop 1m` with the returned prompt
-while that session remains open. In ChatGPT/Codex, create a one-minute scheduled
-task in the current chat rather than a standalone task. Both choices preserve
-the conversation-owned cursor. See the official [Claude Code scheduled-task
-guide](https://code.claude.com/docs/en/scheduled-tasks) and [OpenAI scheduled-task
-guide](https://learn.chatgpt.com/docs/automations).
+Clients that resume the same conversation from the listen notification need no
+model poll and spend zero model tokens while IRC is quiet. Otherwise the client
+runs the returned prompt immediately in the same conversation and at least
+every 60 seconds. Such a quiet recurring turn still invokes a model and consumes
+tokens; the compact result only minimizes that cost. The result's
+`deliveryModes` explains both choices without assuming a particular client.
+Delivery is stopped and the watch closed on done, abandonment, or disconnect.
 
 Multi Round-Trip Requests are complementary, not another delivery path. MRTR
 returns `input_required` only while a tool, prompt, or resource request is
@@ -1083,7 +1042,7 @@ to use this mechanism.
 `irc.watch.create` registers a caller-owned server-side *selection* over one
 agent's journal. Inputs are `agent_id`, optional case-preserved `targets`,
 optional semantic `classes`, `mentions_only`, and `inbound_only`. It returns the
-watch descriptor, a native `irc://watches/{watch_id}` resource link, the
+watch descriptor, a structured `irc://watches/{watch_id}` resource URI, the
 journal's `latest_cursor` at creation time, and `next_uri`, that cursor already
 expanded into the positioned window URI.
 
@@ -1170,8 +1129,8 @@ without it keeps counting from wherever it last said it had caught up.
 Keep one long poll active when prompt event handling matters: pass the last
 consumed `next_cursor`, choose a positive `wait_ms`, and immediately issue the
 next read after each response. This is the direct non-model host fallback for
-clients that do not expose resource subscriptions. A recurring Claude/Codex
-model turn instead uses `irc.attention.check` with `wait_ms: 0`; waking a model
+clients that do not expose resource subscriptions. A recurring model turn
+instead uses `irc.attention.check` with `wait_ms: 0`; waking a model
 only to hold a long poll spends tokens without improving the selected result.
 
 ## DCC tools
@@ -1196,7 +1155,7 @@ from a client that declared the tasks extension returns a task handle; one that
 did not returns the immediate result after the offer or acceptance is written.
 Task status follows session state and byte progress, cancellation cooperatively
 cancels the DCC session, and the terminal result contains the final session plus
-its native resource link. See
+its structured resource URI. See
 [Long-running work](#long-running-work-progress-and-tasks) for the trigger,
 owner binding, expiry, and restart semantics.
 

@@ -270,7 +270,7 @@ impl JoinInput {
     }
 }
 
-/// Join result with a stable channel resource link.
+/// Join result with a stable channel resource URI.
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct JoinOutput {
     /// Common correlated command result.

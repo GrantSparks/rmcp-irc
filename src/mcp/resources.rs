@@ -118,10 +118,9 @@ impl ResourceUris {
 
 /// A resource and everything a client needs to decide what to do with it.
 ///
-/// Single source of truth for the presentation of a URI. `resources/list`,
-/// `resources/templates/list`, and the `resource_link` blocks returned from
-/// tool results all build from this, so a link a tool hands back and the same
-/// resource in the catalog can never describe themselves differently.
+/// Single source of truth for the presentation of a URI. `resources/list` and
+/// `resources/templates/list` both build from this, so every catalog view of a
+/// resource describes it consistently.
 #[derive(Clone, Debug)]
 pub struct ResourceDescriptor {
     /// Stable URI.

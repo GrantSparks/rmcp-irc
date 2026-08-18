@@ -107,23 +107,8 @@ const PROMPT_NAMES: &[&str] = &[
     "irc-summarize-respond",
 ];
 
-/// MCP revisions this server will serve, preferred revision first.
-///
-/// The whole design targets `2026-07-28`: per-request declarations, no session,
-/// tasks, and input round trips. But version negotiation is exact-match — a
-/// server that lists only its preferred revision answers *every* older client
-/// with `2026-07-28`, and a client that speaks the `initialize` lifecycle then
-/// sends ordinary requests carrying none of the `_meta` that revision requires
-/// and is refused on its first call. Listing the two session-lifecycle
-/// revisions in current use makes the handshake honest instead: such a client
-/// negotiates a revision it can actually speak, and gets the base surface,
-/// because features here are enabled by what a request declares rather than by
-/// the version on it.
-const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
-    ProtocolVersion::V_2026_07_28,
-    ProtocolVersion::V_2025_11_25,
-    ProtocolVersion::V_2025_06_18,
-];
+/// The single MCP revision this server implements.
+const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
 
 /// Tools that can be run as MCP tasks.
 ///
@@ -258,7 +243,7 @@ impl IrcMcpService {
                  question instead of connecting, and you answer it and re-send the same call. \
                  Otherwise the default bounded suffixing applies. Read the auto-joined channel \
                  topic, announce a concise hello with real task/worktree scope, and preserve the \
-                 returned `agent_id` and native resource links for subsequent operations. Do not \
+                 returned `agent_id` and structured resource URIs for subsequent operations. Do not \
                  invent account registration for an ephemeral guest."
             ),
         )]
@@ -280,7 +265,7 @@ impl IrcMcpService {
         vec![PromptMessage::new_text(
             Role::User,
             format!(
-                "For IRC agent `{}`, call `irc.attention.open`. {targets} Have the client merge the returned filterAddition under params.notifications in its one existing `subscriptions/listen` request and open or reopen that stream with complete request metadata; matching `notifications/resources/updated` are the asynchronous host notification path. Then, unless the host directly resumes the model from those matching notifications, run the returned ordinary scheduler prompt immediately and in this same conversation with no interval longer than 60 seconds. A scheduled quiet check still consumes model tokens, so do not describe it as a zero-token path. Persist `resume_cursor` only after handling returned events, drain immediately while `has_more` is true, and cancel the recurring task, close the watch, and disconnect when the work ends. Successful tool results may also report bounded activity while the model is already running, but cannot wake it. Do not use top-level MRTR or a task's input_required state as an ambient event channel: both request input needed to continue a specific operation.",
+                "For IRC agent `{}`, call `irc.attention.open`. {targets} Follow the returned delivery instructions and establish one mode before claiming to watch or stand by. Notification mode keeps the returned filter merged into one `subscriptions/listen` stream and resumes this same conversation when modelResumeResource changes. Recurring-check mode runs the returned prompt immediately in this same conversation with no interval longer than 60 seconds. Persist `resume_cursor` only after handling returned events, drain immediately while `has_more` is true, and stop delivery, close the watch, and disconnect when the work ends. Quiet recurring checks consume model tokens; notification mode does not invoke the model while quiet. Successful tool results may report bounded activity while the model is already running, but cannot wake it.",
                 input.agent_id,
             ),
         )]
@@ -304,7 +289,7 @@ impl IrcMcpService {
             format!(
                 "For IRC agent `{}`, set up mention delivery in this order. 1. Call \
                  `irc.watch.create` with `mentions_only: true`. {targets} Keep the returned \
-                 `watch_id` and `latest_cursor`, and attach the native watch resource link. 2. Ask \
+                 `watch_id`, `latest_cursor`, and structured watch resource URI. 2. Ask \
                  the host to merge that watch URI into the `resourceSubscriptions` of its one \
                  consolidated `subscriptions/listen` stream; the notification is filtered by the watch, so it means \
                  there is something here for you. 3. On each update, call `irc.events.read` with \
@@ -342,7 +327,7 @@ impl IrcMcpService {
                 "Using IRC agent `{}`, call `irc.join` for `{}`. If the channel is keyed, the call \
                  comes back as an `input_required` question asking for the key rather than as a \
                  failure: answer it and re-send the same call, or decline to leave the channel \
-                 unjoined. Follow the returned native channel resource link, read the topic before \
+                 unjoined. Follow the returned structured channel resource URI, read the topic before \
                  sending messages, and treat it as channel-specific instruction. Read the recent \
                  transcript/history and known members to avoid duplicating active work, then \
                  announce relevant intent and subscribe to the channel's live resources when \
@@ -463,14 +448,14 @@ impl IrcMcpService {
                     let summary = if output.motd.text.is_empty() {
                         format!(
                             "Connected {} as {}. Before yielding, call irc.attention.open and \
-                             arrange its returned check at least every 60 seconds while connected. \
+                             establish one of its returned continuous-delivery modes. \
                              The server has no MOTD.",
                             output.agent_id, output.nickname,
                         )
                     } else {
                         format!(
                             "Connected {} as {}. Before yielding, call irc.attention.open and \
-                             arrange its returned check at least every 60 seconds while connected. \
+                             establish one of its returned continuous-delivery modes. \
                              Server MOTD:\n{}",
                             output.agent_id, output.nickname, output.motd.text
                         )
@@ -523,12 +508,11 @@ impl IrcMcpService {
                 let resources = ResourceUris::for_agent(&created.watch.agent_id);
                 let subscription = AttentionSubscription::new(&created.watch, &resources);
                 let summary = format!(
-                    "Attention opened for {} at {}. Merge the returned filter addition under \
-                     params.notifications and open or reopen the client's one subscriptions/listen \
-                     stream with complete request metadata. Because that stream wakes the host \
-                     rather than the model, also schedule the returned ordinary prompt in this same \
-                     conversation at least every 60 seconds unless the host directly resumes the \
-                     model on matching updates. Scheduled quiet checks consume model tokens.",
+                    "Attention opened for {} at {}. Establish one returned delivery mode now: keep \
+                     the subscriptions/listen filter active and resume this same conversation when \
+                     modelResumeResource changes, or run the recurring-check prompt immediately in \
+                     this same conversation and at least every 60 seconds. If neither is available, \
+                     disclose that responsiveness is best-effort.",
                     created.watch.agent_id, created.watch.uri,
                 );
                 let link = ContentBlock::ResourceLink(watch_resource_entry(&created.watch));
@@ -2540,18 +2524,7 @@ impl ServerHandler for IrcMcpService {
         .with_instructions(MCP_INSTRUCTIONS)
     }
 
-    /// The revisions negotiation may agree to, preferred first.
-    ///
-    /// Everything this server exposes assumes the stateless request model:
-    /// identity and capabilities arrive per request, cross-request state is
-    /// named by an explicit handle, and there is no handshake to remember. That
-    /// model is what `2026-07-28` describes, and it stays the preferred
-    /// revision. The two session-lifecycle revisions behind it are here so a
-    /// client that speaks only those negotiates one of them rather than being
-    /// told `2026-07-28` and then refused for the per-request metadata its own
-    /// revision never defined; a request declaring anything outside the set is
-    /// still an explicit `-32022` rather than one served under assumptions the
-    /// caller does not share. See [`SUPPORTED_PROTOCOL_VERSIONS`].
+    /// The only revision negotiation may agree to.
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
         std::borrow::Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
@@ -2610,15 +2583,11 @@ impl ServerHandler for IrcMcpService {
         let mut response = self.tool_router.call(call).await?;
         if let CallToolResponse::Complete(result) = &mut response {
             adopt_unstructured(result);
-            // Session-lifecycle clients do not restate their negotiated
-            // capabilities per request. In particular, Codex's 2025-06-18
-            // bridge rejects otherwise valid tool results containing native
-            // `resource_link` blocks as an unexpected response type. Every
-            // linked URI is also present in structuredContent, so retain the
-            // richer blocks only for a self-describing modern request.
-            if !profile.declares_required_metadata() {
-                remove_native_resource_links(result);
-            }
+            // Stable resource URIs already live in structuredContent. Keep the
+            // content array to the broadly supported text/audio/image forms:
+            // current model hosts do not all accept native `resource_link`
+            // blocks even when they speak MCP 2026-07-28.
+            remove_native_resource_links(result);
             if carries_activity_hint {
                 self.hint_at_activity(agent_id.as_ref(), result).await;
             }
@@ -5083,21 +5052,16 @@ mod tests {
         assert_eq!(info.instructions.as_deref(), Some(MCP_INSTRUCTIONS));
         assert!(!MCP_INSTRUCTIONS.contains("AGENT"));
         assert!(MCP_INSTRUCTIONS.contains("irc.attention.open"));
-        assert!(MCP_INSTRUCTIONS.contains("60 seconds"));
+        assert!(MCP_INSTRUCTIONS.contains("continuous-delivery"));
     }
 
     #[test]
-    fn the_server_prefers_the_stateless_revision_and_still_answers_session_clients() {
+    fn the_server_serves_only_the_stateless_revision() {
         let service = IrcMcpService::new(Arc::new(Gateway::new(Default::default())));
         assert_eq!(
             service.supported_protocol_versions().as_ref(),
-            [
-                ProtocolVersion::V_2026_07_28,
-                ProtocolVersion::V_2025_11_25,
-                ProtocolVersion::V_2025_06_18,
-            ],
-            "negotiation is exact-match, so every revision a current client asks \
-             for must be listed or that client is answered with one it cannot speak"
+            [ProtocolVersion::V_2026_07_28],
+            "the server must not negotiate a revision whose lifecycle it does not implement"
         );
         assert_eq!(
             service.get_info().protocol_version,
@@ -5325,11 +5289,11 @@ mod tests {
         for boundary in [
             "irc.attention.open",
             "subscriptions/listen",
-            "notifications/resources/updated",
+            "modelResumeResource",
+            "Notification mode",
+            "Recurring-check mode",
             "60 seconds",
-            "consumes model tokens",
-            "top-level MRTR",
-            "task's input_required",
+            "consume model tokens",
         ] {
             assert!(
                 text.text.contains(boundary),
@@ -5378,7 +5342,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_result_keeps_text_and_structured_uris_without_native_links() {
+    fn portable_result_keeps_text_and_structured_uris_without_native_links() {
         let agent_id = crate::agent::AgentId::new();
         let resources = ResourceUris::for_agent(&agent_id);
         let mut result = tool_success_with_content(

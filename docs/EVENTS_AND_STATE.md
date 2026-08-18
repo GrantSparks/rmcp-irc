@@ -404,8 +404,8 @@ after handling returned events. This makes retries at-least-once and prevents
 unrelated traffic from aging a quiet attention cursor into a gap.
 
 A direct host bridge consumes the listen stream and resumes a model only on a
-matching watch update; that spends no model tokens while quiet. Where Claude or
-Codex cannot be resumed by a notification, the same conversation runs the
+matching watch update; that spends no model tokens while quiet. Where the model
+cannot be resumed by a notification, the same conversation runs the
 ordinary prompt returned by `irc.attention.open` immediately and at least every
 60 seconds, calling `irc.attention.check` with `wait_ms: 0` and
 `set_activity_anchor: true`. A scheduled quiet turn still consumes model tokens

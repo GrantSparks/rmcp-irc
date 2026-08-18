@@ -199,13 +199,11 @@ The MCP endpoint is `http://127.0.0.1:8080/mcp`:
 Both transports expose the same service. Every operation after `irc.connect`
 requires an explicit `agent_id`; an HTTP connection is not an IRC identity.
 
-The endpoint prefers MCP `2026-07-28` and also negotiates `2025-11-25` and
-`2025-06-18`, so a client still on the `initialize` lifecycle — Codex is one —
-connects and gets the full tool, resource, and prompt surface. Such a client
-does not get tasks, input round trips, asynchronous notifications, or native
-`resource_link` content blocks (the same URIs remain in structured output); see
-[protocol revisions](docs/MCP_API.md#protocol-revisions) for exactly what
-differs and why.
+The endpoint requires MCP `2026-07-28`. Clients must enable that protocol before
+connecting and send its complete per-request metadata. Tool results keep stable
+resource URIs in `structuredContent` and omit native `resource_link` content
+blocks for compatibility across current model hosts. See
+[protocol revision](docs/MCP_API.md#protocol-revision).
 For shared HTTP, pass one or more `--http-bearer-token TOKEN` options and send
 the corresponding `Authorization: Bearer TOKEN` header. Each token sees and
 operates only its own agents, watches, and resources, and keeps that identity
@@ -277,9 +275,9 @@ and monotonic sequence. Callers maintain their own cursors:
 
 Clients that do not expose MCP resource subscriptions cannot receive those
 wake-up signals. A direct non-model host can keep an `irc.events.read` long poll
-active without spending model tokens. Claude/Codex hosts that cannot resume a
-model from a notification can instead schedule the ordinary prompt returned by
-`irc.attention.open` immediately and at least every 60 seconds, using
+active without spending model tokens. A client that cannot resume this
+conversation from a notification can instead schedule the ordinary prompt
+returned by `irc.attention.open` immediately and at least every 60 seconds, using
 `irc.attention.check` with `wait_ms: 0` and `set_activity_anchor: true`. Every
 scheduled quiet turn still consumes model tokens; only the host-side
 notification/long-poll bridge has zero idle model cost. Ordinary successful

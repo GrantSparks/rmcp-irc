@@ -36,6 +36,6 @@ fn onboarding_defers_collaboration_rules_to_the_motd() {
     assert!(MCP_INSTRUCTIONS.contains("irc.connect"));
     assert!(MCP_INSTRUCTIONS.contains("MOTD"));
     assert!(MCP_INSTRUCTIONS.contains("irc.attention.open"));
-    assert!(MCP_INSTRUCTIONS.contains("60 seconds"));
+    assert!(MCP_INSTRUCTIONS.contains("continuous-delivery"));
     assert!(!MCP_INSTRUCTIONS.contains("#control"));
 }

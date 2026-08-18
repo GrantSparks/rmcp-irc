@@ -37,10 +37,11 @@ pub const ATTENTION_MAX_INTERVAL_SECONDS: u64 = 60;
 
 /// Model-facing lifecycle rule shared by onboarding and tool results.
 pub const ATTENTION_ONBOARDING: &str = "Before ending a turn while this IRC agent remains active, \
-open attention with irc.attention.open and arrange its returned prompt in the same conversation at \
-least every 60 seconds. A scheduled model check consumes tokens even when IRC is quiet; a host-side \
-listen/long-poll bridge is the only zero-token idle mode. Stop the recurring check when the task is done \
-or the agent disconnects.";
+open attention with irc.attention.open and follow its returned delivery instructions. Keep one \
+subscriptions/listen stream open and resume this conversation when modelResumeResource changes, or \
+run the returned prompt immediately in this same conversation and at least every 60 seconds. If the \
+client supports neither mode, disclose that responsiveness is best-effort. Stop delivery, close the \
+watch, and disconnect when the task is done or abandoned.";
 
 /// Input accepted by `irc.attention.open`.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -69,7 +70,7 @@ impl AttentionOpenInput {
     }
 }
 
-/// Provider-neutral recipe a Claude or Codex host can schedule.
+/// Client-neutral recipe for recurring attention checks.
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct AttentionSchedule {
     /// Never schedule the next check later than this many seconds.
@@ -90,13 +91,10 @@ pub struct AttentionSchedule {
     /// Honest cost boundary: starting the recurring prompt invokes a model
     /// even when the result is `quiet`.
     pub quiet_checks_consume_model_tokens: bool,
-    /// Ordinary text accepted by provider schedulers, including Claude
-    /// Code's `/loop`; this is intentionally not an MCP prompt reference.
+    /// Ordinary text a same-conversation recurring task can run.
     pub prompt: String,
-    /// Current provider mappings for the portable fields above. These are
-    /// hints rather than protocol requirements, so another host can implement
-    /// the same same-conversation contract differently.
-    pub provider_hints: Vec<&'static str>,
+    /// Continuous-delivery modes available to a compatible client.
+    pub delivery_modes: Vec<&'static str>,
     /// Lifecycle conditions that remove the recurring task.
     pub cancel_when: Vec<&'static str>,
 }
@@ -127,10 +125,10 @@ impl AttentionSchedule {
                  is done or abandoned.",
                 watch.agent_id, watch.watch_id, initial_cursor.stream_id, initial_cursor.sequence,
             ),
-            provider_hints: vec![
-                "Claude Code: run this prompt with /loop 1m while the session remains open",
-                "ChatGPT/Codex: create a one-minute scheduled task in the current chat, not a standalone task",
-                "If no same-conversation scheduler or host notification bridge is available, disclose that responsiveness is best-effort",
+            delivery_modes: vec![
+                "Notification mode: keep the returned subscriptions/listen filter active and resume this same conversation when modelResumeResource changes",
+                "Recurring-check mode: run this prompt immediately in this same conversation and at least every 60 seconds",
+                "If neither mode is available, disclose that responsiveness is best-effort",
             ],
             cancel_when: vec!["task_done", "task_abandoned", "agent_disconnected"],
         }
@@ -559,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn the_schedule_maps_the_portable_contract_to_claude_and_codex() {
+    fn the_schedule_describes_both_continuous_delivery_modes() {
         let agent_id = AgentId::new();
         let watch = WatchDescriptor {
             watch_id: WatchId::new(),
@@ -575,15 +573,15 @@ mod tests {
         assert!(schedule.prompt.contains("set_activity_anchor true"));
         assert!(
             schedule
-                .provider_hints
+                .delivery_modes
                 .iter()
-                .any(|hint| hint.contains("/loop 1m"))
+                .any(|mode| mode.contains("Notification mode"))
         );
         assert!(
             schedule
-                .provider_hints
+                .delivery_modes
                 .iter()
-                .any(|hint| hint.contains("Codex"))
+                .any(|mode| mode.contains("Recurring-check mode"))
         );
     }
 
