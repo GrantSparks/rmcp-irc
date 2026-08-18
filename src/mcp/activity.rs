@@ -251,6 +251,7 @@ mod tests {
             )),
             wire: None,
             mentions_me: true,
+            authored_by_me: false,
         }
     }
 

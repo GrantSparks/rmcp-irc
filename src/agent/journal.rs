@@ -290,6 +290,9 @@ pub struct NewEvent {
     /// Whether this event is addressed to the owning agent. See
     /// [`IrcEvent::mentions_me`].
     pub mentions_me: bool,
+    /// Whether the owning agent wrote this event itself. See
+    /// [`IrcEvent::authored_by_me`].
+    pub authored_by_me: bool,
     /// Complete parsed wire data when the event came from IRC.
     pub wire: Option<WireMessage>,
 }
@@ -326,6 +329,11 @@ pub struct IrcEvent {
     /// Always false for the agent's own echoed messages.
     #[serde(default)]
     pub mentions_me: bool,
+    /// Whether the owning agent wrote this event itself, covering both the
+    /// outbound line and the server's `echo-message` copy of it, which arrives
+    /// inbound carrying the agent's own nickname as its source.
+    #[serde(default)]
+    pub authored_by_me: bool,
 }
 
 /// Optional filters applied during a cursor read.
@@ -558,6 +566,29 @@ impl EventFilter {
                 .mentions_me
                 .is_none_or(|value| event.mentions_me == value)
     }
+}
+
+/// Whether one semantic event was written by `nickname` itself.
+///
+/// With `echo-message` negotiated a server returns the agent's own message as
+/// ordinary inbound traffic, so the source nickname is the only thing that
+/// separates what the agent said from what it was told.
+pub fn authored_by_nickname(
+    event: &SemanticEvent,
+    nickname: &str,
+    case_mapping: CaseMapping,
+) -> bool {
+    if nickname.is_empty() {
+        return false;
+    }
+    let source = match event {
+        SemanticEvent::MessageChannel { source, .. }
+        | SemanticEvent::MessagePrivate { source, .. }
+        | SemanticEvent::MessageAction { source, .. }
+        | SemanticEvent::MessageNotice { source, .. } => source,
+        _ => return false,
+    };
+    case_mapping.fold(&source.name) == case_mapping.fold(nickname)
 }
 
 /// Decide whether an inbound message is addressed to the agent itself.
@@ -820,6 +851,7 @@ impl EventJournal {
             semantic: event.semantic,
             wire: event.wire,
             mentions_me: event.mentions_me,
+            authored_by_me: event.authored_by_me,
         };
         let raw_bytes = event.wire.as_ref().map_or(0, |wire| wire.raw_bytes.len());
         let bytes = serde_json::to_vec(&event)?.len().saturating_add(raw_bytes);
@@ -1081,6 +1113,7 @@ mod tests {
             semantic: None,
             wire: None,
             mentions_me: false,
+            authored_by_me: false,
         }
     }
 
@@ -1171,6 +1204,7 @@ mod tests {
         let addressed = journal
             .push(NewEvent {
                 mentions_me: true,
+                authored_by_me: false,
                 ..event(&agent_id, EventClass::MessageChannel)
             })
             .expect("addressed");
@@ -1636,6 +1670,7 @@ mod tests {
             semantic: None,
             wire: None,
             mentions_me: false,
+            authored_by_me: false,
         };
         let mut journal = EventJournal::new(4, 4096);
         journal.push(event).expect("push");

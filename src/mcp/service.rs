@@ -4450,6 +4450,12 @@ fn message_tags(input: &SendInput) -> Vec<Tag> {
     tags
 }
 
+/// Split `text` into chunks that each fit `max_bytes`, preferring a break after
+/// whitespace so a sentence carried over several lines stays readable.
+///
+/// The split is lossless: the chunks concatenate back to `text` exactly, which
+/// is why a chosen break keeps the whitespace it broke after rather than
+/// dropping it.
 fn split_utf8(text: &str, max_bytes: usize) -> Result<Vec<String>, GatewayError> {
     if max_bytes == 0 {
         return Err(GatewayError::InvalidMessage(
@@ -4468,10 +4474,31 @@ fn split_utf8(text: &str, max_bytes: usize) -> Result<Vec<String>, GatewayError>
                 "one UTF-8 code point exceeds the active line budget".into(),
             ));
         }
+        if end < remaining.len()
+            && let Some(boundary) = word_boundary(&remaining[..end])
+        {
+            end = boundary;
+        }
         chunks.push(remaining[..end].to_owned());
         remaining = &remaining[end..];
     }
     Ok(chunks)
+}
+
+/// Byte offset just past the last whitespace in `chunk`, when breaking there
+/// still fills most of the line.
+///
+/// A chunk whose only whitespace sits near its start, and one holding a single
+/// unbroken token, both return `None` so the caller falls back to the hard
+/// budget instead of emitting a nearly empty line.
+fn word_boundary(chunk: &str) -> Option<usize> {
+    let floor = chunk.len() / 2;
+    let (index, character) = chunk
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())?;
+    let end = index + character.len_utf8();
+    (end > floor).then_some(end)
 }
 
 fn history_message(
@@ -5855,6 +5882,32 @@ mod tests {
         let chunks = split_utf8("Māui🙂Athena", 5).expect("split");
         assert!(chunks.iter().all(|chunk| chunk.len() <= 5));
         assert_eq!(chunks.concat(), "Māui🙂Athena");
+    }
+
+    #[test]
+    fn splitting_prose_breaks_between_words_rather_than_inside_one() {
+        let text = "the live copy stops at item six and never mentions attention";
+        let chunks = split_utf8(text, 24).expect("split");
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 24));
+        for chunk in chunks.iter().take(chunks.len() - 1) {
+            assert!(
+                chunk.ends_with(' '),
+                "each carried line should end at a word boundary: {chunk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_longer_than_the_budget_still_splits_at_the_hard_boundary() {
+        let text = format!("prefix {}", "z".repeat(40));
+        let chunks = split_utf8(&text, 16).expect("split");
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 16));
+        assert!(
+            chunks.len() > 2,
+            "an unbreakable token must still fit lines"
+        );
     }
 
     #[test]

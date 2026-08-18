@@ -112,6 +112,21 @@ breaking changes to the CLI, configuration, or MCP surface.
   extensions, and elicitation support, so capability negotiation is debuggable
   per request. (#10)
 
+### Fixed
+
+- Model attention no longer returns the agent its own words. With
+  `echo-message` negotiated, the server's copy of a message the agent sent
+  arrives inbound carrying the agent's own nickname, so every such line
+  qualified for attention inside a `full_traffic_targets` channel and was paid
+  for on each scheduled check. Journal events now record `authored_by_me`
+  alongside `mentions_me`, and `irc.attention.open` selection refuses
+  self-authored conversational events on both the notification and the read
+  path.
+- `irc.send` splits an overlong message between words instead of at the raw
+  byte budget, so text carried over several IRC lines no longer breaks in the
+  middle of a word. The split stays byte-lossless and still falls back to the
+  hard boundary for a token longer than one line.
+
 ## [0.2.0] - 2026-08-17
 
 ### Added

@@ -1672,6 +1672,7 @@ impl AgentActor {
             semantic: Some(EventPayload::Pressure(pressure)),
             wire: None,
             mentions_me: false,
+            authored_by_me: false,
         };
         if self.journal.push(event).is_ok() {
             self.notify_journal_append();
@@ -1868,6 +1869,7 @@ impl AgentActor {
             semantic: Some(EventPayload::Motd(motd.clone())),
             wire: None,
             mentions_me: false,
+            authored_by_me: false,
         });
         self.notify_resources(&["motd", "state", "events"]);
     }
@@ -1981,6 +1983,7 @@ impl AgentActor {
         let class = EventClass::from(projection.class);
         let target = message.params.first().cloned();
         let mentions_me = self.addresses_me(&projection);
+        let authored_by_me = self.authored_by_me(&projection);
         let event = NewEvent {
             agent_id: self.id.clone(),
             direction: EventDirection::Inbound,
@@ -1994,6 +1997,7 @@ impl AgentActor {
             semantic: Some(EventPayload::Irc(projection.clone())),
             wire: Some(message.clone()),
             mentions_me,
+            authored_by_me,
         };
         match self.journal.push(event) {
             Ok(cursor) => {
@@ -2122,6 +2126,7 @@ impl AgentActor {
             semantic: (!awaits_echo).then_some(EventPayload::Irc(projection)),
             wire: Some(wire),
             mentions_me: false,
+            authored_by_me: true,
         };
         if self.journal.push(event).is_ok() {
             self.notify_journal_append();
@@ -2150,6 +2155,7 @@ impl AgentActor {
             semantic: Some(semantic),
             wire: None,
             mentions_me: false,
+            authored_by_me: false,
         };
         if self.journal.push(event).is_ok() {
             self.notify_journal_append();
@@ -2201,6 +2207,7 @@ impl AgentActor {
             })),
             wire: None,
             mentions_me: false,
+            authored_by_me: false,
         };
         let _ = self.journal.push(event);
         self.notify_journal_append();
@@ -2240,6 +2247,7 @@ impl AgentActor {
             semantic: Some(EventPayload::Motd(motd.clone())),
             wire: None,
             mentions_me: false,
+            authored_by_me: false,
         };
         if self.journal.push(event).is_ok() {
             // Invalidate matching watches as well as the broad event resource.
@@ -3514,6 +3522,7 @@ impl AgentActor {
             semantic: Some(semantic),
             wire: None,
             mentions_me: false,
+            authored_by_me: false,
         };
         if self.journal.push(event).is_ok() {
             self.notify_journal_append();
@@ -3529,6 +3538,23 @@ impl AgentActor {
             return false;
         };
         addresses_nickname(&projection.event, nickname, self.isupport.case_mapping())
+    }
+
+    /// Whether the agent itself wrote the line this projection came from.
+    ///
+    /// With `echo-message` negotiated the server sends the agent's own message
+    /// back as ordinary inbound traffic, so direction alone cannot tell the
+    /// agent's own words from anybody else's.
+    fn authored_by_me(&self, projection: &crate::irc::semantic::SemanticProjection) -> bool {
+        let state = self.state.borrow();
+        let Some(nickname) = state.identity.nickname.as_deref() else {
+            return false;
+        };
+        crate::agent::journal::authored_by_nickname(
+            &projection.event,
+            nickname,
+            self.isupport.case_mapping(),
+        )
     }
 
     fn dcc_connect_timeout(&self) -> Duration {

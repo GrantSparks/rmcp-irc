@@ -189,6 +189,12 @@ impl AttentionSelection {
         if event.direction != EventDirection::Inbound {
             return false;
         }
+        // An `echo-message` copy of the agent's own line arrives inbound with
+        // the agent as its source. It is already in the caller's context from
+        // the send that produced it, so it never needs a model turn.
+        if event.authored_by_me {
+            return false;
+        }
         if event.class == EventClass::DccChatMessage
             || event.class == EventClass::MessagePrivate
             || event.mentions_me
@@ -846,6 +852,7 @@ mod tests {
             semantic: None,
             wire: None,
             mentions_me,
+            authored_by_me: false,
         }
     }
 
@@ -854,6 +861,16 @@ mod tests {
         account: Option<&str>,
         mentions_me: bool,
         direction: EventDirection,
+    ) -> IrcEvent {
+        authored_message(target, account, mentions_me, direction, false)
+    }
+
+    fn authored_message(
+        target: &str,
+        account: Option<&str>,
+        mentions_me: bool,
+        direction: EventDirection,
+        authored_by_me: bool,
     ) -> IrcEvent {
         let semantic = SemanticEvent::MessageChannel {
             source: Source {
@@ -868,6 +885,7 @@ mod tests {
         IrcEvent {
             direction,
             semantic: Some(EventPayload::Irc(SemanticProjection::from(semantic))),
+            authored_by_me,
             ..event(Some(target), EventClass::MessageChannel, mentions_me)
         }
     }
@@ -940,12 +958,15 @@ mod tests {
         let mention = message("#control", None, true, EventDirection::Inbound);
         let background = message("#control", None, false, EventDirection::Inbound);
         let own_echo = message("#project", None, false, EventDirection::Outbound);
+        // What `echo-message` actually returns: the agent's own line, inbound,
+        // in a target whose whole conversation it asked to follow.
+        let echoed_back = authored_message("#project", None, false, EventDirection::Inbound, true);
 
         for selected in [&project, &human, &mention] {
             assert!(filter.matches(selected, mapping));
             assert!(filter.cursor_query(mapping).selects(selected));
         }
-        for ignored in [&background, &own_echo] {
+        for ignored in [&background, &own_echo, &echoed_back] {
             assert!(!filter.matches(ignored, mapping));
             assert!(!filter.cursor_query(mapping).selects(ignored));
         }

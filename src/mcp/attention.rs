@@ -517,6 +517,7 @@ mod tests {
             semantic: Some(EventPayload::Irc(SemanticProjection::from(semantic))),
             wire: None,
             mentions_me: false,
+            authored_by_me: false,
         }
     }
 
