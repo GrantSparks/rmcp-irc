@@ -19,7 +19,7 @@ pub const STATE_SCHEMA_VERSION: u32 = 2;
 /// registry and its developer instructions. Both are fixed at thread creation,
 /// so bumping this retires an existing thread once and recreates it to pick up
 /// the current contract.
-pub const TOOL_REGISTRY_VERSION: u32 = 3;
+pub const TOOL_REGISTRY_VERSION: u32 = 4;
 
 /// An MCP journal cursor kept opaque except for its stable wire fields.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

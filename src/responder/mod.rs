@@ -10,6 +10,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -468,6 +469,7 @@ async fn handle_page(
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let events = page.get("events").cloned().unwrap_or_else(|| json!([]));
+        let authenticated_authority = has_authenticated_authority(&events);
         let resume_cursor = cursor_at(&page, "/resume_cursor")?;
         let bootstrap = !state.bootstrap_complete;
         if state_name == "quiet" && !bootstrap {
@@ -482,6 +484,7 @@ async fn handle_page(
             )
             .into_iter()
             .collect();
+            let exit_requested = AtomicBool::new(false);
             let actions = validated_turn(
                 app,
                 app_config,
@@ -491,6 +494,8 @@ async fn handle_page(
                 input,
                 &config.allowed_channels,
                 &private,
+                authenticated_authority,
+                &exit_requested,
                 bootstrap,
                 config.turn_timeout,
                 shutdown,
@@ -504,6 +509,10 @@ async fn handle_page(
             });
             store.save(state)?;
             dispatch_pending(mcp, store, state).await?;
+            if exit_requested.load(Ordering::Acquire) {
+                shutdown.cancel();
+                return Ok(());
+            }
         }
 
         if page.get("has_more").and_then(Value::as_bool) != Some(true) {
@@ -511,6 +520,17 @@ async fn handle_page(
         }
         page = check_with_delivery_proof(mcp, state).await?;
     }
+}
+
+fn has_authenticated_authority(events: &Value) -> bool {
+    events.as_array().is_some_and(|events| {
+        events.iter().any(|event| {
+            event.get("direction").and_then(Value::as_str) == Some("inbound")
+                && event
+                    .get("source_account")
+                    .is_some_and(|account| !account.is_null())
+        })
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -523,6 +543,8 @@ async fn validated_turn(
     input: String,
     allowed_channels: &[String],
     private_senders: &HashSet<String>,
+    authenticated_authority: bool,
+    exit_requested: &AtomicBool,
     bootstrap: bool,
     turn_timeout: Duration,
     shutdown: &CancellationToken,
@@ -540,6 +562,8 @@ async fn validated_turn(
             agent_id,
             allowed_channels,
             private_senders,
+            authenticated_authority,
+            exit_requested,
         };
         let text = run_turn_recovering(
             app,
@@ -1079,6 +1103,23 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_inbound_account_tag_grants_responder_exit_authority() {
+        assert!(has_authenticated_authority(&json!([{
+            "direction": "inbound",
+            "source_account": "grant"
+        }])));
+        assert!(!has_authenticated_authority(&json!([{
+            "direction": "inbound",
+            "source_account": null
+        }])));
+        assert!(!has_authenticated_authority(&json!([{
+            "direction": "outbound",
+            "source_account": "grant"
+        }])));
+        assert!(!has_authenticated_authority(&json!({"not": "events"})));
+    }
 
     #[test]
     fn validates_at_most_three_distinct_candidates_without_filling() {
