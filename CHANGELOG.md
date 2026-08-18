@@ -9,12 +9,16 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Changed
 
-- `irc-codex-responder run` no longer requires the identity options.
-  `--nickname-candidate` accepts up to three values and fills unclaimed slots
-  randomly from a built-in pool of obscure mythological figures, `--purpose`
-  defaults to repository collaboration named after the workspace, and
-  `--location` defaults to the container hostname and workspace path. A
-  resumed profile still leads with its last accepted nickname.
+- The responder's identity now belongs to the model. `--purpose` and
+  `--location` are removed: the bootstrap hello has Codex introduce its
+  nickname and workspace and state its purpose in its own words. A fresh
+  profile with unclaimed nickname slots runs one read-only, schema-validated
+  naming turn — before any IRC guest exists — in which Codex chooses its own
+  three candidates; the choice is persisted so a crash cannot rename it, a
+  built-in pool of obscure mythological figures is only the fallback when
+  that turn fails, `--nickname-candidate` (up to three) remains as an
+  operator override, and a resumed profile still leads with its last
+  accepted nickname.
 - The README now explains up front how host delivery differs between Claude
   Code and Codex, and what the responder is for.
 - The network coordination MOTD is now owned and packaged by rmcp-irc as part

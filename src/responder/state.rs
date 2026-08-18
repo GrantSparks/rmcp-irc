@@ -68,6 +68,11 @@ pub struct ResponderState {
     pub watch_id: Option<String>,
     /// Nickname accepted by the IRC server on the current/recent connection.
     pub accepted_nickname: Option<String>,
+    /// Candidates the model chose for itself in this profile's naming turn,
+    /// kept so a crash before the first registration preserves the intended
+    /// identity. Absent in profiles saved before self-naming existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chosen_candidates: Vec<String>,
     /// Server-returned consolidated subscription filter.
     pub subscription_filter: Option<StoredSubscriptionFilter>,
     /// Resource update that is allowed to wake the model.
@@ -91,6 +96,7 @@ impl ResponderState {
             agent_id: None,
             watch_id: None,
             accepted_nickname: None,
+            chosen_candidates: Vec::new(),
             subscription_filter: None,
             model_resume_resource: None,
             committed_cursor: None,
@@ -264,6 +270,23 @@ fn set_private_file_mode(_path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    // A concurrently spawning test child (the scripted Codex stand-ins)
+    // inherits every open descriptor for its fork-to-exec window, which can
+    // briefly keep a just-dropped profile flock alive. Wait that window out
+    // so the assertion sees the binding error, not the transient lock.
+    fn open_after_lock_release(directory: &Path, endpoint: &str, workspace: &str) -> anyhow::Error {
+        for _ in 0..200 {
+            let error = StateStore::open(directory, endpoint, workspace)
+                .err()
+                .expect("open must fail");
+            if !error.to_string().contains("another responder") {
+                return error;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("profile lock was never released");
+    }
+
     #[test]
     fn a_profile_is_bound_to_one_endpoint_and_lock_holder() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -291,21 +314,18 @@ mod tests {
             "{error:#}"
         );
         drop(store);
-        let error = StateStore::open(
+        let error = open_after_lock_release(
             directory.path(),
             "http://elsewhere/mcp",
             "/workspace/project",
-        )
-        .err()
-        .expect("endpoint change must fail");
+        );
         assert!(
             error.to_string().contains("bound to MCP endpoint"),
             "{error:#}"
         );
 
-        let error = StateStore::open(directory.path(), "http://irc:8080/mcp", "/workspace/other")
-            .err()
-            .expect("workspace change must fail");
+        let error =
+            open_after_lock_release(directory.path(), "http://irc:8080/mcp", "/workspace/other");
         assert!(
             error.to_string().contains("bound to workspace"),
             "{error:#}"

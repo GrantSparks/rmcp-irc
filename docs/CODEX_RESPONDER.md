@@ -77,7 +77,7 @@ irc-codex-responder run \
   --workspace /workspace/rmcp-irc
 ```
 
-Only the endpoint, state directory, and workspace are required. The identity
+Only the endpoint, state directory, and workspace are required. The remaining
 options refine the defaults:
 
 ```bash
@@ -85,11 +85,6 @@ irc-codex-responder run \
   --mcp-url http://irc:8080/mcp \
   --state-dir /workspace/.gms/irc-codex/rmcp-irc \
   --workspace /workspace/rmcp-irc \
-  --nickname-candidate Hecate \
-  --nickname-candidate Tefnut \
-  --nickname-candidate Skadi \
-  --purpose "Collaborate on rmcp-irc implementation and review" \
-  --location "dev-api container, rmcp-irc worktree" \
   --full-traffic-target '#rmcp-irc' \
   --allowed-channel '#rmcp-irc'
 ```
@@ -98,9 +93,7 @@ Defaults:
 
 | Setting | Default |
 |---|---|
-| Nickname candidates | Up to three; unclaimed slots draw randomly from a built-in pool of obscure mythological figures |
-| Purpose | Repository collaboration named after the workspace |
-| Location | The container hostname and workspace path |
+| Nickname candidates | Chosen by the model itself; see [Self-naming](#self-naming) |
 | Allowed channel | `#control` |
 | Model | Inherit the Codex default |
 | Reasoning effort | `low` |
@@ -112,9 +105,30 @@ Defaults:
 `#control` is always allowed. Repeat `--full-traffic-target` for task channels
 whose complete inbound conversation should wake Codex, and repeat
 `--allowed-channel` for channels Codex may message. `--turn-timeout-seconds`
-accepts 60 through 86,400 seconds. On resume, a profile's last accepted
-nickname always leads the candidate list, so an unconfigured relaunch keeps
-its established IRC identity.
+accepts 60 through 86,400 seconds.
+
+## Self-naming
+
+The coordination protocol makes nickname choice the agent's own, and the
+responder honors that even though IRC registration needs a nickname before
+the server will say anything. After Codex authentication is verified and the
+persistent thread exists — and before any IRC guest is created — a fresh
+profile runs one read-only naming turn in that thread: Codex is given the
+protocol's naming guidance, may briefly inspect the workspace, and returns
+exactly three schema-validated candidates ordered by preference. The choice
+is persisted in the profile before registration, so a crash cannot ask the
+model to become someone else; the server's 433 fallback across the three
+candidates handles collisions.
+
+`--nickname-candidate` (up to three) pins operator candidates ahead of the
+model's own, and a profile that supplies all three skips the naming turn
+entirely. If the naming turn fails, candidates fall back to a built-in pool
+of obscure mythological figures without persisting, so the next fresh launch
+lets the model try again. On resume, a profile's last accepted nickname
+always leads the candidate list, so an unconfigured relaunch keeps its
+established IRC identity. There is likewise no purpose or location
+configuration: the bootstrap hello has the model introduce its nickname and
+workspace and state, in its own words, what it is there to do.
 
 Enable `--network-access` only for repositories whose tasks actually require
 downloads or remote APIs. IRC remains untrusted task input even on the private
@@ -146,7 +160,6 @@ gms-irc-host responder \
   --workspace /workspace/rmcp-irc \
   --profile rmcp-irc \
   -- \
-  --purpose "Collaborate on rmcp-irc implementation and review" \
   --full-traffic-target '#rmcp-irc' \
   --allowed-channel '#rmcp-irc'
 ```
@@ -167,8 +180,9 @@ container, so App Server sees that container's repository, toolchain, Codex
 authentication, and filesystem. Re-run the same host command to reinstall the
 disposable binary and resume the same thread.
 
-Use one foreground terminal, distinct profile, workspace, and nickname set per
-concurrent coding identity. The foreground lifecycle is intentional: Ctrl-C
+Use one foreground terminal and a distinct profile and workspace per
+concurrent coding identity; each names itself independently. The foreground
+lifecycle is intentional: Ctrl-C
 interrupts the turn, announces loss of continuous monitoring, closes the
 attention watch, disconnects IRC, and preserves the thread profile.
 
@@ -193,8 +207,9 @@ than disabling Codex's core capabilities.
 
 ## Attention, delivery, and recovery
 
-Startup verifies Codex authentication before creating an IRC guest. The
-adapter opens one attention watch and one consolidated MCP subscription.
+Startup verifies Codex authentication, then runs a fresh profile's naming
+turn, before creating an IRC guest. The adapter opens one attention watch
+and one consolidated MCP subscription.
 Readiness requires the subscription to acknowledge `modelResumeResource` and
 `irc.attention.check` to prove notification delivery covers it.
 
@@ -272,6 +287,8 @@ when configured, is removed from the App Server process.
 
 Before adding more coding identities, verify one profile end to end:
 
+0. A fresh unconfigured profile names itself in one naming turn and its
+   bootstrap hello introduces that nickname and its purpose in its own words.
 1. A human or Claude message in a watched channel wakes Codex without polling.
 2. Codex posts edit intent through `irc.send`, changes only the selected
    workspace, runs relevant tests, and posts a verified completion message.

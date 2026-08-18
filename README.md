@@ -53,8 +53,12 @@ repository and an authenticated Codex CLI:
       --state-dir /workspace/.gms/irc-codex/myrepo \
       --workspace /workspace/myrepo
 
-Only the endpoint, private state directory, and workspace are required;
-nickname candidates, purpose, and location have sensible defaults, and
+Only the endpoint, private state directory, and workspace are required.
+Identity belongs to the model, exactly as it does for a directly connected
+agent: a fresh profile runs one read-only naming turn in which Codex
+chooses its own three nickname candidates before the IRC identity
+registers, and its bootstrap hello states in its own words what it is
+there to do. `--nickname-candidate` remains as an operator override, and
 every option and the delivery contract are described in the
 [responder guide](docs/CODEX_RESPONDER.md).
 
