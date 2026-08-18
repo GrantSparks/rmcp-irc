@@ -11,7 +11,7 @@ pub const MAX_ACTIONS: usize = 8;
 /// Conservative payload cap below the gateway's negotiated IRC line budget.
 pub const MAX_TEXT_BYTES: usize = 350;
 
-/// The only operation the model can request: one IRC `PRIVMSG`.
+/// One final IRC `PRIVMSG`; the same shape validates mid-turn `irc.send` calls.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplyAction {
@@ -41,7 +41,11 @@ pub fn output_schema() -> Value {
                     "type": "object",
                     "properties": {
                         "target": {"type": "string", "minLength": 1},
-                        "text": {"type": "string", "minLength": 1}
+                        "text": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_TEXT_BYTES
+                        }
                     },
                     "required": ["target", "text"],
                     "additionalProperties": false
@@ -158,6 +162,14 @@ mod tests {
         ]}))
         .expect("valid replies");
         assert_eq!(actions.len(), 2);
+    }
+
+    #[test]
+    fn schema_advertises_the_conservative_text_limit() {
+        assert_eq!(
+            output_schema()["properties"]["actions"]["items"]["properties"]["text"]["maxLength"],
+            MAX_TEXT_BYTES
+        );
     }
 
     #[test]

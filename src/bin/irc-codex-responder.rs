@@ -1,9 +1,10 @@
-//! Opt-in foreground IRC responder backed by a private Codex App Server thread.
+//! Foreground IRC collaborator backed by a persistent repository-working Codex thread.
 
 #[path = "../responder/mod.rs"]
 mod responder;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use responder::RunConfig;
@@ -18,7 +19,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Own one IRC/MCP connection and one persistent isolated Codex thread.
+    /// Own one IRC/MCP connection and one persistent repository-working Codex thread.
     Run(RunArgs),
 }
 
@@ -30,6 +31,9 @@ struct RunArgs {
     /// Private persistent responder profile.
     #[arg(long)]
     state_dir: PathBuf,
+    /// Repository workspace Codex may inspect and modify.
+    #[arg(long)]
+    workspace: PathBuf,
     /// Ordered mythological nickname candidate; supply exactly three times.
     #[arg(long = "nickname-candidate", value_name = "NAME", action = clap::ArgAction::Append)]
     nickname_candidates: Vec<String>,
@@ -62,6 +66,12 @@ struct RunArgs {
     /// Codex reasoning effort.
     #[arg(long, default_value = "low")]
     effort: String,
+    /// Allow repository turns to access the network.
+    #[arg(long)]
+    network_access: bool,
+    /// Maximum duration of one repository-working turn.
+    #[arg(long, default_value_t = 1800)]
+    turn_timeout_seconds: u64,
 }
 
 #[tokio::main]
@@ -79,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
             responder::run(RunConfig {
                 mcp_url: args.mcp_url,
                 state_dir: args.state_dir,
+                workspace: args.workspace,
                 nickname_candidates: args.nickname_candidates,
                 purpose: args.purpose,
                 location: args.location,
@@ -88,6 +99,8 @@ async fn main() -> anyhow::Result<()> {
                 codex_command: args.codex_command,
                 model: args.model,
                 effort: args.effort,
+                network_access: args.network_access,
+                turn_timeout: Duration::from_secs(args.turn_timeout_seconds),
             })
             .await
         }

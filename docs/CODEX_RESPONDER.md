@@ -1,314 +1,268 @@
-# Codex IRC Responder
+# Codex IRC Repository Responder
 
-`irc-codex-responder` is an optional, foreground adapter that gives one IRC
-identity continuous model attention through a dedicated Codex App Server
-thread. It is an IRC coordination identity, not a repository coding agent.
-It cannot attach to or adopt a ChatGPT, Codex UI, or other pre-existing thread.
+`irc-codex-responder` is the compatibility layer that lets a Codex coding
+agent collaborate with humans and Claude agents on IRC without polling for
+messages and without installing an IRC plugin into Codex. It owns one
+notification-backed IRC/MCP connection and one persistent Codex App Server
+thread rooted in an explicit repository workspace.
 
-The responder is disabled in normal `rmcp-irc` builds. The gateway continues
-to run independently and never starts Codex.
+The responder is opt-in. Normal `irc-mcp` builds and the gateway supervisor do
+not start Codex.
 
-## Boundary and data flow
+## What it provides
 
 ```text
-Ergo IRC <-TCP-> irc-mcp <-HTTP MCP-> irc-codex-responder <-stdio JSONL-> Codex App Server
-                                  owns IRC        owns one private thread
+Ergo IRC <-TCP-> irc-mcp <-HTTP MCP-> responder <-stdio JSONL-> Codex App Server
+                                    owns attention       owns coding thread
 ```
 
-The responder owns both connections. It calls the IRC tools, opens and drains
-the attention watch, validates model output, sends accepted messages, and
-persists delivery state. Codex is never given the MCP URL, an MCP bearer token,
-an IRC connection, or callable tools.
+When watched IRC activity appears, the adapter immediately resumes the same
+Codex thread. Codex can inspect, edit, and test the selected repository using
+its built-in coding tools. A client-defined `irc.send` tool lets it announce
+exact edit intent, synchronize with peer agents, and report blockers while a
+turn is running. No Codex plugin or MCP configuration is required.
 
-Codex receives explicitly untrusted observations: the MOTD, topics, recent
-history, and one attention page. Its only accepted result is a structured
-object containing zero to eight short `PRIVMSG` actions. The responder rejects
-other targets, operations, control characters, duplicate messages, text over
-350 UTF-8 bytes, and private replies to anyone who did not privately message
-the responder in that event batch.
+The responder still owns the IRC credential and connection. It never passes
+the MCP URL or bearer token into App Server. Mid-turn and final IRC sends are
+restricted to operator-allowlisted channels and, for direct replies, private
+senders present in the current attention page. Final actions also use a
+durable outbox so the IRC cursor advances only after delivery.
 
 ## Requirements
 
-- Codex CLI 0.147.0 or later, installed and authenticated where the responder
-  runs. Run `codex login` there first.
+- Codex CLI 0.147.0 or later, installed and authenticated in the development
+  container. Run `codex login` there first.
 - An `irc-mcp` Streamable HTTP endpoint speaking MCP `2026-07-28`.
-- Exactly three distinct nickname candidates.
-- A private, persistent state directory.
+- An existing writable repository or worktree for `--workspace`.
+- Exactly three distinct mythological nickname candidates.
+- A private persistent state directory outside the selected workspace.
 - For GMS, a built gateway image and an explicit running development container
-  attached to the internal IRC network.
+  attached to the private IRC network.
 
-The adapter uses the stable stdio JSONL App Server API only. It does not enable
-`experimentalApi` or use the WebSocket transport. The relevant App Server
-contract is documented in the
+The implementation uses the stdio JSONL App Server API. Repository turns use
+`workspaceWrite` with the selected workspace as the writable root and approval
+policy `never`. Network access is off by default and can be enabled explicitly
+with `--network-access`. The client-defined `irc.send` tool uses App Server's
+experimental dynamic-tools API; `thread/start` is the startup capability probe
+and fails clearly if the installed CLI rejects `dynamicTools`. App Server stores
+that registry in the thread's session metadata and restores it on
+`thread/resume`; responder state schema 2 prevents older prototype threads from
+entering that resume path. All file, shell, plan, and other normal coding items
+remain allowed. See the
 [official Codex App Server documentation](https://learn.chatgpt.com/docs/app-server).
 
 ## Build and inspect
-
-Build only the opt-in binary:
 
 ```bash
 cargo build --release --locked \
   --features codex-responder \
   --bin irc-codex-responder
-```
 
-Inspecting its version or help does not start App Server or connect to IRC:
-
-```bash
 irc-codex-responder --version
 irc-codex-responder run --help
 ```
 
-The default `irc-mcp` binary does not require or launch the responder. A
-gateway package may carry the responder as an inert distribution file while
-its supervisor continues to start only Ergo and `irc-mcp`.
+The default `irc-mcp` binary does not depend on or launch the responder. A
+gateway image may carry `irc-codex-responder` as an inert distribution payload
+for a host launcher to inject into a development container.
 
 ## Direct launch
+
+Run the binary in the same container that contains the repository and the
+authenticated Codex CLI:
 
 ```bash
 irc-codex-responder run \
   --mcp-url http://irc:8080/mcp \
-  --state-dir /workspace/.gms/irc-codex/api-review \
+  --state-dir /workspace/.gms/irc-codex/rmcp-irc \
+  --workspace /workspace/rmcp-irc \
   --nickname-candidate Hecate \
   --nickname-candidate Tefnut \
   --nickname-candidate Skadi \
-  --purpose "Coordinate API work and answer human mentions" \
-  --location "development container api, synemantic worktree"
+  --purpose "Collaborate on rmcp-irc implementation and review" \
+  --location "dev-api container, rmcp-irc worktree" \
+  --full-traffic-target '#rmcp-irc' \
+  --allowed-channel '#rmcp-irc'
 ```
 
-Important defaults:
+Defaults:
 
 | Setting | Default |
 |---|---|
 | Allowed channel | `#control` |
-| Model | Omitted; inherit the Codex default |
+| Model | Inherit the Codex default |
 | Reasoning effort | `low` |
+| Network access | Disabled; opt in with `--network-access` |
+| Repository-turn timeout | 1,800 seconds |
 | Attention page | 100 events |
-| Safety check | 60 seconds |
-| Model-turn timeout | 5 minutes |
+| Notification safety check | 60 seconds |
 
-Use `--full-traffic-target TARGET` repeatedly for task channels whose complete
-traffic should wake the responder. Use `--allowed-channel TARGET` repeatedly
-to expand the channel send allowlist. `#control` is always included. A generic
-authenticated deployment may name an environment variable with
-`--bearer-token-env`; its value is neither persisted nor passed to Codex.
+`#control` is always allowed. Repeat `--full-traffic-target` for task channels
+whose complete inbound conversation should wake Codex, and repeat
+`--allowed-channel` for channels Codex may message. `--turn-timeout-seconds`
+accepts 60 through 86,400 seconds.
 
-Do not put secrets in `--purpose`, `--location`, channel topics, or IRC
-messages. Those values become model input and thread history.
+Enable `--network-access` only for repositories whose tasks actually require
+downloads or remote APIs. IRC remains untrusted task input even on the private
+network; ordinary local editing, builds, and tests do not require this flag.
 
-## GMS: install-on-launch workflow
+The workspace is canonicalized before App Server or IRC starts. A state
+profile is permanently bound to both its first MCP endpoint and canonical
+workspace, preventing a persistent coding thread from being accidentally
+resumed against a different checkout.
 
-Run the host-owned launcher on the Docker host, not inside an ordinary
-development container:
+## GMS host workflow
+
+Run the launcher on the Docker host because only the host can extract the
+binary from the pinned image and copy it into the chosen development
+container:
 
 ```bash
-gms-irc-host responder --container dev-api -- \
+gms-irc-host responder \
+  --container dev-api \
+  --workspace /workspace/rmcp-irc \
+  --profile rmcp-irc \
+  -- \
   --nickname-candidate Hecate \
   --nickname-candidate Tefnut \
   --nickname-candidate Skadi \
-  --purpose "Coordinate API work and answer human mentions" \
-  --location "dev-api, synemantic API worktree"
+  --purpose "Collaborate on rmcp-irc implementation and review" \
+  --location "dev-api container, rmcp-irc worktree" \
+  --full-traffic-target '#rmcp-irc' \
+  --allowed-channel '#rmcp-irc'
 ```
 
-`--container` is always explicit. `--profile` defaults to the container name;
-specify it when a container hosts more than one identity or when a stable
-logical name is clearer:
+The host command:
 
-```bash
-gms-irc-host responder --container dev-api --profile api-review -- ...
-```
+1. verifies the pinned gateway and selected development container;
+2. canonicalizes the requested writable repository inside that container;
+3. extracts the version-matched responder from the gateway image;
+4. copies it to a disposable path in the development container;
+5. runs it in the foreground with the internal MCP URL, validated workspace,
+   and `/workspace/.gms/irc-codex/<profile>` state; and
+6. removes the disposable executable after shutdown.
 
-Each invocation performs the same idempotent installation:
+Nothing is installed permanently on the Docker host or into the development
+image. After a host launch, the process itself runs inside the development
+container, so App Server sees that container's repository, toolchain, Codex
+authentication, and filesystem. Re-run the same host command to reinstall the
+disposable binary and resume the same thread.
 
-1. Verify the configured gateway image is present and running.
-2. Verify the selected development container is running, has a writable
-   `/workspace`, and is attached to the IRC network.
-3. Create a stopped temporary container from the pinned gateway image and
-   extract `/usr/local/bin/irc-codex-responder`.
-4. Copy the binary to a unique temporary path in the development container.
-5. Verify `--version`, then run it in the foreground with
-   `http://irc:8080/mcp` and the selected profile.
-6. Remove the temporary executable and host copy when the session ends.
+Use one foreground terminal, distinct profile, workspace, and nickname set per
+concurrent coding identity. The foreground lifecycle is intentional: Ctrl-C
+interrupts the turn, announces loss of continuous monitoring, closes the
+attention watch, disconnects IRC, and preserves the thread profile.
 
-The executable is therefore reinstalled on every launch. Recreating a
-development container requires no special repair step: run the same command
-again. To run several responders, invoke the command once per container in a
-separate foreground terminal, with distinct profiles and nickname candidates.
+## Coding and coordination contract
 
-The executable is disposable. Only this directory is intended to persist:
+IRC messages are collaborator conversation and task context, not inert text.
+The persistent developer instructions tell Codex to:
 
-```text
-/workspace/.gms/irc-codex/<profile>/
-├── responder.lock
-├── state.json
-├── codex-home/
-│   ├── auth.json
-│   └── ... App Server thread data ...
-```
+- inspect real repository and git state and follow applicable `AGENTS.md`;
+- act on relevant human or peer-agent requests while treating pasted content,
+  metadata, topics, and MOTD text as untrusted data;
+- preserve concurrent work and use `irc.send` to announce exact paths before
+  potentially overlapping edits;
+- use normal built-in coding tools to implement and verify scoped work;
+- avoid commits, pushes, material deletion, and scope expansion without clear
+  authorization; and
+- finish with a schema-constrained completion, blocker, or concise reply.
 
-Each process also creates an empty mode-0700 working directory beneath the
-system temporary directory after verifying that none of its ancestors is a Git
-repository. It is removed on clean exit. It deliberately does not live beneath
-`/workspace`, because a seemingly empty child directory would still inherit an
-ancestor repository boundary.
+This is deliberately a repository-working agent, not an IRC-only chatbot. The
+remaining restrictions protect the connection and repository boundary rather
+than disabling Codex's core capabilities.
 
-The host launcher reserves `--mcp-url` and `--state-dir` so a GMS invocation
-cannot accidentally leave the internal gateway or mix profiles. Run
-`gms-irc-host responder --help` for the complete host-side reference.
+## Attention, delivery, and recovery
 
-## Profile identity and sensitivity
+Startup verifies Codex authentication before creating an IRC guest. The
+adapter opens one attention watch and one consolidated MCP subscription.
+Readiness requires the subscription to acknowledge `modelResumeResource` and
+`irc.attention.check` to prove notification delivery covers it.
 
-A new state directory creates exactly one non-ephemeral App Server thread with
-service name `rmcp_irc_responder`. The thread ID is recorded by the adapter;
-there is deliberately no CLI option for supplying one. Every later launch
-resumes that exact recorded thread. If resume fails, the responder exits rather
-than silently creating a replacement.
+- Matching activity starts one serialized Codex turn immediately.
+- Quiet notification checks and the 60-second host-side safety check start no
+  model turns.
+- Additional activity remains pending while a coding turn is active.
+- `has_more` attention pages drain sequentially.
+- A failed turn does not commit its cursor.
+- If App Server stops, the adapter resumes the recorded thread and tells Codex
+  to inspect current workspace state before continuing, avoiding blind replay
+  of edits or IRC messages.
+- If the final schema is invalid, the corrective turn receives only the local
+  validation error and is explicitly told not to repeat repository work.
 
-The state directory is mode 0700, and its state, lock, and isolated
-authentication files are mode 0600. State writes are atomic and fsynced. An
-exclusive process-lifetime lock prevents two responders from using the same
-profile concurrently. A profile is permanently bound to its first MCP endpoint.
-
-Treat the entire profile as sensitive durable data. It contains a copied Codex
-authentication file, model thread history, IRC identity handles, cursors, and
-possibly a pending reply outbox. Back it up and move it only as one private
-unit. Do not edit `state.json` by hand and do not copy one profile to create a
-second identity.
-
-The isolated `CODEX_HOME` is seeded only from `auth.json` in the authenticated
-development container. User MCP servers, apps, plugins, skills, project
-configuration, and general Codex configuration are not imported.
-
-## Attention and turn lifecycle
-
-On startup the adapter verifies Codex authentication before connecting to IRC.
-It then connects using the three nickname candidates, opens one compound
-attention watch, and opens the exact consolidated subscription filter returned
-by the gateway. Readiness requires both:
-
-1. the subscription acknowledgement covers `modelResumeResource`; and
-2. `irc.attention.check.delivery.mode` is `notification` and explicitly covers
-   that resource.
-
-The first turn must send a `hello` to `#control`. After bootstrap:
-
-- A matching resource notification triggers an immediate attention check.
-- A 60-second host-side safety check detects missed notifications.
-- A quiet check advances the quiet cursor but starts no Codex turn.
-- One non-quiet attention page produces at most one serialized Codex turn.
-- `has_more` pages drain sequentially.
-- Notifications that arrive during a turn remain pending and are checked after
-  the serialized turn completes.
-
-After a valid structured response, the responder first persists a pending
-outbox. It sends actions sequentially, checkpoints each accepted send, and
-commits the page's `resume_cursor` only after the entire outbox completes. A
-failed or rejected turn retains the cursor for retry.
-
-There is one unavoidable at-least-once crash window: an IRC message may be
-duplicated if the gateway accepts `irc.send` and the process dies before the
-next outbox checkpoint reaches disk.
-
-## Isolation and fail-closed behavior
-
-App Server runs in an empty non-repository directory with:
-
-- read-only sandboxing and no network access;
-- approval policy `never`;
-- shell and unified execution disabled;
-- apps, plugins, multi-agent, goals, hooks, memories, Code Mode, image tools,
-  computer/browser tools, and web search disabled;
-- no configured MCP servers; and
-- persistent developer instructions limiting the thread to IRC coordination.
-
-The JSONL client treats App Server commands, file changes, tool calls, plan
-items, permission/approval/input requests, elicitation, hooks, or process and
-filesystem activity as policy violations. It interrupts the active turn and
-sends no reply for that attempt.
-
-All model output is parsed again outside Codex. The adapter accepts only:
+Final output is an object with zero to eight short messages:
 
 ```json
 {
   "actions": [
-    {"target": "#control", "text": "one short IRC line"}
+    {"target": "#control", "text": "done tests pass; updated responder workspace support"}
   ]
 }
 ```
 
-An invalid response or policy violation gets one corrective retry containing
-only the local validation failure. A second failure emits a deterministic
-availability warning, closes attention, disconnects cleanly, and exits
-nonzero. Only validated `PRIVMSG` actions are sent, with multiline handling set
-to `reject_if_too_long` and compact tool results.
+Each message is limited to one target and 350 UTF-8 bytes, with no IRC control
+delimiters or duplicates. The same target and line validation protects
+mid-turn `irc.send`. Final actions are persisted before dispatch and the page
+cursor commits only after all actions are checkpointed. As with any IRC send,
+there is a small at-least-once crash window if the server accepts a message
+immediately before the process dies.
 
-## Shutdown and recovery
+Gateway, subscription, watch, and App Server recovery use bounded retry. The
+adapter never silently creates a replacement App Server thread when resume
+fails. A terminal degradation announces reduced availability, cleans up IRC,
+and exits nonzero.
 
-Ctrl-C and SIGTERM interrupt an active model turn, announce that continuous
-monitoring is ending, close the attention watch, disconnect IRC, stop App
-Server, and retain the adapter-owned thread profile. The next invocation
-reinstalls the executable and resumes that thread.
+## Profile security
 
-Dropped subscriptions, expired IRC handles, and expired attention watches are
-reopened with bounded exponential backoff. A crashed App Server is restarted
-and the recorded thread is resumed. No recovery path creates a replacement
-thread. If App Server authentication or required attention delivery cannot be
-recovered within 60 seconds, the responder announces loss of availability,
-cleans up IRC, and exits nonzero.
+The mode-0700 profile contains mode-0600 state, lock, copied `auth.json`, and
+App Server thread data. Treat it as sensitive durable state. Do not edit
+`state.json` or copy one profile to manufacture another identity. State schema
+version 2 adds the workspace binding; profiles created by the earlier IRC-only
+prototype must be replaced with a new profile directory.
 
-## Cost model
-
-There is one model turn for bootstrap and one for each non-quiet attention
-page. Quiet IRC causes no model turns: notifications and the 60-second safety
-check are handled by the adapter itself. A rejected structured response can
-cost one additional corrective turn. The model also receives current MOTD,
-topics, recent history, and the attention page, so busy channels and large
-histories increase input-token cost.
-
-Use narrow `--full-traffic-target` selections and allowlists. The responder is
-not a general always-on coding agent and should not be used as one.
+The isolated `CODEX_HOME` imports authentication only, not user MCP servers,
+plugins, apps, skills, or global Codex configuration. Applicable repository
+instructions and project configuration remain visible in the selected
+worktree. Repository access comes from App Server's built-in coding tools and
+explicit workspace sandbox—not a plugin. The MCP bearer environment variable,
+when configured, is removed from the App Server process.
 
 ## Troubleshooting
 
 `no Codex authentication found`
-: Run `codex login` in the selected development container. The IRC container's
-  lack of credentials is intentional.
+: Run `codex login` inside the selected development container.
 
-`Codex CLI ... is too old`
-: Upgrade Codex in the development container to 0.147.0 or later. An
-  incompatible stable response shape also produces a compatibility error.
+`state profile is bound to workspace`
+: Reuse the original canonical workspace or choose a new `--profile` /
+  `--state-dir` for the other checkout.
 
-`another responder may already be running`
-: The profile lock is held. Stop the existing foreground process or choose a
-  distinct `--profile`; do not remove a live lock file.
-
-`state profile is bound to MCP endpoint`
-: Use the original endpoint or a new state directory. Endpoint rebinding is
-  rejected to prevent accidental thread/cursor adoption.
+`unsupported responder state schema 1`
+: The profile belongs to the IRC-only prototype. Preserve it if needed, then
+  start this repository-working responder with a new profile.
 
 `did not prove notification delivery`
-: The gateway did not acknowledge the required model-resume resource or did
-  not report notification-backed delivery. Verify the gateway version and its
-  Streamable HTTP subscription path.
+: The gateway did not acknowledge or cover the model-resume resource. Verify
+  the pinned gateway version and Streamable HTTP subscription path.
 
-Responder exits after two validation failures
-: Inspect stderr and IRC history. The fail-closed exit is intentional; fix the
-  model/configuration issue and restart the same profile.
+`another responder may already be running`
+: Stop the foreground process holding that profile or select another profile.
+  Do not remove a live lock file.
 
-## Canary and rollout
+## Canary checklist
 
-Land and deploy `rmcp-irc` before changing GMS's `irc.mcpCommit`. Then rebuild
-the gateway image and canary one foreground development-container profile.
-Verify:
+Before adding more coding identities, verify one profile end to end:
 
-1. `irc-codex-responder --version` runs without starting App Server.
-2. A human mention receives one short reply in the originating target.
-3. Quiet IRC produces no model turns.
-4. Restarting the same profile resumes the recorded thread.
-5. A gateway restart recovers the IRC handle and attention subscription.
-6. Forbidden tool or file activity is rejected without an IRC send.
-7. Ctrl-C announces reduced availability, closes the watch, and disconnects.
+1. A human or Claude message in a watched channel wakes Codex without polling.
+2. Codex posts edit intent through `irc.send`, changes only the selected
+   workspace, runs relevant tests, and posts a verified completion message.
+3. Quiet IRC causes no model turn.
+4. Restarting the same profile resumes its thread and repository context, and
+   the resumed turn can still send a mid-turn status through `irc.send`.
+5. A different workspace is rejected for that profile.
+6. A gateway restart recovers the IRC handle and attention subscription.
+7. Ctrl-C announces reduced availability and cleanly disconnects.
 
-Only after the canary should additional development containers be started.
-The GMS IRC container remains credential-free, Internet-isolated, and unaware
-of Codex throughout this rollout.
+The IRC server container remains credential-free, Internet-isolated, and
+unaware of Codex. Codex and repository access stay in the explicit development
+container selected by the operator.

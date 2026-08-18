@@ -14,7 +14,7 @@ use uuid::Uuid;
 use super::output::ReplyAction;
 
 /// Current on-disk state schema.
-pub const STATE_SCHEMA_VERSION: u32 = 1;
+pub const STATE_SCHEMA_VERSION: u32 = 2;
 
 /// An MCP journal cursor kept opaque except for its stable wire fields.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -57,6 +57,9 @@ pub struct ResponderState {
     pub schema_version: u32,
     /// MCP endpoint this profile is permanently bound to.
     pub endpoint: String,
+    /// Canonical repository workspace this thread may modify.
+    #[serde(default)]
+    pub workspace: String,
     /// Adapter-created App Server thread. Never supplied by an operator.
     pub thread_id: Option<String>,
     /// Current in-memory IRC gateway handle, if it remains live.
@@ -78,11 +81,12 @@ pub struct ResponderState {
 }
 
 impl ResponderState {
-    /// Make a fresh profile permanently bound to `endpoint`.
-    pub fn fresh(endpoint: String) -> Self {
+    /// Make a fresh profile permanently bound to one endpoint and workspace.
+    pub fn fresh(endpoint: String, workspace: String) -> Self {
         Self {
             schema_version: STATE_SCHEMA_VERSION,
             endpoint,
+            workspace,
             thread_id: None,
             agent_id: None,
             watch_id: None,
@@ -95,7 +99,7 @@ impl ResponderState {
         }
     }
 
-    fn validate(&self, endpoint: &str) -> anyhow::Result<()> {
+    fn validate(&self, endpoint: &str, workspace: &str) -> anyhow::Result<()> {
         ensure!(
             self.schema_version == STATE_SCHEMA_VERSION,
             "unsupported responder state schema {}; this binary supports {}",
@@ -107,6 +111,12 @@ impl ResponderState {
             "state profile is bound to MCP endpoint {:?}, not {:?}; choose another --state-dir",
             self.endpoint,
             endpoint
+        );
+        ensure!(
+            self.workspace == workspace,
+            "state profile is bound to workspace {:?}, not {:?}; choose another --state-dir",
+            self.workspace,
+            workspace
         );
         if let Some(outbox) = &self.pending_outbox {
             ensure!(
@@ -122,12 +132,18 @@ impl ResponderState {
 pub struct StateStore {
     directory: PathBuf,
     state_path: PathBuf,
+    endpoint: String,
+    workspace: String,
     _lock: File,
 }
 
 impl StateStore {
     /// Open/create a private state directory and take its lifetime lock.
-    pub fn open(directory: &Path, endpoint: &str) -> anyhow::Result<(Self, ResponderState)> {
+    pub fn open(
+        directory: &Path,
+        endpoint: &str,
+        workspace: &str,
+    ) -> anyhow::Result<(Self, ResponderState)> {
         create_private_directory(directory)?;
         let lock_path = directory.join("responder.lock");
         let lock = private_file_options()
@@ -147,6 +163,8 @@ impl StateStore {
         let store = Self {
             directory: directory.to_path_buf(),
             state_path: directory.join("state.json"),
+            endpoint: endpoint.to_owned(),
+            workspace: workspace.to_owned(),
             _lock: lock,
         };
         let state = if store.state_path.exists() {
@@ -155,10 +173,10 @@ impl StateStore {
                 .with_context(|| format!("read {}", store.state_path.display()))?;
             let state: ResponderState = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse {}", store.state_path.display()))?;
-            state.validate(endpoint)?;
+            state.validate(endpoint, workspace)?;
             state
         } else {
-            ResponderState::fresh(endpoint.to_owned())
+            ResponderState::fresh(endpoint.to_owned(), workspace.to_owned())
         };
         Ok((store, state))
     }
@@ -170,7 +188,7 @@ impl StateStore {
 
     /// Replace `state.json` atomically and fsync both file and directory.
     pub fn save(&self, state: &ResponderState) -> anyhow::Result<()> {
-        state.validate(&state.endpoint)?;
+        state.validate(&self.endpoint, &self.workspace)?;
         let temporary = self
             .directory
             .join(format!(".state.json.{}.tmp", Uuid::new_v4()));
@@ -249,26 +267,54 @@ mod tests {
     #[test]
     fn a_profile_is_bound_to_one_endpoint_and_lock_holder() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let (store, state) =
-            StateStore::open(directory.path(), "http://irc:8080/mcp").expect("first lock");
+        let (store, mut state) = StateStore::open(
+            directory.path(),
+            "http://irc:8080/mcp",
+            "/workspace/project",
+        )
+        .expect("first lock");
         store.save(&state).expect("save");
-        let error = StateStore::open(directory.path(), "http://irc:8080/mcp")
-            .err()
-            .expect("second lock must fail");
+        let error = StateStore::open(
+            directory.path(),
+            "http://irc:8080/mcp",
+            "/workspace/project",
+        )
+        .err()
+        .expect("second lock must fail");
         assert!(error.to_string().contains("another responder"), "{error:#}");
+        state.workspace = "/workspace/other".into();
+        let error = store
+            .save(&state)
+            .expect_err("in-memory workspace rebinding must fail");
+        assert!(
+            error.to_string().contains("bound to workspace"),
+            "{error:#}"
+        );
         drop(store);
-        let error = StateStore::open(directory.path(), "http://elsewhere/mcp")
-            .err()
-            .expect("endpoint change must fail");
+        let error = StateStore::open(
+            directory.path(),
+            "http://elsewhere/mcp",
+            "/workspace/project",
+        )
+        .err()
+        .expect("endpoint change must fail");
         assert!(
             error.to_string().contains("bound to MCP endpoint"),
+            "{error:#}"
+        );
+
+        let error = StateStore::open(directory.path(), "http://irc:8080/mcp", "/workspace/other")
+            .err()
+            .expect("workspace change must fail");
+        assert!(
+            error.to_string().contains("bound to workspace"),
             "{error:#}"
         );
     }
 
     #[test]
     fn an_invalid_outbox_checkpoint_is_rejected() {
-        let mut state = ResponderState::fresh("http://irc/mcp".into());
+        let mut state = ResponderState::fresh("http://irc/mcp".into(), "/workspace/project".into());
         state.pending_outbox = Some(PendingOutbox {
             actions: Vec::new(),
             next_unsent_action: 1,
@@ -278,7 +324,29 @@ mod tests {
             },
             completes_bootstrap: false,
         });
-        assert!(state.validate("http://irc/mcp").is_err());
+        assert!(
+            state
+                .validate("http://irc/mcp", "/workspace/project")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_one_profiles_report_the_migration_error_before_workspace_binding() {
+        let state = ResponderState::fresh("http://irc/mcp".into(), "/workspace/project".into());
+        let mut value = serde_json::to_value(state).expect("serialize state");
+        value["schema_version"] = serde_json::json!(1);
+        value.as_object_mut().unwrap().remove("workspace");
+        let old: ResponderState = serde_json::from_value(value).expect("parse schema one state");
+        let error = old
+            .validate("http://irc/mcp", "/workspace/project")
+            .expect_err("schema one must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported responder state schema 1"),
+            "{error:#}"
+        );
     }
 
     #[cfg(unix)]
@@ -291,7 +359,7 @@ mod tests {
         fs::create_dir(&destination).expect("destination");
         let link = directory.path().join("profile");
         symlink(&destination, &link).expect("symlink");
-        let error = StateStore::open(&link, "http://irc/mcp")
+        let error = StateStore::open(&link, "http://irc/mcp", "/workspace/project")
             .err()
             .expect("symlink must fail");
         assert!(error.to_string().contains("symlinked"), "{error:#}");

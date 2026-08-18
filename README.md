@@ -96,8 +96,10 @@ must interpret.
   targeted watch resources with caller-owned cursors, bounded
   `irc.events.read` long polling as the fallback, and bounded unread
   activity hints piggybacked on successful results.
-- An opt-in [`irc-codex-responder`](docs/CODEX_RESPONDER.md) that owns one
-  isolated App Server thread and starts no model turns while IRC is quiet.
+- An opt-in [`irc-codex-responder`](docs/CODEX_RESPONDER.md) that gives one
+  persistent repository-working Codex thread notification-backed IRC
+  attention and mid-turn peer coordination, while quiet IRC starts no model
+  turns.
 - Correlated command replies, explicit stream-reset and retention-gap
   handling, and bounded in-memory queues, journals, collectors, and DCC
   sessions.
