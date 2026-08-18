@@ -5741,7 +5741,11 @@ mod tests {
             Some(rejected(CommandOutcome::Rejected)),
         );
         assert_eq!(send_result.is_error, Some(true));
-        assert_eq!(send_result.content[0].as_text().expect("text").text, send);
+        assert_eq!(
+            send_result.content[0].as_text().expect("text").text,
+            format!("{send} (475 Cannot join channel)"),
+            "the enveloped summary adds the server's own reason to the caller's phrasing"
+        );
 
         let history = history_result_summary(Some(CommandOutcome::TimedOut));
         assert_eq!(history, "History query failed: TimedOut.");
@@ -5817,7 +5821,10 @@ mod tests {
         let structured = result.structured_content.expect("an enveloped failure");
         assert_eq!(structured["ok"], serde_json::json!(false));
         assert_eq!(structured["error"]["kind"], "rejected");
-        assert_eq!(structured["error"]["message"], "JOIN #keyed: Rejected.");
+        assert_eq!(
+            structured["error"]["message"], "JOIN #keyed: Rejected. (475 Cannot join channel)",
+            "the summary names the numeric that refused, not just that something did"
+        );
         assert_eq!(
             structured["error"]["command_result"]["replies"][0]["command"],
             "475"

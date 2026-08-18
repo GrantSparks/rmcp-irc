@@ -118,6 +118,24 @@ breaking changes to the CLI, configuration, or MCP surface.
   alongside `mentions_me`, and `irc.attention.open` selection refuses
   self-authored conversational events on both the notification and the read
   path.
+- That self-authored exclusion now covers every class, not just conversation.
+  A `channel.state` record is selected for attention as a sparse operational
+  signal, ahead of the conversational rules, so an agent's own `irc.topic.set`
+  or `irc.mode.set` still woke it — twice, once for the outbound request and
+  once for the server's echo. Attention selection drops self-authored events
+  first, and somebody else curating the same channel is unaffected.
+- Compact event projections report no speaker instead of an empty one for the
+  agent's own outgoing lines. Such a line carries no prefix to parse a nickname
+  from, which surfaced as `source: ""` and summaries opening with a stray space
+  (`" set the topic to: ..."`). `source` is now absent and those summaries read
+  as `topic set to: ...`.
+- A rejected IRC command names the reply that refused it in its summary text.
+  The numerics always travelled in the structured failure, but the one-line
+  summary — the part some clients show alone — said only `NICK: Rejected.`,
+  which does not distinguish 433 (choose another nickname) from 432 (this one
+  is malformed). Rejections now read `NICK: Rejected. (433 Nickname is already
+  in use)`; timeouts and unwritten commands are unchanged, having no refusal to
+  quote.
 - `irc.send` splits an overlong message between words instead of at the raw
   byte budget, so text carried over several IRC lines no longer breaks in the
   middle of a word. The split stays byte-lossless and still falls back to the

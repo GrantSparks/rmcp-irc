@@ -51,7 +51,7 @@ use serde_json::{Value, json};
 use crate::{
     dcc::session::DccSession,
     error::GatewayError,
-    irc::correlation::{CommandOutcome, CommandResult},
+    irc::correlation::{CommandOutcome, CommandResult, is_error_numeric},
     mcp::activity::ActivityHint,
 };
 
@@ -128,6 +128,23 @@ impl ToolFailure {
         message: impl Into<String>,
         result: CommandResult,
     ) -> Self {
+        // Carrying the numerics is not the same as reporting them. The summary
+        // line is the part every client shows and some clients show alone, so a
+        // caller told only "NICK: Rejected." cannot tell 433 (choose another
+        // name) from 432 (this name is malformed) without going and reading the
+        // structured half. Naming the refusal costs one clause.
+        //
+        // Only a rejection has a refusal to quote: a command that timed out or
+        // never reached the socket does not, and an error numeric that happened
+        // to arrive before it gave up would describe something other than the
+        // outcome being reported.
+        let detail = (outcome == CommandOutcome::Rejected)
+            .then(|| rejection_detail(&result))
+            .flatten();
+        let message = match detail {
+            Some(detail) => format!("{} ({detail})", message.into()),
+            None => message.into(),
+        };
         Self {
             command_result: Some(result.clone()),
             ..Self::new(command_outcome_kind(outcome), message, result.retriable)
@@ -195,6 +212,33 @@ impl ToolFailure {
 /// difference between a server that refused a command and one that never
 /// acknowledged it is the difference between fixing the arguments and retrying
 /// unchanged.
+/// The server's own words for why it refused, taken from the reply that ended
+/// the exchange.
+///
+/// Scanning from the back matters: a rejection can arrive after informational
+/// replies, and it is the last error the server sent that explains the outcome.
+fn rejection_detail(result: &CommandResult) -> Option<String> {
+    result.replies.iter().rev().find_map(|reply| {
+        let head = if reply.command.eq_ignore_ascii_case("FAIL") {
+            // FAIL names its subject in the middle parameters -- FAIL NICK
+            // ACCOUNT_REQUIRED_TO_CHANGE_NICK -- and those codes are the
+            // machine-readable half, so they belong in the summary too.
+            let mut head = vec!["FAIL".to_owned()];
+            head.extend(reply.params.iter().cloned());
+            head.join(" ")
+        } else {
+            let numeric = reply
+                .numeric()
+                .filter(|numeric| is_error_numeric(*numeric))?;
+            numeric.to_string()
+        };
+        Some(match reply.trailing.as_deref() {
+            Some(text) if !text.is_empty() => format!("{head} {text}"),
+            _ => head,
+        })
+    })
+}
+
 const fn command_outcome_kind(outcome: CommandOutcome) -> &'static str {
     match outcome {
         CommandOutcome::Rejected => "rejected",

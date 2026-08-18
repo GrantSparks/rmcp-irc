@@ -94,7 +94,11 @@ type ConversationalParts = (
 );
 
 fn conversational_parts(event: &SemanticEvent) -> Option<ConversationalParts> {
-    let named = |source: &Source| Some(source.name.clone());
+    // A line the gateway wrote carries no prefix, so its parsed source name is
+    // empty. That is genuinely "unknown speaker", not a speaker called "", and
+    // reporting it as a name would put an empty string where a reader expects a
+    // nickname and a stray leading space in front of every summary.
+    let named = |source: &Source| (!source.name.is_empty()).then(|| source.name.clone());
     let account = |source: &Source| source.account.clone();
     Some(match event {
         SemanticEvent::MessageChannel { source, text, .. }
@@ -105,7 +109,7 @@ fn conversational_parts(event: &SemanticEvent) -> Option<ConversationalParts> {
             named(source),
             account(source),
             Some(text.clone()),
-            Some(format!("{} {text}", source.name)),
+            Some(with_actor(named(source).as_deref(), text)),
         ),
         SemanticEvent::MessageNotice { source, text, .. } => (
             named(source),
@@ -120,7 +124,7 @@ fn conversational_parts(event: &SemanticEvent) -> Option<ConversationalParts> {
             reason,
             ..
         } => {
-            let who = subject.clone().unwrap_or_else(|| source.name.clone());
+            let who = subject.clone().or_else(|| named(source));
             let reason = reason
                 .as_ref()
                 .map(|reason| format!(" ({reason})"))
@@ -129,14 +133,17 @@ fn conversational_parts(event: &SemanticEvent) -> Option<ConversationalParts> {
                 named(source),
                 account(source),
                 None,
-                Some(format!("{who} {}{reason}", membership_verb(change))),
+                Some(with_actor(
+                    who.as_deref(),
+                    &format!("{}{reason}", membership_verb(change)),
+                )),
             )
         }
         SemanticEvent::Presence { source, change } => (
             named(source),
             account(source),
             None,
-            Some(format!("{} {}", source.name, presence_verb(change))),
+            Some(with_actor(named(source).as_deref(), &presence_verb(change))),
         ),
         SemanticEvent::ChannelState {
             source,
@@ -144,9 +151,16 @@ fn conversational_parts(event: &SemanticEvent) -> Option<ConversationalParts> {
             modes,
             ..
         } => {
+            let actor = named(source);
             let summary = match (topic, modes) {
-                (Some(topic), _) => format!("{} set the topic to: {topic}", source.name),
-                (None, Some(modes)) => format!("{} set mode {}", source.name, modes.join(" ")),
+                (Some(topic), _) => match actor.as_deref() {
+                    Some(actor) => format!("{actor} set the topic to: {topic}"),
+                    None => format!("topic set to: {topic}"),
+                },
+                (None, Some(modes)) => match actor.as_deref() {
+                    Some(actor) => format!("{actor} set mode {}", modes.join(" ")),
+                    None => format!("mode set {}", modes.join(" ")),
+                },
                 (None, None) => return None,
             };
             (named(source), account(source), topic.clone(), Some(summary))
@@ -177,6 +191,19 @@ pub fn source_account(event: &IrcEvent) -> Option<&str> {
     source.account.as_deref()
 }
 
+/// Prefix a summary with whoever caused it, or leave it as the bare predicate
+/// when the wire named nobody.
+///
+/// Only the agent's own outgoing lines reach this without an actor: they have
+/// no prefix to parse one from, and the caller already knows it was the one
+/// talking.
+fn with_actor(actor: Option<&str>, predicate: &str) -> String {
+    actor.map_or_else(
+        || predicate.to_owned(),
+        |actor| format!("{actor} {predicate}"),
+    )
+}
+
 fn membership_verb(change: &crate::irc::semantic::MembershipChange) -> &'static str {
     use crate::irc::semantic::MembershipChange;
     match change {
@@ -198,5 +225,84 @@ fn presence_verb(change: &crate::irc::semantic::PresenceChange) -> String {
         PresenceChange::Away(None) => "is back".into(),
         PresenceChange::Host { user, host } => format!("is now {user}@{host}"),
         PresenceChange::RealName(value) => format!("is now \"{value}\""),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        agent::{
+            AgentId,
+            journal::{EventCorrelation, EventOrigin, EventVerbosity},
+        },
+        irc::{semantic::SemanticProjection, target::ChannelName},
+    };
+
+    #[test]
+    fn a_line_the_agent_wrote_itself_reports_no_speaker_rather_than_an_empty_one() {
+        // An outgoing line has no prefix to parse a nickname out of, which used
+        // to reach the reader as a speaker named "" and summaries that opened
+        // with a bare space.
+        let projected = project(SemanticEvent::ChannelState {
+            source: source(""),
+            channel: Some(ChannelName::new("#project".to_owned()).expect("channel")),
+            topic: Some("what we are doing".into()),
+            modes: None,
+        });
+
+        assert_eq!(projected.source, None);
+        assert_eq!(
+            projected.summary.as_deref(),
+            Some("topic set to: what we are doing")
+        );
+    }
+
+    #[test]
+    fn a_line_somebody_sent_still_names_them() {
+        let projected = project(SemanticEvent::ChannelState {
+            source: source("grant"),
+            channel: Some(ChannelName::new("#project".to_owned()).expect("channel")),
+            topic: Some("what we are doing".into()),
+            modes: None,
+        });
+
+        assert_eq!(projected.source.as_deref(), Some("grant"));
+        assert_eq!(
+            projected.summary.as_deref(),
+            Some("grant set the topic to: what we are doing")
+        );
+    }
+
+    fn source(name: &str) -> Source {
+        Source {
+            name: name.to_owned(),
+            user: None,
+            host: None,
+            account: None,
+        }
+    }
+
+    fn project(event: SemanticEvent) -> CompactEvent {
+        let irc = IrcEvent {
+            cursor: EventCursor {
+                stream_id: "stream".into(),
+                sequence: 1,
+            },
+            agent_id: AgentId::new(),
+            direction: EventDirection::Outbound,
+            class: EventClass::ChannelState,
+            origin: EventOrigin::Live,
+            verbosity: EventVerbosity::Semantic,
+            target: Some("#project".into()),
+            server_time: None,
+            received_at: Timestamp::now(),
+            correlation: EventCorrelation::default(),
+            semantic: Some(EventPayload::Irc(SemanticProjection::from(event))),
+            wire: None,
+            mentions_me: false,
+            authored_by_me: true,
+        };
+        CompactEvent::project(&irc).expect("a channel-state event is conversational")
     }
 }

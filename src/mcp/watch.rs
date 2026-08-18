@@ -170,6 +170,16 @@ pub const SPARSE_ATTENTION_CLASSES: &[EventClass] = &[
 impl AttentionSelection {
     /// Whether one event requires model attention.
     pub fn matches(&self, event: &IrcEvent, case_mapping: CaseMapping) -> bool {
+        // Nothing the agent itself wrote needs a model turn, whatever class it
+        // lands in. Its own request is already in the caller's context from the
+        // tool call that produced it, and the server's echo of that request
+        // says the same thing a second time. This has to come before the sparse
+        // rule below: a self-issued TOPIC or MODE is a `channel.state` event, so
+        // checking it only on the conversational path would leave an agent
+        // waking itself up every time it curated a channel.
+        if event.authored_by_me {
+            return false;
+        }
         // Sparse lifecycle signals are relevant even when gateway-internal. A
         // scheduled fallback that cannot be woken by the listen stream still
         // needs to observe them on its next check.
@@ -187,12 +197,6 @@ impl AttentionSelection {
             return false;
         }
         if event.direction != EventDirection::Inbound {
-            return false;
-        }
-        // An `echo-message` copy of the agent's own line arrives inbound with
-        // the agent as its source. It is already in the caller's context from
-        // the send that produced it, so it never needs a model turn.
-        if event.authored_by_me {
             return false;
         }
         if event.class == EventClass::DccChatMessage
@@ -969,6 +973,54 @@ mod tests {
         for ignored in [&background, &own_echo, &echoed_back] {
             assert!(!filter.matches(ignored, mapping));
             assert!(!filter.cursor_query(mapping).selects(ignored));
+        }
+    }
+
+    #[test]
+    fn an_agents_own_channel_curation_never_wakes_it() {
+        let mapping = CaseMapping::default();
+        let filter = WatchFilter {
+            attention: Some(AttentionSelection::default()),
+            ..WatchFilter::default()
+        };
+        // A self-issued TOPIC is a sparse `channel.state` event, so it reaches
+        // attention by a different route than a message does: once as the
+        // outbound request, and again as the server's echo of it. Neither is
+        // news to the agent that just asked for it.
+        let request = channel_state(EventDirection::Outbound, "");
+        let echo = channel_state(EventDirection::Inbound, "Vohumanah");
+        for own in [&request, &echo] {
+            assert!(!filter.matches(own, mapping));
+            assert!(!filter.cursor_query(mapping).selects(own));
+        }
+
+        // Somebody else curating the same channel is still worth a turn.
+        let by_another = IrcEvent {
+            authored_by_me: false,
+            ..channel_state(EventDirection::Inbound, "grant")
+        };
+        assert!(filter.matches(&by_another, mapping));
+        assert!(filter.cursor_query(mapping).selects(&by_another));
+    }
+
+    /// One topic change the agent itself made, as the journal records it.
+    fn channel_state(direction: EventDirection, source: &str) -> IrcEvent {
+        let semantic = SemanticEvent::ChannelState {
+            source: Source {
+                name: source.to_owned(),
+                user: None,
+                host: None,
+                account: None,
+            },
+            channel: Some(ChannelName::new("#project".to_owned()).expect("channel")),
+            topic: Some("curated by its own occupant".into()),
+            modes: None,
+        };
+        IrcEvent {
+            direction,
+            semantic: Some(EventPayload::Irc(SemanticProjection::from(semantic))),
+            authored_by_me: true,
+            ..event(Some("#project"), EventClass::ChannelState, false)
         }
     }
 
