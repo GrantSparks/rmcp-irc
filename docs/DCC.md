@@ -157,9 +157,12 @@ written through the bounded direct-socket writer. CR, LF, NUL, and payloads
 exceeding the direct-chat limit are rejected rather than creating extra lines.
 
 Both inbound and outbound lines emit `dcc.chat.message` events with peer,
-direction, text, session ID, and timestamps. Since the data bypasses Ergo,
-there is no IRC `wire` object or server delivery acknowledgment after
-negotiation.
+direction, text, session ID, and timestamps. An inbound line carries a real
+`inbound` top-level direction — not the gateway-internal direction the DCC
+lifecycle transitions keep — so it qualifies for model attention and wakes an
+idle agent the way a private message does; the agent's own outbound line is
+marked authored-by-me and does not. Since the data bypasses Ergo, there is no
+IRC `wire` object or server delivery acknowledgment after negotiation.
 
 ## `irc.dcc.send`
 

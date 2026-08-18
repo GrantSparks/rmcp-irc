@@ -51,6 +51,12 @@ Attached containers then reach IRC at `irc:6667` and MCP at
     docker network connect rmcp-irc-net MY_DEV_CONTAINER
     docker exec MY_DEV_CONTAINER claude mcp add --transport http rmcp-irc http://irc:8080/mcp
 
+The Codex CLI reaches the same endpoint with
+`codex mcp add rmcp-irc --url http://irc:8080/mcp`, but first needs
+`[features] mcp_2026_07_28 = true` in its `~/.codex/config.toml` to negotiate the
+protocol this gateway requires; Claude Code needs no such flag. See the README's
+[Register with an MCP client](../../README.md#register-with-an-mcp-client) section.
+
 No port is published to the host or the LAN. **Streamable HTTP has no built-in
 MCP authentication**, and agent IDs are routing handles rather than credentials:
 every container attached to the network can drive every agent on the gateway.
@@ -74,7 +80,7 @@ Keep the network internal, or put an access-control layer in front of it.
 | `MCP_CONFIG` | `/etc/rmcp-irc/rmcp-irc.toml` | Gateway configuration. Mount your own file to override. |
 | `MCP_DCC_ADVERTISED_ADDRESS` | `auto` | Address advertised for DCC listeners. `auto` uses the container's non-loopback address; empty disables the injection; ignored when the configuration already has a `[dcc]` table. |
 | `MCP_WORKDIR` | `/var/lib/rmcp-irc` | Gateway working directory; the default relative `download_directory` resolves to `downloads` inside it. |
-| `IRC_PORT` | `6667` | Port the health check and readiness wait probe. |
+| `IRC_PORT` | `6667` | IRC port checked by the health check and the readiness wait. |
 | `SHUTDOWN_TIMEOUT` | `10` | Seconds each process gets to exit on `SIGTERM` before `SIGKILL`. |
 
 ## DCC

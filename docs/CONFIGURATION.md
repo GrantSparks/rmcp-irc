@@ -37,8 +37,8 @@ restricts that shape to a trusted endpoint, loopback unless the network opt-in
 above is given. Bearer tokens are the only thing that separates callers, so
 configure them before the endpoint is shared with anyone else. Browser
 requests carrying an `Origin` header are denied by default; add exact origins
-with repeatable `--allow-origin SCHEME://HOST[:PORT]`. Every HTTP response
-uses `Cache-Control: private, no-store`.
+with repeatable `--allow-origin SCHEME://HOST[:PORT]` (or the literal `null`).
+Every HTTP response uses `Cache-Control: private, no-store`.
 
 ## `[irc]`: Ergo endpoint
 

@@ -31,7 +31,7 @@ file sources and destinations outside the repository.
    cargo test --all-targets --all-features --locked
    cargo clippy --all-targets --all-features --locked -- -D warnings
    RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps --document-private-items --locked
-   cargo deny check
+   cargo deny --all-features --locked check
    cargo audit
    ```
 
@@ -47,9 +47,13 @@ file sources and destinations outside the repository.
    identities and that the configured port range is free.
 4. Use an MCP client that can display both text and `structuredContent`, issue
    concurrent calls, preserve event cursors, and close stdio cleanly. The two
-   transports expose the same service; they are not separate APIs. Record
-   whether the client exposes MCP resource subscriptions. If it does not, keep
-   an `irc.events.read` long poll active throughout the run.
+   transports expose the same service; they are not separate APIs. The gateway
+   serves only MCP `2026-07-28`; a client that negotiates an older revision
+   cannot connect. Claude Code negotiates it automatically, but a bare Codex CLI
+   client needs `[features] mcp_2026_07_28 = true` in its `~/.codex/config.toml`
+   (see [Register with an MCP client](../README.md#register-with-an-mcp-client)).
+   Record whether the client exposes MCP resource subscriptions. If it does not,
+   keep an `irc.events.read` long poll active throughout the run.
 
 ## Start both transports
 

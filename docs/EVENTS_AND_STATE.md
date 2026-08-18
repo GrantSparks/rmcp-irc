@@ -389,10 +389,11 @@ one operation the task augments. Neither form is an ambient IRC event channel.
 ### Model attention
 
 `irc.attention.open` creates one compound selection for inbound direct/private
-messages, nickname mentions, account-identified human messages, and all inbound
-conversation in caller-selected task targets. It also selects sparse
-connection, MOTD, protocol, topic, journal-pressure, and actionable DCC
-lifecycle events, including gateway-internal ones. The compact attention event
+messages, inbound direct DCC chat lines, nickname mentions, account-identified
+human messages, and all inbound conversation in caller-selected task targets. It
+also selects sparse connection, MOTD, protocol, channel topic/mode,
+journal-pressure, and actionable DCC lifecycle events, including gateway-internal
+ones. The compact attention event
 projection retains `source_account`; a present account is positive human
 evidence under the network MOTD, while a missing account remains unknown.
 

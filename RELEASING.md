@@ -30,7 +30,7 @@ Run the same gates CI enforces:
     cargo clippy --all-targets --all-features --locked -- -D warnings
     RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps --document-private-items --locked
     cargo +1.88.0 check --all-targets --all-features --locked
-    cargo deny --locked check
+    cargo deny --all-features --locked check
 
 `cargo-deny` requires a separately installed subcommand.
 

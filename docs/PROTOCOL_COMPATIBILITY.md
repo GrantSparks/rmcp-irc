@@ -38,6 +38,12 @@ equivalent advertised spelling), `cap-notify`, `labeled-response`,
 spellings when advertised. SASL PLAIN is added only when configured and
 advertised.
 
+Negotiating `draft/message-redaction` only makes the typed `irc.message.redact`
+path available; Ergo still enforces its own history policy, so a redaction
+reaches the channel only when the server permits individual deletion
+(`history.retention.allow-individual-delete`). Even with the capability
+negotiated, every redaction is refused upstream when that setting is off.
+
 Reactions and typing are client-only message tags, not separately negotiated
 capabilities. Their typed tools require negotiated `message-tags` and honor the
 server's `CLIENTTAGDENY` policy. `draft/multiline`, metadata, and event-playback
@@ -159,6 +165,12 @@ Requirements:
 - dispatch compares command names case-insensitively while preserving spelling;
 - tag keys remain case-sensitive and distinguish a flag from an explicit empty
   value;
+- a message's final logical field is recovered whether the server sent it
+  colon-prefixed as `trailing` or, when it contains no spaces, as a bare final
+  middle parameter; Ergo omits the leading colon for a spaceless final field —
+  such as a one-word real name (311), a single-word topic (332 and the TOPIC
+  echo), a lone WHOIS channel (319), or a single NAMES entry (353) — so a
+  projection reads that field by position rather than from `trailing` alone;
 - IRC formatting and CTCP are parsed additively without removing original text;
 - server-advertised line limits apply, with 512 bytes including CRLF when none
   is advertised and the configured ceiling always enforced;
@@ -184,7 +196,7 @@ Known commands have a static `CommandSpec`:
 
 ```text
 name
-phase                  registration | registered | lifecycle
+phase                  registration | registered | lifecycle | any
 required_capabilities
 response_strategy
 state_effects
@@ -198,6 +210,7 @@ The required response strategies are:
 | --- | --- |
 | `ack` | One complete logical labeled response: a direct reply/ACK or an outer batch. |
 | `single_reply` | One matching reply or error completes the command. |
+| `command_reply` | One matching named non-numeric server command (such as `MARKREAD`) or an error completes the command. |
 | `numeric_sequence` | Collect until a command-specific terminal numeric. |
 | `batch` | Collect a complete batch of the expected type, including nested batches. |
 | `echo` | Complete on a matching server echo/state transition. |

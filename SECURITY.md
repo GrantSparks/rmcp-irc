@@ -2,10 +2,11 @@
 
 Supported releases and the current `main` branch receive security fixes.
 
-`rmcp-irc` is intended for trusted local or internal-network MCP clients. It
-does not provide MCP authentication, agent ACLs, command allowlists, channel
-policy, or DCC peer authorization. The configured Ergo server controls IRC
-permissions.
+`rmcp-irc` is intended for trusted local or internal-network MCP clients. On
+Streamable HTTP, optional `--http-bearer-token` credentials separate callers
+into isolated owners; beyond that the gateway provides no agent ACLs, command
+allowlists, channel policy, or DCC peer authorization. The configured Ergo
+server controls IRC permissions.
 
 The gateway validates IRC framing, bounds memory and direct-session resources,
 redacts configured credentials, and requires explicit DCC file-conflict
@@ -31,6 +32,8 @@ after an IRC write.
 ## Deployment notes
 
 - Bind Streamable HTTP only to the intended trusted network.
+- On shared Streamable HTTP, configure one or more `--http-bearer-token`
+  credentials; without them every caller shares one trusted local owner.
 - Use plain TCP or TLS according to the configured Ergo endpoint.
 - Put optional PASS/SASL values in environment variables referenced by the
   configuration file.

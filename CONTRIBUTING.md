@@ -20,14 +20,11 @@ hooks. After installing `pre-commit` 3.2 or newer, run this once in the clone:
 
     pre-commit install
 
-The configuration installs all three hook types used by the project:
+The configuration installs the two hook types used by the project:
 
-- `pre-commit` checks formatting and common file errors;
-- `commit-msg` removes unsolicited AI-assistant attribution while preserving
-  human co-author trailers; and
-- `pre-push` runs the attribution hook's regression tests, then runs Rustfmt,
-  the tests, Clippy, and the documentation build with the same flags used by
-  CI.
+- `pre-commit` checks formatting and common file errors; and
+- `pre-push` runs Rustfmt, the tests, Clippy, and the documentation build with
+  the same flags used by CI.
 
 The pre-push suite can also be run at any time, including before a commit:
 

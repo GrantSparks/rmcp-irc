@@ -51,13 +51,21 @@ that is what makes commits possible. It is deliberately not
 and delivery cursors) lives outside the workspace and is never a writable root,
 so an injected turn cannot reach it. The scope is widened by naming additional
 writable roots, not by removing that wall. The responder still removes its MCP
-bearer secret from the App Server environment. The client-defined IRC
-tools use App Server's experimental dynamic-tools API; `thread/start` is the startup capability probe
-and fails clearly if the installed CLI rejects `dynamicTools`. App Server stores
-that registry in the thread's session metadata and restores it on
-`thread/resume`; a tool-registry version retires an older thread once when the
-registered surface expands. All file, shell, plan, and other normal coding items
-remain allowed. See the
+bearer secret from the App Server environment. The responder enables the
+experimental App Server surface with `capabilities.experimentalApi` at
+`initialize`, and the client-defined IRC tools use its dynamic-tools API;
+`thread/start` is the startup capability probe and fails clearly if the
+installed CLI rejects `dynamicTools`. App Server stores that registry in the
+thread's session metadata and restores it on `thread/resume`; a tool-registry
+version retires an older thread once when the registered surface expands. All
+file, shell, plan, and other normal coding items remain allowed.
+
+Because Codex is driven through the App Server and never speaks MCP to the
+gateway itself, the responder needs none of the client-side Codex configuration
+a direct connection does — in particular not the undocumented
+`[features] mcp_2026_07_28` switch a bare `codex mcp add` client needs to
+negotiate `2026-07-28`. The responder holds the gateway connection with its own
+MCP client, and its isolated `CODEX_HOME` imports authentication only. See the
 [official Codex App Server documentation](https://learn.chatgpt.com/docs/app-server).
 
 ## Build and inspect

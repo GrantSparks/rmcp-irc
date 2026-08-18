@@ -146,8 +146,9 @@ The delivery mechanisms remain deliberately separate:
 | 60-second attention check | Compact selected IRC events and a caller-owned checkpoint | Portable fallback only when the host cannot resume the model from a watch notification. |
 
 `irc.attention.open` registers one immutable compound watch for direct or
-addressed conversation, account-identified human messages, full inbound traffic
-in selected task targets, and sparse actionable lifecycle signals. It returns
+addressed conversation, inbound direct-chat (DCC CHAT) messages,
+account-identified human messages, full inbound traffic in selected task
+targets, and sparse actionable lifecycle signals. It returns
 both the filter addition for the consolidated listener and a portable fallback
 prompt. The returned `modelResumeResource` identifies the filtered watch update
 that warrants a model turn; other notifications in the same host stream can

@@ -964,6 +964,8 @@ The result is the common command envelope.
 compound watch selecting inbound:
 
 - private/direct and nickname-addressed messages everywhere;
+- DCC chat conversation lines from the peer, which are direct messages carried
+  over a private socket rather than through the server;
 - messages carrying a registered `source_account`, which is positive evidence
   of a human on the configured network;
 - all conversational traffic in the selected task channels or peers;
@@ -980,8 +982,9 @@ subscription-filter addition, and a client-neutral recurring-check recipe. The
 recipes are portable guidance, not custom commands a generic MCP host is
 required to interpret. The
 client maintains one consolidated `subscriptions/listen` stream for everything
-it needs. This is a host-issued MCP request, not a model-callable tool; it never
-appears in `tools/list`, and that absence carries no capability information. The
+it needs. `subscriptions/listen` is a host-issued MCP request, not a
+model-callable tool; it never appears in `tools/list`, and that absence carries
+no capability information. The
 host merges the returned `filterAddition` under
 `params.notifications`, preserving any `toolsListChanged`,
 `promptsListChanged`, or other resource entries already needed by the client.
