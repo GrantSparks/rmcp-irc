@@ -696,10 +696,8 @@ async fn build_turn_input(
     let mut topics = Vec::new();
     let mut histories = Vec::new();
     for target in context_channels(config) {
-        topics.push((
-            target.clone(),
-            mcp.topic(required_agent(state)?, &target).await?,
-        ));
+        let topic = mcp.topic(required_agent(state)?, &target).await?;
+        topics.push((target.clone(), stable_topic(&topic)));
         if bootstrap {
             histories.push(json!({
                 "target": target,
@@ -717,6 +715,20 @@ async fn build_turn_input(
         attention_page,
         bootstrap,
     )
+}
+
+/// Stable projection of one `irc.topic.get` result.
+///
+/// The full result embeds a per-call command envelope — command id, labels,
+/// batched wire replies — so no two fetches ever compare equal and an
+/// unchanged topic would be resent on every turn. Only what identifies the
+/// topic itself takes part in delta comparison and reaches the model.
+fn stable_topic(result: &Value) -> Value {
+    json!({
+        "topic": result.get("topic"),
+        "set_by": result.get("set_by"),
+        "set_at": result.get("set_at"),
+    })
 }
 
 /// Serialize one turn's input, carrying only context this thread has not seen.
@@ -1077,6 +1089,26 @@ mod tests {
         config.nickname_candidates = vec!["Nabu".into()];
         config.validate().expect("valid");
         assert_eq!(config.nickname_candidates, vec!["Nabu"]);
+    }
+
+    #[test]
+    fn topic_delta_comparison_ignores_the_per_call_command_envelope() {
+        // Snotra's live finding: unchanged topics were resent every turn
+        // because the raw topic.get result carries per-call command ids.
+        let first = json!({
+            "channel": "#control", "topic": "alpha", "set_by": "grant", "set_at": 1,
+            "result": {"command_id": "cmd_1", "replies": [{"raw": "@label=cmd_1 ..."}]}
+        });
+        let second = json!({
+            "channel": "#control", "topic": "alpha", "set_by": "grant", "set_at": 1,
+            "result": {"command_id": "cmd_2", "replies": [{"raw": "@label=cmd_2 ..."}]}
+        });
+        assert_eq!(stable_topic(&first), stable_topic(&second));
+        assert_eq!(stable_topic(&first)["topic"], "alpha");
+        assert_ne!(
+            stable_topic(&first),
+            stable_topic(&json!({"topic": "beta", "set_by": "grant", "set_at": 2}))
+        );
     }
 
     #[test]
