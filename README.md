@@ -266,21 +266,49 @@ limits, reconnect behavior, and DCC settings.
 
 ### Register with an MCP client
 
+Register whichever transport your client uses. Run the command in the attached
+development container and use the binary path reported by `command -v irc-mcp`;
+the Streamable HTTP endpoint is the one started under
+[Streamable HTTP](#streamable-http) below.
+
 For Claude Code:
 
+    # stdio
     claude mcp add rmcp-irc -- \
       /absolute/path/to/irc-mcp serve --transport stdio
+    # Streamable HTTP
+    claude mcp add --transport http rmcp-irc http://127.0.0.1:8080/mcp
 
 For Codex:
 
+    # stdio
     codex mcp add rmcp-irc -- \
       /absolute/path/to/irc-mcp serve --transport stdio
+    # Streamable HTTP
+    codex mcp add rmcp-irc --url http://127.0.0.1:8080/mcp
 
-Run these commands in the attached development container and use the binary
-path reported by `command -v irc-mcp`. For an existing server, append
-`--config /path/to/rmcp-irc.toml` to the server command.
+For an existing server, append `--config /path/to/rmcp-irc.toml` to the stdio
+server command.
 
-Once the client has started the server over stdio, call `irc.connect`. The
+**Codex needs one extra, undocumented setting.** The gateway requires MCP
+`2026-07-28` (see [protocol revision](docs/MCP_API.md#protocol-revision)), and
+the Codex CLI offers that revision — over either transport — only when its
+configuration opts into an experimental switch its own documentation does not
+mention. Add it to `config.toml` in the active `CODEX_HOME`
+(`~/.codex/config.toml` by default):
+
+    [features]
+    mcp_2026_07_28 = true
+
+Without it Codex negotiates an older revision and `irc.connect` never
+completes. Claude Code negotiates `2026-07-28` on its own and needs no
+equivalent switch. This bare-client path also cannot be woken when watched
+traffic arrives, which is why Codex usually runs behind
+[`irc-codex-responder`](#which-agents-stay-responsive) instead; the responder
+holds the gateway connection itself and drives Codex through the App Server, so
+the feature flag is not needed there.
+
+Once the client is registered, call `irc.connect`. The
 result includes the accepted nickname, the server's MOTD, the agent ID, and
 links to the agent's resources. Read and follow the MOTD before
 participating. Before the foreground turn ends, call `irc.attention.open`
@@ -296,18 +324,18 @@ Start the shared endpoint:
     irc-mcp serve --transport http --listen 127.0.0.1:8080 \
       --config /path/to/config.toml
 
-The MCP endpoint is `http://127.0.0.1:8080/mcp`:
+The MCP endpoint is `http://127.0.0.1:8080/mcp`; register it with the
+Streamable HTTP commands under
+[Register with an MCP client](#register-with-an-mcp-client). Both transports
+expose the same service. Every operation after `irc.connect` requires an
+explicit `agent_id`; an HTTP connection is not an IRC identity.
 
-    claude mcp add --transport http rmcp-irc http://127.0.0.1:8080/mcp
-    codex mcp add rmcp-irc --url http://127.0.0.1:8080/mcp
-
-Both transports expose the same service. Every operation after `irc.connect`
-requires an explicit `agent_id`; an HTTP connection is not an IRC identity.
-
-The endpoint requires MCP `2026-07-28`. Clients must enable that protocol before
-connecting and send its complete per-request metadata. Tool results keep stable
-resource URIs in `structuredContent` and omit native `resource_link` content
-blocks for compatibility across current model hosts. See
+The endpoint requires MCP `2026-07-28` and its complete per-request metadata.
+Clients must enable that protocol before connecting — for Codex that is the
+`mcp_2026_07_28` feature flag under
+[Register with an MCP client](#register-with-an-mcp-client). Tool results keep
+stable resource URIs in `structuredContent` and omit native `resource_link`
+content blocks for compatibility across current model hosts. See
 [protocol revision](docs/MCP_API.md#protocol-revision).
 For shared HTTP, pass one or more `--http-bearer-token TOKEN` options and send
 the corresponding `Authorization: Bearer TOKEN` header. Each token sees and
