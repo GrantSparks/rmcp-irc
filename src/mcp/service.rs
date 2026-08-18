@@ -265,7 +265,7 @@ impl IrcMcpService {
         vec![PromptMessage::new_text(
             Role::User,
             format!(
-                "For IRC agent `{}`, call `irc.attention.open`. {targets} Follow the returned delivery instructions and establish one mode before claiming to watch or stand by. Notification mode keeps the returned filter merged into one `subscriptions/listen` stream and resumes this same conversation when modelResumeResource changes. Recurring-check mode runs the returned prompt immediately in this same conversation with no interval longer than 60 seconds. Persist `resume_cursor` only after handling returned events, drain immediately while `has_more` is true, and stop delivery, close the watch, and disconnect when the work ends. Quiet recurring checks consume model tokens; notification mode does not invoke the model while quiet. Successful tool results may report bounded activity while the model is already running, but cannot wake it.",
+                "For IRC agent `{}`, call `irc.attention.open`. {targets} Follow the returned delivery instructions and establish one mode before claiming to watch or stand by. Notification mode keeps the returned filter merged into one `subscriptions/listen` stream and resumes this same conversation when modelResumeResource changes. Recurring-check mode runs the returned prompt immediately, then every 60 seconds in this same conversation. Treat `intervalSeconds` as the cadence and never use an immediate continuation loop; in Codex, a durable goal alone is not a timer. Persist `resume_cursor` only after handling returned events, drain immediately while `has_more` is true, and stop delivery, close the watch, and disconnect when the work ends. Quiet recurring checks consume model tokens; notification mode does not invoke the model while quiet. Successful tool results may report bounded activity while the model is already running, but cannot wake it.",
                 input.agent_id,
             ),
         )]
@@ -305,7 +305,7 @@ impl IrcMcpService {
                  cannot force or schedule a model turn. MCP 2026-07-28 has no server-initiated \
                  sampling — it is deprecated by SEP-2577 — and input requests exist only inside an \
                  active client request. For autonomous model participation, use \
-                 `irc.attention.open` and its at-most-60-second same-conversation scheduler recipe, \
+                 `irc.attention.open` and its 60-second same-conversation scheduler recipe, \
                  or a host bridge that directly resumes the model from this listen stream.",
                 input.agent_id
             ),
@@ -511,7 +511,9 @@ impl IrcMcpService {
                     "Attention opened for {} at {}. Establish one returned delivery mode now: keep \
                      the subscriptions/listen filter active and resume this same conversation when \
                      modelResumeResource changes, or run the recurring-check prompt immediately in \
-                     this same conversation and at least every 60 seconds. If neither is available, \
+                     this same conversation and then every 60 seconds. Do not use an immediate \
+                     continuation loop; in Codex, a durable goal alone is not a timer. If neither \
+                     notification mode nor a cadence-aware scheduler is available, \
                      disclose that responsiveness is best-effort.",
                     created.watch.agent_id, created.watch.uri,
                 );

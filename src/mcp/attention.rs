@@ -39,9 +39,10 @@ pub const ATTENTION_MAX_INTERVAL_SECONDS: u64 = 60;
 pub const ATTENTION_ONBOARDING: &str = "Before ending a turn while this IRC agent remains active, \
 open attention with irc.attention.open and follow its returned delivery instructions. Keep one \
 subscriptions/listen stream open and resume this conversation when modelResumeResource changes, or \
-run the returned prompt immediately in this same conversation and at least every 60 seconds. If the \
-client supports neither mode, disclose that responsiveness is best-effort. Stop delivery, close the \
-watch, and disconnect when the task is done or abandoned.";
+run the returned prompt immediately and then every 60 seconds in this same conversation. Do not use \
+an immediate continuation loop; in Codex, a durable goal alone is not a timer. If the client supports \
+neither notification mode nor a cadence-aware scheduler, disclose that responsiveness is best-effort. \
+Stop delivery, close the watch, and disconnect when the task is done or abandoned.";
 
 /// Input accepted by `irc.attention.open`.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -73,6 +74,10 @@ impl AttentionOpenInput {
 /// Client-neutral recipe for recurring attention checks.
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct AttentionSchedule {
+    /// Recommended delay between recurring checks after the immediate first
+    /// check. This makes the cadence explicit for clients whose generic goal
+    /// or continuation mechanism otherwise runs again immediately.
+    pub interval_seconds: u64,
     /// Never schedule the next check later than this many seconds.
     pub max_interval_seconds: u64,
     /// The first check should run as soon as setup completes.
@@ -104,6 +109,7 @@ impl AttentionSchedule {
     /// needed by the active conversation.
     pub fn new(watch: &WatchDescriptor, initial_cursor: &EventCursor) -> Self {
         Self {
+            interval_seconds: ATTENTION_MAX_INTERVAL_SECONDS,
             max_interval_seconds: ATTENTION_MAX_INTERVAL_SECONDS,
             run_immediately: true,
             same_conversation: true,
@@ -121,13 +127,18 @@ impl AttentionSchedule {
                  relevant messages in their originating target, and retain resume_cursor only after \
                  handling the returned events. If a handle is unknown or expired and the underlying \
                  task is still active, reconnect, reread the MOTD, reopen attention, and replace the \
-                 handles. Cancel this recurring task, close the watch, and disconnect when the work \
-                 is done or abandoned.",
+                 handles. After the immediate first check, run each later check 60 seconds after the \
+                 previous check; do not use an immediate continuation loop. In Codex, a durable goal \
+                 alone is not a cadence-aware scheduler and can fire repeatedly without waiting, so \
+                 use notification mode or an actual scheduled task that honors this interval. Cancel \
+                 this recurring task, close the watch, and disconnect when the work is done or \
+                 abandoned.",
                 watch.agent_id, watch.watch_id, initial_cursor.stream_id, initial_cursor.sequence,
             ),
             delivery_modes: vec![
                 "Notification mode: keep the returned subscriptions/listen filter active and resume this same conversation when modelResumeResource changes",
-                "Recurring-check mode: run this prompt immediately in this same conversation and at least every 60 seconds",
+                "Recurring-check mode: run this prompt immediately, then every 60 seconds in this same conversation; do not use an immediate continuation loop",
+                "Codex: a durable goal alone is not a timer; use notification mode or a cadence-aware scheduled task that honors intervalSeconds",
                 "If neither mode is available, disclose that responsiveness is best-effort",
             ],
             cancel_when: vec!["task_done", "task_abandoned", "agent_disconnected"],
@@ -567,10 +578,13 @@ mod tests {
             expires_at: Timestamp::now(),
         };
         let schedule = AttentionSchedule::new(&watch, &cursor(10));
+        assert_eq!(schedule.interval_seconds, 60);
         assert_eq!(schedule.max_interval_seconds, 60);
         assert!(schedule.same_conversation);
         assert!(schedule.check_sets_activity_anchor);
         assert!(schedule.prompt.contains("set_activity_anchor true"));
+        assert!(schedule.prompt.contains("60 seconds after"));
+        assert!(schedule.prompt.contains("durable goal alone"));
         assert!(
             schedule
                 .delivery_modes
@@ -583,6 +597,19 @@ mod tests {
                 .iter()
                 .any(|mode| mode.contains("Recurring-check mode"))
         );
+        assert!(
+            schedule
+                .delivery_modes
+                .iter()
+                .any(|mode| mode.contains("Codex"))
+        );
+    }
+
+    #[test]
+    fn onboarding_rejects_an_immediate_codex_continuation_loop() {
+        assert!(ATTENTION_ONBOARDING.contains("every 60 seconds"));
+        assert!(ATTENTION_ONBOARDING.contains("durable goal alone is not a timer"));
+        assert!(ATTENTION_ONBOARDING.contains("cadence-aware scheduler"));
     }
 
     #[test]

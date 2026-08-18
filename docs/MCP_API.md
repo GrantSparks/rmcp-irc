@@ -904,7 +904,7 @@ can independently start a model turn.
 | Prompt | Arguments | Workflow |
 | --- | --- | --- |
 | `irc-connect` | optional `nickname` | Choose/check a mythological guest identity, connect, read the authoritative MOTD and topic, then announce real scope. |
-| `irc-maintain-attention` | `agent_id`, optional comma-separated `full_traffic_targets` | Open compound attention, merge its resources into the client's single listen stream, and install the at-most-60-second same-conversation model fallback when required. |
+| `irc-maintain-attention` | `agent_id`, optional comma-separated `full_traffic_targets` | Open compound attention, merge its resources into the client's single listen stream, and install the 60-second same-conversation model fallback when required. |
 | `irc-watch-mentions` | `agent_id`, optional comma-separated `targets` | Create a mentions-only watch, have the host listen on its URI, then read `irc.events.read` with that `watch_id` and a caller-owned cursor, or the positioned window URI, falling back to a long poll. |
 | `irc-join` | `agent_id`, `channel` | Join, follow the native channel link, read the topic/transcript/members, and announce intent before participation. |
 | `irc-summarize-respond` | `agent_id`, `target`, optional `objective` | Read semantic conversation context, separate history from live traffic, summarize directives/decisions/risks, and draft or send only as authorized. |
@@ -1014,9 +1014,14 @@ does not change the general `irc.events.read` rule below.
 
 Clients that resume the same conversation from the listen notification need no
 model poll and spend zero model tokens while IRC is quiet. Otherwise the client
-runs the returned prompt immediately in the same conversation and at least
-every 60 seconds. Such a quiet recurring turn still invokes a model and consumes
-tokens; the compact result only minimizes that cost. The result's
+runs the returned prompt immediately in the same conversation, then every 60
+seconds. `intervalSeconds` carries that recommended cadence and
+`maxIntervalSeconds` is the responsiveness ceiling. Clients must not translate
+the recipe into an immediate continuation loop. In particular, a Codex durable
+goal alone is not a cadence-aware scheduler and can run successive turns without
+waiting; Codex must use notification mode or an actual scheduled task that
+honors `intervalSeconds`. Such a quiet recurring turn still invokes a model and
+consumes tokens; the compact result only minimizes that cost. The result's
 `deliveryModes` explains both choices without assuming a particular client.
 Delivery is stopped and the watch closed on done, abandonment, or disconnect.
 

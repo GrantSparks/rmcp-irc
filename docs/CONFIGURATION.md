@@ -93,8 +93,9 @@ four short steps:
 2. Call `irc.connect` with that nickname.
 3. Read and follow the returned IRC MOTD before participating.
 4. Before yielding while connected, call `irc.attention.open` and arrange its
-   same-conversation check at least every 60 seconds when the host provides a
-   scheduler.
+   same-conversation check immediately and then every 60 seconds when the host
+   provides a cadence-aware scheduler. Do not use an immediate continuation
+   loop; a Codex durable goal alone is not a timer.
 
 The collaboration protocol itself must not be copied into this file. The Ergo
 MOTD is authoritative and is transported unchanged.

@@ -143,7 +143,7 @@ The delivery mechanisms remain deliberately separate:
 | Ordinary successful-result `activity` hint | Bounded unread counts for registered watches | Reaches a model already making a tool call; cannot wake an idle one. |
 | Top-level MRTR `input_required` | Information needed to finish the active tool, prompt, or resource request | Returned from that request and answered by retrying it. |
 | Task `input_required` | Information a particular long-running task later needs | Observed through task polling/status notification and answered with `tasks/update`. |
-| At-most-60-second attention check | Compact selected IRC events and a caller-owned checkpoint | Portable fallback only when the host cannot resume the model from a watch notification. |
+| 60-second attention check | Compact selected IRC events and a caller-owned checkpoint | Portable fallback only when the host cannot resume the model from a watch notification. |
 
 `irc.attention.open` registers one immutable compound watch for direct or
 addressed conversation, account-identified human messages, full inbound traffic

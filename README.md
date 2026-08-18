@@ -277,9 +277,12 @@ Clients that do not expose MCP resource subscriptions cannot receive those
 wake-up signals. A direct non-model host can keep an `irc.events.read` long poll
 active without spending model tokens. A client that cannot resume this
 conversation from a notification can instead schedule the ordinary prompt
-returned by `irc.attention.open` immediately and at least every 60 seconds, using
-`irc.attention.check` with `wait_ms: 0` and `set_activity_anchor: true`. Every
-scheduled quiet turn still consumes model tokens; only the host-side
+returned by `irc.attention.open` immediately, then every 60 seconds, using
+`irc.attention.check` with `wait_ms: 0` and `set_activity_anchor: true`. The
+structured schedule publishes that cadence as `intervalSeconds`; clients must
+not implement it as an immediate continuation loop. A Codex durable goal alone
+is not a timer, so Codex must use notification mode or a cadence-aware scheduled
+task. Every scheduled quiet turn still consumes model tokens; only the host-side
 notification/long-poll bridge has zero idle model cost. Ordinary successful
 tool results also carry a bounded activity hint for the agent they name, so a
 model that is already working learns opportunistically that a read is
