@@ -9,6 +9,18 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ## [0.4.0] - 2026-08-18
 
+### Added
+
+- A host-owned `irc.exit` tool lets a responder session end itself when an
+  authenticated human asks it to. It succeeds only when the current attention
+  page carries an inbound event with a non-null server-asserted `source_account`,
+  then latches a post-turn graceful shutdown that closes the attention watch,
+  disconnects IRC, and saves state before the process exits. The developer
+  instructions now tell Codex to call it on an explicit exit request, since
+  merely disconnecting or saying goodbye does not end the session. The
+  tool-registry version is bumped so an existing thread retires once to expose
+  the new tool and instructions.
+
 ### Changed
 
 - The responder's developer instructions no longer gate commits and pushes
@@ -58,6 +70,9 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Fixed
 
+- The responder can now save its profile state on Windows. The atomic write
+  fsynced its directory by opening it as a file — which fails on Windows with
+  "access denied" — so that durability step is now Unix-only.
 - Spaceless final fields are no longer dropped from typed projections and
   state. A leading colon is required only to protect a final field containing
   spaces, so Ergo omits it for a one-word field, which then arrives as a bare

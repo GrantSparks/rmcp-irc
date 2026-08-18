@@ -1307,14 +1307,17 @@ done
 
     #[test]
     fn turn_sandbox_policy_is_scoped_workspace_write_with_network() {
-        let policy = turn_sandbox_policy(Path::new("/workspace/project"));
+        let workspace = Path::new("/workspace/project");
+        let policy = turn_sandbox_policy(workspace);
         assert_eq!(policy["type"], "workspaceWrite");
         assert_eq!(policy["networkAccess"], true);
         let roots = policy["writableRoots"].as_array().expect("writable roots");
-        assert!(roots.iter().any(|root| root == "/workspace/project"));
+        assert!(roots.iter().any(|root| root == &json!(workspace)));
         // The workspace .git must be named explicitly or commits fail: Codex
-        // keeps it read-only under workspace-write.
-        assert!(roots.iter().any(|root| root == "/workspace/project/.git"));
+        // keeps it read-only under workspace-write. Build the expected root the
+        // same way the policy does so the separator matches on every platform.
+        let git_root = json!(workspace.join(".git"));
+        assert!(roots.iter().any(|root| root == &git_root));
         // The wall the responder relies on: not full access, so its
         // out-of-workspace state directory is never a writable root.
         assert_ne!(policy["type"], "dangerFullAccess");

@@ -232,6 +232,11 @@ impl StateStore {
                 self.state_path.display()
             )
         })?;
+        // fsync the directory so the rename itself is durable. Only Unix can
+        // open a directory as a file for this; on Windows `File::open` on a
+        // directory fails with "Access is denied", and directory-entry
+        // durability is the filesystem's responsibility there, so skip it.
+        #[cfg(unix)]
         File::open(&self.directory)
             .and_then(|directory| directory.sync_all())
             .with_context(|| format!("sync {}", self.directory.display()))?;
