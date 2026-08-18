@@ -498,7 +498,9 @@ pub fn project(message: &WireMessage, isupport: &IsupportRegistry) -> SemanticPr
         "TOPIC" => SemanticEvent::ChannelState {
             source,
             channel: as_channel(target),
-            topic: text,
+            // A spaceless topic arrives as params[1] with no colon, not as the
+            // trailing `text`.
+            topic: message.final_field(1),
             modes: None,
         },
         "MODE" => SemanticEvent::ChannelState {

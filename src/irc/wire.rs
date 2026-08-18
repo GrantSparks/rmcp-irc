@@ -239,6 +239,25 @@ impl WireMessage {
             .find(|tag| tag.key == key)
             .and_then(|tag| tag.value.as_deref())
     }
+
+    /// The final field of a message, whether it arrived as the trailing
+    /// parameter or — because it has no spaces — as a bare final middle
+    /// parameter.
+    ///
+    /// A leading colon is required only to protect a final field that contains
+    /// spaces, so a server may omit it for a spaceless field, which then parses
+    /// as an ordinary middle parameter instead of `trailing`. Ergo does exactly
+    /// this for, among others, a one-word real name (311), a single-word topic
+    /// (332 and the TOPIC echo), a lone WHOIS channel (319), and a single NAMES
+    /// entry (353). Reading only `trailing` drops such a field. `index` is where
+    /// the field sits as a middle parameter — the position right after the
+    /// message's fixed leading parameters — so a genuinely absent field still
+    /// yields `None` rather than a structural parameter.
+    pub fn final_field(&self, index: usize) -> Option<String> {
+        self.trailing
+            .clone()
+            .or_else(|| self.params.get(index).cloned())
+    }
 }
 
 /// Split one space-delimited component, returning it and the remainder.
@@ -623,6 +642,25 @@ mod tests {
         assert_eq!(message.tags[0].value.as_deref(), Some("a b"));
         assert_eq!(message.tags[0].raw_value.as_deref(), Some(r"a\sb"));
         assert_eq!(message.tags[1].value, None);
+    }
+
+    #[test]
+    fn final_field_reads_trailing_then_the_bare_middle_parameter() {
+        // A space-bearing final field arrives colon-prefixed as `trailing`.
+        let with_colon =
+            WireMessage::parse(Bytes::from_static(b":irc 332 me #room :a spaced topic"))
+                .expect("parse");
+        assert_eq!(with_colon.final_field(2).as_deref(), Some("a spaced topic"));
+
+        // A spaceless final field may arrive as a bare middle parameter.
+        let bare =
+            WireMessage::parse(Bytes::from_static(b":irc 332 me #room OneWord")).expect("parse");
+        assert_eq!(bare.trailing, None);
+        assert_eq!(bare.final_field(2).as_deref(), Some("OneWord"));
+
+        // A genuinely absent field yields None rather than a structural param.
+        let absent = WireMessage::parse(Bytes::from_static(b":irc 331 me #room")).expect("parse");
+        assert_eq!(absent.final_field(2), None);
     }
 
     #[test]

@@ -4226,21 +4226,15 @@ fn whois_profile(result: &CommandResult) -> WhoisProfile {
         match reply.command.parse::<u16>().ok() {
             Some(301) => {
                 profile.nickname = reply.params.get(1).cloned().or(profile.nickname);
-                profile.away_message = reply.trailing.clone();
+                profile.away_message = reply.final_field(2);
             }
             Some(311) => {
                 profile.nickname = reply.params.get(1).cloned();
                 profile.username = reply.params.get(2).cloned();
                 profile.hostname = reply.params.get(3).cloned();
-                // RPL_WHOISUSER puts the real name after the `*` marker. Most
-                // servers send it colon-prefixed, so it arrives as `trailing`;
-                // but a spaceless real name may be sent as a bare final middle
-                // parameter (params[5], following the `*` at params[4]). Fall
-                // back to that so the projection is not null in that case.
-                profile.real_name = reply
-                    .trailing
-                    .clone()
-                    .or_else(|| reply.params.get(5).cloned());
+                // RPL_WHOISUSER puts the real name after the `*` marker at
+                // params[4]; a spaceless real name arrives bare at params[5].
+                profile.real_name = reply.final_field(5);
             }
             Some(312) => {
                 profile.nickname = reply.params.get(1).cloned().or(profile.nickname);
@@ -4254,7 +4248,7 @@ fn whois_profile(result: &CommandResult) -> WhoisProfile {
             Some(319) => {
                 profile.channels.extend(
                     reply
-                        .trailing
+                        .final_field(2)
                         .as_deref()
                         .unwrap_or_default()
                         .split_whitespace()
@@ -4287,7 +4281,7 @@ fn names_channels(result: &CommandResult) -> Vec<NamesChannel> {
             });
         entry.names.extend(
             reply
-                .trailing
+                .final_field(3)
                 .as_deref()
                 .unwrap_or_default()
                 .split_whitespace()
@@ -4306,7 +4300,7 @@ fn list_channels(result: &CommandResult) -> Vec<ChannelListEntry> {
             Some(ChannelListEntry {
                 channel: reply.params.get(1)?.clone(),
                 visible_users: reply.params.get(2).and_then(|value| value.parse().ok()),
-                topic: reply.trailing.clone(),
+                topic: reply.final_field(3),
             })
         })
         .collect()
@@ -4338,7 +4332,10 @@ fn help_lines(result: &CommandResult) -> Vec<HelpLine> {
         .map(|reply| HelpLine {
             command: reply.command.clone(),
             subject: reply.params.get(1).cloned(),
-            text: reply.trailing.clone(),
+            // RPL_HELP* carry the body after the subject at params[2]; a
+            // spaceless one-line body arrives there bare. FAIL keeps its
+            // space-bearing description in `trailing`, which wins.
+            text: reply.final_field(2),
         })
         .collect()
 }
@@ -4350,14 +4347,16 @@ fn topic_reply(result: &CommandResult) -> (Option<String>, Option<String>, Optio
     for reply in &result.replies {
         match reply.command.as_str() {
             "331" => topic = None,
-            "332" => topic = reply.trailing.clone(),
+            "332" => topic = reply.final_field(2),
             // A mutation is answered by the server's echo of the TOPIC line
             // rather than by RPL_TOPICWHOTIME, and the echo says who and when
             // just as plainly: the setter is its prefix and the instant is its
             // `time` tag. Reading only 333 left a caller that had just set a
             // topic unable to learn the metadata for the change it made.
             "TOPIC" => {
-                topic = reply.trailing.clone();
+                // The echo's params are [channel, topic]; a spaceless topic
+                // arrives bare at params[1] rather than as `trailing`.
+                topic = reply.final_field(1);
                 set_by = reply
                     .prefix
                     .as_ref()
@@ -5532,6 +5531,38 @@ mod tests {
                 Some(1_700_000_001)
             )
         );
+    }
+
+    #[test]
+    fn spaceless_final_fields_are_recovered_from_bare_middle_parameters() {
+        // Ergo drops the leading colon on a spaceless final field, so it parses
+        // as a middle parameter. Every projection that reads such a field must
+        // still recover it instead of reporting null or empty.
+
+        // RPL_TOPIC (332) and the TOPIC echo: a one-word topic.
+        let topic_get = command_result_with(&[b":irc.example 332 Me #room OneWordTopic"]);
+        assert_eq!(topic_reply(&topic_get).0.as_deref(), Some("OneWordTopic"));
+        let topic_echo = command_result_with(&[b":Setter!u@h TOPIC #room OneWordTopic"]);
+        assert_eq!(topic_reply(&topic_echo).0.as_deref(), Some("OneWordTopic"));
+
+        // RPL_LIST (322): a one-word channel topic.
+        let list = command_result_with(&[b":irc.example 322 Me #room 3 SoloTopic"]);
+        assert_eq!(list_channels(&list)[0].topic.as_deref(), Some("SoloTopic"));
+
+        // RPL_NAMREPLY (353): a lone member.
+        let names = command_result_with(&[
+            b":irc.example 353 Me = #room @Solo",
+            b":irc.example 366 Me #room :End of NAMES",
+        ]);
+        assert_eq!(names_channels(&names)[0].names, ["@Solo"]);
+
+        // RPL_WHOISCHANNELS (319): a single channel.
+        let whois = command_result_with(&[b":irc.example 319 Me Nick #only"]);
+        assert_eq!(whois_profile(&whois).channels, ["#only"]);
+
+        // RPL_HELPTXT (705): a one-word body.
+        let help = command_result_with(&[b":irc.example 705 Me index terse"]);
+        assert_eq!(help_lines(&help)[0].text.as_deref(), Some("terse"));
     }
 
     #[test]

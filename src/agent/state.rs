@@ -402,7 +402,8 @@ impl AgentState {
             }
             Some(332) => {
                 if let Some(channel) = message.params.get(1) {
-                    self.channel_mut(channel, mapping).topic = message.trailing.clone();
+                    // A spaceless topic arrives at params[2] without a colon.
+                    self.channel_mut(channel, mapping).topic = message.final_field(2);
                 }
             }
             Some(333) => {
@@ -690,5 +691,35 @@ mod tests {
         // The raw mode string and its argument must never leak in as keys.
         assert!(!modes.contains_key("+o"));
         assert!(!modes.contains_key("Kuebiko"));
+    }
+
+    #[test]
+    fn a_spaceless_topic_survives_both_the_numeric_and_the_live_change() {
+        let isupport = IsupportRegistry::new();
+        let mut state = AgentState::new(AgentId::new(), Timestamp::now());
+
+        // RPL_TOPIC (332) with a colon-less one-word topic.
+        state.reduce_wire(&wire(":s 332 me #Room OneWordTopic"), &isupport);
+        assert_eq!(
+            state.channels["#room"].topic.as_deref(),
+            Some("OneWordTopic")
+        );
+
+        // A live TOPIC change to another spaceless topic, via the semantic path.
+        let change = wire(":Setter!u@h TOPIC #Room AnotherOneWord");
+        let projection = crate::irc::semantic::project(&change, &isupport);
+        state.reduce(
+            &projection,
+            EventCursor {
+                stream_id: "stream".into(),
+                sequence: 2,
+            },
+            isupport.case_mapping(),
+            Timestamp::now(),
+        );
+        assert_eq!(
+            state.channels["#room"].topic.as_deref(),
+            Some("AnotherOneWord")
+        );
     }
 }
