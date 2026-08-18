@@ -129,6 +129,17 @@ breaking changes to the CLI, configuration, or MCP surface.
   from, which surfaced as `source: ""` and summaries opening with a stray space
   (`" set the topic to: ..."`). `source` is now absent and those summaries read
   as `topic set to: ...`.
+- `irc.topic.set` reports who set the topic and when. A mutation is answered by
+  the server's echo of the `TOPIC` line rather than by `RPL_TOPICWHOTIME`, and
+  only the latter was read, so an agent that had just set a topic was told
+  `set_by`/`set_at` were unknown by the very reply naming both. The echo's
+  prefix and `time` tag now fill them, and a `333` still outranks an echo when
+  both arrive.
+- `irc.status` with `result_detail: compact` no longer repeats the whole MOTD
+  body on every call. Status is polled, and re-serving several kilobytes of
+  unchanged text was the most expensive part of asking a simple question.
+  Compact status keeps the MOTD's status, source, and receipt time; `irc.connect`
+  still returns the text, and the linked MOTD resource remains complete.
 - A rejected IRC command names the reply that refused it in its summary text.
   The numerics always travelled in the structured failure, but the one-line
   summary — the part some clients show alone — said only `NICK: Rejected.`,

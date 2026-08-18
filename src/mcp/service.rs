@@ -73,6 +73,7 @@ use crate::{
             WatchTarget, WatchUri, watch_events_uri,
         },
     },
+    time::Timestamp,
 };
 
 /// Resource templates this server exposes. Declared once so the template
@@ -722,7 +723,7 @@ impl IrcMcpService {
                     caller: Some(caller_profile(&RequestProfile::from_context(&context))),
                 };
                 let mut output = output;
-                output.state.motd = motd_for_tool_result(output.state.motd, output.result_detail);
+                output.state.motd = motd_for_status(output.state.motd, output.result_detail);
                 let content = agent_resource_links(&output.resources);
                 tool_success_with_content(
                     format!(
@@ -4298,7 +4299,27 @@ fn topic_reply(result: &CommandResult) -> (Option<String>, Option<String>, Optio
     for reply in &result.replies {
         match reply.command.as_str() {
             "331" => topic = None,
-            "332" | "TOPIC" => topic = reply.trailing.clone(),
+            "332" => topic = reply.trailing.clone(),
+            // A mutation is answered by the server's echo of the TOPIC line
+            // rather than by RPL_TOPICWHOTIME, and the echo says who and when
+            // just as plainly: the setter is its prefix and the instant is its
+            // `time` tag. Reading only 333 left a caller that had just set a
+            // topic unable to learn the metadata for the change it made.
+            "TOPIC" => {
+                topic = reply.trailing.clone();
+                set_by = reply
+                    .prefix
+                    .as_ref()
+                    .map(|prefix| prefix.raw.clone())
+                    .or(set_by);
+                set_at = reply
+                    .tag_value("time")
+                    .and_then(|value| value.parse::<Timestamp>().ok())
+                    .map(|time| time.as_datetime().timestamp())
+                    .and_then(|seconds| u64::try_from(seconds).ok())
+                    .or(set_at);
+            }
+            // RPL_TOPICWHOTIME is the server's own record and outranks an echo.
             "333" => {
                 set_by = reply.params.get(2).cloned();
                 set_at = reply.params.get(3).and_then(|value| value.parse().ok());
@@ -4697,6 +4718,26 @@ fn motd_for_tool_result(
     if detail == ToolResultDetail::Compact {
         motd.lines.clear();
         motd.wire_replies.clear();
+    }
+    motd
+}
+
+/// Drop the MOTD body from a status snapshot, keeping the fact of it.
+///
+/// `irc.connect` returns the text because the agent has to read it once and has
+/// nowhere else to read it from yet. `irc.status` is different: it is polled,
+/// and re-serving several kilobytes of unchanged text on every poll is the
+/// single most expensive thing about asking a simple question. What a caller
+/// actually needs from status is whether a MOTD arrived, when, and from which
+/// source; the text is one resource read away and is linked from the same
+/// result.
+fn motd_for_status(
+    mut motd: crate::agent::state::MotdState,
+    detail: ToolResultDetail,
+) -> crate::agent::state::MotdState {
+    motd = motd_for_tool_result(motd, detail);
+    if detail == ToolResultDetail::Compact {
+        motd.text = String::new();
     }
     motd
 }
@@ -5423,6 +5464,69 @@ mod tests {
         ]);
         assert_eq!(
             topic_reply(&topic),
+            (
+                Some("Coordinate here".into()),
+                Some("grant".into()),
+                Some(1_700_000_001)
+            )
+        );
+    }
+
+    #[test]
+    fn a_compact_status_reports_the_motd_without_reciting_it() {
+        let motd = crate::agent::state::MotdState {
+            status: crate::agent::state::MotdStatus::Received,
+            lines: vec!["line one".into(), "line two".into()],
+            text: "line one\nline two".into(),
+            wire_replies: Vec::new(),
+            source: None,
+            received_at: Some(Timestamp::now()),
+        };
+
+        // Polled callers get the fact of the MOTD and its timing; the body is
+        // one resource read away and does not belong in every status result.
+        let compact = motd_for_status(motd.clone(), ToolResultDetail::Compact);
+        assert!(compact.text.is_empty());
+        assert!(compact.lines.is_empty());
+        assert_eq!(compact.status, crate::agent::state::MotdStatus::Received);
+        assert!(compact.received_at.is_some());
+
+        // `full` is unchanged, and connect keeps serving the text either way
+        // because an agent has nowhere else to read it from yet.
+        assert_eq!(
+            motd_for_status(motd.clone(), ToolResultDetail::Full).text,
+            motd.text
+        );
+        assert_eq!(
+            motd_for_tool_result(motd.clone(), ToolResultDetail::Compact).text,
+            motd.text
+        );
+    }
+
+    #[test]
+    fn a_topic_mutation_learns_its_setter_from_the_echo_it_gets_back() {
+        // A mutation is answered by the echo, not by RPL_TOPICWHOTIME, so an
+        // agent that had just set a topic used to be told set_by/set_at were
+        // unknown -- by the very reply naming both.
+        let echo = command_result_with(&[
+            b"@time=2026-08-18T00:36:15.543Z :Vohumanah!~agent@127.0.0.1 TOPIC #control :Coordinate here",
+        ]);
+        assert_eq!(
+            topic_reply(&echo),
+            (
+                Some("Coordinate here".into()),
+                Some("Vohumanah!~agent@127.0.0.1".into()),
+                Some(1_787_013_375)
+            )
+        );
+
+        // The server's own record still outranks an echo when both arrive.
+        let both = command_result_with(&[
+            b"@time=2026-08-18T00:36:15.543Z :Vohumanah!~agent@127.0.0.1 TOPIC #control :Coordinate here",
+            b":irc.example 333 Me #control grant 1700000001",
+        ]);
+        assert_eq!(
+            topic_reply(&both),
             (
                 Some("Coordinate here".into()),
                 Some("grant".into()),

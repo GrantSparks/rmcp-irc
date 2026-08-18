@@ -161,9 +161,10 @@ pub struct ConnectOutput {
 pub struct AgentInput {
     /// Opaque handle returned by `irc.connect`.
     pub agent_id: AgentId,
-    /// Result detail: `compact` (default) keeps one MOTD text representation
-    /// in state but omits duplicate lines and raw numerics; `full` returns the
-    /// legacy state inline. The linked MOTD resource is always complete.
+    /// Result detail: `compact` (default) reports that a MOTD arrived, when,
+    /// and from which source, without repeating its body on a call meant to be
+    /// polled; `full` returns the legacy state inline, body and raw numerics
+    /// included. The linked MOTD resource is always complete either way.
     #[serde(default)]
     pub result_detail: ToolResultDetail,
 }
