@@ -56,10 +56,16 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Fixed
 
-- `irc.whois` no longer projects `real_name` as null when the server sends a
-  spaceless real name as a bare final parameter of RPL_WHOISUSER (311) with no
-  colon prefix. The projection read only the trailing parameter; it now falls
-  back to the parameter following the `*` marker.
+- Spaceless final fields are no longer dropped from typed projections and
+  state. A leading colon is required only to protect a final field containing
+  spaces, so Ergo omits it for a one-word field, which then arrives as a bare
+  middle parameter rather than the trailing parameter. Every projection that
+  read only the trailing parameter lost such a field — `irc.whois` `real_name`
+  came back null, and a one-word channel topic made `irc.topic.get` return a
+  null topic. A shared `WireMessage::final_field` accessor now recovers the
+  field for WHOIS real name/away/channels, TOPIC (query and echo), LIST topics,
+  NAMES entries, and HELP text, and for the channel topic tracked in
+  `irc.status` and the event stream.
 - Inbound DCC CHAT lines now wake a model through `irc.attention`. Every DCC
   event was journaled with direction `internal`, but the attention filter only
   admits message classes whose direction is `inbound`, so an established chat's
