@@ -28,6 +28,13 @@ breaking changes to the CLI, configuration, or MCP surface.
   volta, `~/.local/bin`) in login-shell profiles — which also supply the
   `node` an npm-installed Codex shim needs. `--codex-command` remains the
   explicit escape hatch.
+
+### Fixed
+
+- `thread/start`/`thread/resume` now send the thread-level sandbox as the
+  kebab-case mode string `workspace-write` that Codex CLI 0.147.0 requires.
+  The camelCase spelling App Server echoes in its own responses is rejected
+  in requests, and the scripted test server now rejects it the same way.
 - The network coordination MOTD is now owned and packaged by rmcp-irc as part
   of the IRC protocol contract. Attention onboarding distinguishes verified
   notification-backed, adapter-backed, and foreground-only operation. Returned

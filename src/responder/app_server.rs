@@ -407,10 +407,13 @@ impl AppServer {
     }
 
     fn thread_settings(&self) -> Value {
+        // Unlike turn/start's sandboxPolicy object, the thread-level sandbox
+        // is a kebab-case mode string; the camelCase spelling that App Server
+        // itself echoes in responses is rejected in requests.
         let mut settings = json!({
             "cwd": self.config.cwd,
             "approvalPolicy": "never",
-            "sandbox": "workspaceWrite",
+            "sandbox": "workspace-write",
             "developerInstructions": DEVELOPER_INSTRUCTIONS
         });
         if let Some(model) = &self.config.model {
@@ -1014,11 +1017,15 @@ while IFS= read -r line; do
     *'"method":"initialized"'*) ;;
     *'"method":"account/read"'*)
       printf '%s\n' '{"id":2,"result":{"requiresOpenaiAuth":true,"account":{"type":"chatgpt"}}}' ;;
-    *'"method":"thread/start"'*'"dynamicTools"'*)
+    *'"method":"thread/start"'*'"sandbox":"workspaceWrite"'*)
+      printf '%s\n' '{"id":3,"error":{"code":-32600,"message":"Invalid request: unknown variant `workspaceWrite`, expected one of `read-only`, `workspace-write`, `danger-full-access`"}}' ;;
+    *'"method":"thread/resume"'*'"sandbox":"workspaceWrite"'*)
+      printf '%s\n' '{"id":4,"error":{"code":-32600,"message":"Invalid request: unknown variant `workspaceWrite`, expected one of `read-only`, `workspace-write`, `danger-full-access`"}}' ;;
+    *'"method":"thread/start"'*'"dynamicTools"'*'"sandbox":"workspace-write"'*)
       printf '%s\n' '{"id":3,"result":{"thread":{"id":"thr_responder"}}}' ;;
     *'"method":"thread/resume"'*'"dynamicTools"'*)
       printf '%s\n' '{"id":4,"error":{"code":-32602,"message":"dynamicTools is not a thread/resume parameter"}}' ;;
-    *'"method":"thread/resume"'*)
+    *'"method":"thread/resume"'*'"sandbox":"workspace-write"'*)
       printf '%s\n' '{"id":4,"result":{"thread":{"id":"thr_responder"}}}' ;;
     *'"method":"turn/start"'*'"networkAccess":false'*)
       printf '%s\n' '{"id":5,"result":{"turn":{"id":"turn_1","status":"inProgress"}}}'
