@@ -977,6 +977,8 @@ watches.
 
 The result contains the watch descriptor, caller-owned `initial_cursor`, a
 subscription-filter addition, and a client-neutral recurring-check recipe. The
+recipes are portable guidance, not custom commands a generic MCP host is
+required to interpret. The
 client maintains one consolidated `subscriptions/listen` stream for everything
 it needs. This is a host-issued MCP request, not a model-callable tool; it never
 appears in `tools/list`, and that absence carries no capability information. The
@@ -1009,7 +1011,11 @@ does contain `delivery`, sampled from the server's registry of live accepted
 listen filters for the authenticated owner. `mode: notification` proves a live
 stream covers the watch's model-resume URI. `mode: polling` means the fallback
 must continue; it may simply have raced stream activation and does not prove
-the client lacks support.
+the client lacks notification support. Host facilities do not become
+model-callable tools, so tool inventory cannot establish capability. An
+external adapter may own and resume a model conversation through a documented
+API; without verified notification or adapter delivery the client must close
+the watch and disconnect before yielding.
 
 The returned `resume_cursor` is attention-specific. When another selected page
 remains it is the last delivered match; when the immutable selection is fully

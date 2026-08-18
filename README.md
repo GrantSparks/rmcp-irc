@@ -187,6 +187,11 @@ not a callable tool, so it will not appear in `tools/list`. Run the immediate
 `irc.attention.check`: its `delivery` block reports whether the server actually
 observes a live accepted stream covering the watch URI. Keep recurring checks
 while it reports `polling`; cancel them only after it reports `notification`.
+The subscription and schedule are portable recipes, not custom commands a
+generic MCP host must interpret. A host may provide standard notification
+delivery; an external adapter may own and resume a model conversation through a
+documented API. Without verified notification or adapter delivery, the client
+is foreground-only and must close its watch and disconnect before yielding.
 
 ### Streamable HTTP
 
@@ -291,8 +296,8 @@ notification/long-poll bridge has zero idle model cost. `irc.attention.check`
 includes server-observed delivery state. `notification` proves a live accepted
 stream covers the model-resume URI and recurring checks can stop. `polling`
 means they continue; it can be a race with host activation and is not proof the
-client lacks support. The protocol method never appears as a callable tool, so
-tool inventory is not capability evidence. Ordinary successful
+client lacks notification support. The protocol method never appears as a
+callable model tool, so tool inventory is not capability evidence. Ordinary successful
 tool results also carry a bounded activity hint for the agent they name, so a
 model that is already working learns opportunistically that a read is
 worthwhile; `irc.attention.check` omits the redundant hint to keep its recurring

@@ -44,8 +44,11 @@ an immediate continuation loop; in Codex, a durable goal alone is not a timer. s
 is a host-issued MCP protocol request, never a callable tool, so its absence from tools/list says \
 nothing about client support. The immediate attention check reports server-observed delivery truth: \
 cancel recurring checks only after it confirms notification mode; a polling result may be an \
-activation race, so keep checking. Claim best-effort only after explicit client failure and no \
-cadence-aware scheduler. Stop delivery, close the watch, and disconnect when the task is done or abandoned.";
+activation race, so keep checking. The returned recipes are portable guidance, not commands the MCP \
+host is required to interpret. An external adapter may use a documented host API to resume this \
+conversation on the recurring cadence. If neither notification delivery nor an adapter is verified, \
+remain foreground-only: before yielding, close the watch and disconnect rather than claim standby. \
+Stop delivery, close the watch, and disconnect when the task is done or abandoned.";
 
 /// Input accepted by `irc.attention.open`.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -76,6 +79,7 @@ impl AttentionOpenInput {
 
 /// Client-neutral recipe for recurring attention checks.
 #[derive(Clone, Debug, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AttentionSchedule {
     /// Recommended delay between recurring checks after the immediate first
     /// check. This makes the cadence explicit for clients whose generic goal
@@ -146,7 +150,8 @@ impl AttentionSchedule {
                 "subscriptions/listen is a host-issued MCP request, not a tool; absence from tools/list is not evidence of missing support",
                 "Cancel recurring checks only after attention.check reports delivery.mode notification; polling may be an activation race",
                 "Codex: a durable goal alone is not a timer; use notification mode or a cadence-aware scheduled task that honors intervalSeconds",
-                "If neither mode is available, disclose that responsiveness is best-effort",
+                "The schedule is an adapter recipe, not a required MCP host command",
+                "Without verified notification or adapter delivery, disconnect before yielding and report foreground-only availability",
             ],
             cancel_when: vec!["task_done", "task_abandoned", "agent_disconnected"],
         }
@@ -664,15 +669,22 @@ mod tests {
                 .iter()
                 .any(|mode| mode.contains("Codex"))
         );
+        let json = serde_json::to_value(&schedule).expect("serialize attention schedule");
+        assert_eq!(json["intervalSeconds"], 60);
+        assert_eq!(json["maxIntervalSeconds"], 60);
+        assert_eq!(json["sameConversation"], true);
+        assert!(json.get("interval_seconds").is_none());
     }
 
     #[test]
     fn onboarding_rejects_an_immediate_codex_continuation_loop() {
         assert!(ATTENTION_ONBOARDING.contains("every 60 seconds"));
         assert!(ATTENTION_ONBOARDING.contains("durable goal alone is not a timer"));
-        assert!(ATTENTION_ONBOARDING.contains("cadence-aware scheduler"));
+        assert!(ATTENTION_ONBOARDING.contains("durable goal alone is not a timer"));
         assert!(ATTENTION_ONBOARDING.contains("never a callable tool"));
         assert!(ATTENTION_ONBOARDING.contains("activation race"));
+        assert!(ATTENTION_ONBOARDING.contains("portable guidance"));
+        assert!(ATTENTION_ONBOARDING.contains("foreground-only"));
     }
 
     #[test]

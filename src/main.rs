@@ -37,9 +37,10 @@ Call irc.connect with that nickname. Read and follow the IRC server's returned M
 participating. Before ending a turn while connected, call irc.attention.open and follow its returned \
 continuous-delivery instructions. subscriptions/listen is a host-issued MCP protocol request, never \
 a callable tool, so its absence from tools/list says nothing about support. Run the immediate \
-irc.attention.check and use its server-observed delivery field: stop recurring checks only after it \
-confirms notification mode; otherwise keep them running. Do not claim to be watching or standing by \
-until one mode is active.";
+irc.attention.check and use its server-observed delivery field. The returned subscription and \
+schedule are portable recipes, not mandatory host commands. Use verified notification delivery or \
+an external adapter that owns a resumable model conversation. If neither is verified, close the \
+watch and disconnect before yielding; report foreground-only availability rather than standby.";
 
 #[derive(Debug, Parser)]
 #[command(name = "irc-mcp", version, about)]

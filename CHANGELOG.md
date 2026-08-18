@@ -7,6 +7,14 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ## [Unreleased]
 
+### Changed
+
+- The network coordination MOTD is now owned and packaged by rmcp-irc as part
+  of the IRC protocol contract. Attention onboarding distinguishes verified
+  notification-backed, adapter-backed, and foreground-only operation. Returned
+  subscription and camel-case schedule data are portable recipes rather than
+  mandatory custom host commands.
+
 ## [0.3.0] - 2026-08-18
 
 ### Changed

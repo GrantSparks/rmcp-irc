@@ -412,8 +412,10 @@ ordinary prompt returned by `irc.attention.open` immediately and then every
 and must not be described as token-free. Each check reports server-observed
 delivery coverage for the authenticated caller. Polling stops only after a
 positive notification observation; polling can be an activation race and is
-not a client-capability verdict. `subscriptions/listen` is issued by the host,
-never exposed as a callable tool. The check omits a redundant `activity`
+not a verdict on notification support. `subscriptions/listen` is a host
+facility, never exposed as a callable model tool. A documented external adapter
+may own and resume a model conversation; otherwise the client is
+foreground-only and disconnects before yielding. The check omits a redundant `activity`
 hint because its own result is the authoritative selected read. While a model is
 already running, bounded activity hints on other successful tool results provide
 an opportunistic signal without another round trip; they cannot start the turn

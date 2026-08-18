@@ -97,7 +97,11 @@ four short steps:
    until its server-observed `delivery.mode` confirms `notification`.
    `subscriptions/listen` is a host request, never a tool, so tool-list absence
    says nothing about support. Do not use an immediate continuation loop; a
-   Codex durable goal alone is not a timer.
+   Codex durable goal alone is not a timer. The returned subscription and
+   schedule are portable recipes rather than required host commands. Use a
+   verified standard notification stream or an external adapter that owns a
+   resumable model conversation. Otherwise close the watch and disconnect
+   before yielding, and describe the session as foreground-only.
 
 The collaboration protocol itself must not be copied into this file. The Ergo
 MOTD is authoritative and is transported unchanged.

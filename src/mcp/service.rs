@@ -518,7 +518,10 @@ impl IrcMcpService {
                      nothing. Run the returned prompt immediately and every 60 seconds while \
                      attention.check reports delivery.mode polling. Cancel recurring checks only \
                      after the server observes notification mode. Do not use an immediate \
-                     continuation loop; in Codex, a durable goal alone is not a timer.",
+                     continuation loop; in Codex, a durable goal alone is not a timer. The schedule \
+                     is an optional adapter recipe, not an MCP host command. Without verified \
+                     notification or adapter delivery, close the watch and disconnect before \
+                     yielding; report foreground-only availability rather than standby.",
                     created.watch.agent_id, created.watch.uri,
                 );
                 let link = ContentBlock::ResourceLink(watch_resource_entry(&created.watch));

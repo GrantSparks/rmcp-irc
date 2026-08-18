@@ -319,6 +319,11 @@ async fn a_complete_request_reaches_the_tool_surface() {
         attention_open["inputSchema"]["properties"]["full_traffic_targets"].is_object(),
         "the compound target policy is part of the strict 2026 tool schema: {attention_open}"
     );
+    let attention_defs = &attention_open["outputSchema"]["$defs"];
+    assert!(
+        attention_defs["AttentionSchedule"]["properties"]["intervalSeconds"].is_object(),
+        "the documented camel-case cadence is part of the published output schema: {attention_open}"
+    );
     let attention_check = tools
         .iter()
         .find(|tool| tool["name"] == "irc.attention.check")
