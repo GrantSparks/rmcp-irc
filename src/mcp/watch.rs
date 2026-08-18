@@ -1003,6 +1003,39 @@ mod tests {
         assert!(filter.cursor_query(mapping).selects(&by_another));
     }
 
+    #[test]
+    fn an_inbound_dcc_chat_line_wakes_a_chatting_agent_but_its_own_does_not() {
+        let mapping = CaseMapping::default();
+        let filter = WatchFilter {
+            attention: Some(AttentionSelection::default()),
+            ..WatchFilter::default()
+        };
+        // `record_dcc_event` surfaces the peer's line as top-level `Inbound` and
+        // the agent's own line as `Outbound` + authored. Only then is the
+        // `DccChatMessage` arm of the attention filter reachable: an inbound peer
+        // line must wake a chatting agent, and its own line must not.
+        let inbound = dcc_chat(EventDirection::Inbound, false);
+        let own = dcc_chat(EventDirection::Outbound, true);
+        assert!(filter.matches(&inbound, mapping));
+        assert!(!filter.matches(&own, mapping));
+    }
+
+    /// A DCC chat line as `record_dcc_event` journals it: its top-level
+    /// direction and authored flag reflect the peer/agent that spoke.
+    fn dcc_chat(direction: EventDirection, authored_by_me: bool) -> IrcEvent {
+        let message = crate::agent::journal::DccChatMessage {
+            session_id: crate::dcc::session::DccSessionId::new(),
+            direction,
+            text: "peer line".into(),
+        };
+        IrcEvent {
+            direction,
+            semantic: Some(EventPayload::DccChatMessage(message)),
+            authored_by_me,
+            ..event(Some("Peer"), EventClass::DccChatMessage, false)
+        }
+    }
+
     /// One topic change the agent itself made, as the journal records it.
     fn channel_state(direction: EventDirection, source: &str) -> IrcEvent {
         let semantic = SemanticEvent::ChannelState {

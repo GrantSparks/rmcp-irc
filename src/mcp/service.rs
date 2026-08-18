@@ -4232,7 +4232,15 @@ fn whois_profile(result: &CommandResult) -> WhoisProfile {
                 profile.nickname = reply.params.get(1).cloned();
                 profile.username = reply.params.get(2).cloned();
                 profile.hostname = reply.params.get(3).cloned();
-                profile.real_name = reply.trailing.clone();
+                // RPL_WHOISUSER puts the real name after the `*` marker. Most
+                // servers send it colon-prefixed, so it arrives as `trailing`;
+                // but a spaceless real name may be sent as a bare final middle
+                // parameter (params[5], following the `*` at params[4]). Fall
+                // back to that so the projection is not null in that case.
+                profile.real_name = reply
+                    .trailing
+                    .clone()
+                    .or_else(|| reply.params.get(5).cloned());
             }
             Some(312) => {
                 profile.nickname = reply.params.get(1).cloned().or(profile.nickname);
@@ -5489,6 +5497,17 @@ mod tests {
         assert_eq!(profile.channels, ["@#control", "+#rust"]);
         assert_eq!(profile.account.as_deref(), Some("account"));
         assert!(profile.secure);
+
+        // A spaceless real name may arrive as a bare final parameter with no
+        // colon prefix (so `trailing` is None); it must still be projected.
+        let bare_real_name =
+            command_result_with(&[b":irc.example 311 Me Snotra user host * irc-codex-responder"]);
+        let bare_profile = whois_profile(&bare_real_name);
+        assert_eq!(bare_profile.nickname.as_deref(), Some("Snotra"));
+        assert_eq!(
+            bare_profile.real_name.as_deref(),
+            Some("irc-codex-responder")
+        );
 
         let names = command_result_with(&[
             b":irc.example 353 Me = #control :@grant Athena",

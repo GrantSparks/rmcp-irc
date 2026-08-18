@@ -218,12 +218,7 @@ impl AgentState {
             SemanticEvent::Presence { source, change } => {
                 self.reduce_presence(&source.name, change, case_mapping);
             }
-            SemanticEvent::ChannelState {
-                channel,
-                topic,
-                modes,
-                ..
-            } => {
+            SemanticEvent::ChannelState { channel, topic, .. } => {
                 // A MODE that applied to a user carries no channel and does
                 // not touch channel state.
                 let Some(channel) = channel else {
@@ -237,11 +232,12 @@ impl AgentState {
                 if let Some(topic) = topic {
                     state.topic = Some(topic.clone());
                 }
-                if let Some(modes) = modes {
-                    for mode in modes {
-                        state.modes.insert(mode.clone(), None);
-                    }
-                }
+                // Channel modes are owned by `reduce_wire`/`apply_modes`, which
+                // runs on the same message with ISUPPORT mode groups. The
+                // semantic `modes` field is the raw params (`["+o", "Kuebiko"]`
+                // for `MODE #chan +o Kuebiko`); inserting those verbatim here
+                // leaked mode strings and their arguments into the mode map as
+                // bogus keys alongside the correctly parsed entries.
             }
             _ => {}
         }
@@ -655,5 +651,44 @@ mod tests {
             Some("~mcp-agent-f372cdb8-")
         );
         assert_eq!(state.identity.hostname.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn a_live_channel_mode_change_leaves_no_raw_tokens_in_the_mode_map() {
+        let mut isupport = IsupportRegistry::new();
+        isupport.apply_tokens([
+            "CASEMAPPING=ascii",
+            "PREFIX=(ov)@+",
+            "CHANMODES=b,k,l,imnpstC",
+        ]);
+        let mut state = AgentState::new(AgentId::new(), Timestamp::now());
+
+        // Base modes exactly as the server reports them.
+        state.reduce_wire(&wire(":s 324 me #Room +Cnt"), &isupport);
+
+        // A live `+o Kuebiko`, reduced through both paths the actor drives on
+        // every inbound line: the semantic reducer and the wire reducer.
+        let mode = wire(":Op!u@h MODE #Room +o Kuebiko");
+        let projection = crate::irc::semantic::project(&mode, &isupport);
+        state.reduce(
+            &projection,
+            EventCursor {
+                stream_id: "stream".into(),
+                sequence: 1,
+            },
+            isupport.case_mapping(),
+            Timestamp::now(),
+        );
+        state.reduce_wire(&mode, &isupport);
+
+        let modes = &state.channels["#room"].modes;
+        // Only the ISUPPORT-aware `apply_modes` entries survive.
+        assert_eq!(modes["o"].as_deref(), Some("Kuebiko"));
+        assert!(modes.contains_key("C"));
+        assert!(modes.contains_key("n"));
+        assert!(modes.contains_key("t"));
+        // The raw mode string and its argument must never leak in as keys.
+        assert!(!modes.contains_key("+o"));
+        assert!(!modes.contains_key("Kuebiko"));
     }
 }

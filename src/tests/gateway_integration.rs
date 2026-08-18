@@ -488,20 +488,52 @@ async fn ordinary_dcc_chat_uses_a_real_direct_socket_and_emits_both_directions()
     assert_eq!(&outbound, b"outbound\n");
     peer.write_all(b"inbound\n").await.expect("peer write");
 
-    let page = gateway
-        .read_events(
-            &connected.agent_id,
-            Some(before),
-            100,
-            Duration::from_secs(2),
-            EventFilter {
-                class: Some(EventClass::DccChatMessage),
-                ..EventFilter::default()
-            },
-        )
-        .await
-        .expect("chat events");
-    assert!(!page.events.is_empty());
+    // A chat line carries a real direction relative to the gateway. Poll until
+    // both the agent's outbound line and the peer's inbound line are journaled:
+    // read_events returns as soon as the first matching event exists, so the
+    // inbound line may still be crossing the socket on the first page.
+    let (inbound_event, outbound_event) = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let page = gateway
+                .read_events(
+                    &connected.agent_id,
+                    Some(before.clone()),
+                    100,
+                    Duration::from_millis(200),
+                    EventFilter {
+                        class: Some(EventClass::DccChatMessage),
+                        ..EventFilter::default()
+                    },
+                )
+                .await
+                .expect("chat events");
+            let find = |text: &str| {
+                page.events
+                    .iter()
+                    .find(|event| {
+                        matches!(
+                            event.semantic.as_ref(),
+                            Some(crate::agent::journal::EventPayload::DccChatMessage(message))
+                                if message.text == text
+                        )
+                    })
+                    .cloned()
+            };
+            if let (Some(inbound), Some(outbound)) = (find("inbound"), find("outbound")) {
+                return (inbound, outbound);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both chat directions journaled");
+    // The peer's inbound line must surface a top-level `Inbound` direction so it
+    // can wake a chatting agent through the attention filter, and the agent's own
+    // outbound line must be `Outbound` and authored-by-me so it does not self-wake.
+    assert_eq!(inbound_event.direction, EventDirection::Inbound);
+    assert!(!inbound_event.authored_by_me);
+    assert_eq!(outbound_event.direction, EventDirection::Outbound);
+    assert!(outbound_event.authored_by_me);
     gateway
         .dcc_cancel(&connected.agent_id, session.id)
         .await

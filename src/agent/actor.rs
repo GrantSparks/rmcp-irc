@@ -3509,9 +3509,25 @@ impl AgentActor {
         target: Option<String>,
         semantic: EventPayload,
     ) {
+        // A direct chat line has a real direction relative to the gateway: it is
+        // received from or sent toward a DCC peer, exactly as `EventDirection`
+        // documents. Surface that instead of the gateway-internal default the
+        // lifecycle transitions (offer, connect, close, transfer progress) keep.
+        // This is what lets an inbound peer line qualify for model attention;
+        // without it the `DccChatMessage` arm of the attention filter sits behind
+        // an `Inbound`-only gate it can never satisfy, so a chatting agent is
+        // never woken by its peer. The agent's own outbound line is marked
+        // authored-by-me so it does not wake the agent with its own words.
+        let (direction, authored_by_me) = match &semantic {
+            EventPayload::DccChatMessage(message) => match message.direction {
+                EventDirection::Outbound => (EventDirection::Outbound, true),
+                _ => (EventDirection::Inbound, false),
+            },
+            _ => (EventDirection::Internal, false),
+        };
         let event = NewEvent {
             agent_id: self.id.clone(),
-            direction: EventDirection::Internal,
+            direction,
             class,
             origin: EventOrigin::Gateway,
             verbosity: EventVerbosity::Semantic,
@@ -3522,7 +3538,7 @@ impl AgentActor {
             semantic: Some(semantic),
             wire: None,
             mentions_me: false,
-            authored_by_me: false,
+            authored_by_me,
         };
         if self.journal.push(event).is_ok() {
             self.notify_journal_append();
