@@ -56,6 +56,23 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Fixed
 
+- `irc.whois` no longer projects `real_name` as null when the server sends a
+  spaceless real name as a bare final parameter of RPL_WHOISUSER (311) with no
+  colon prefix. The projection read only the trailing parameter; it now falls
+  back to the parameter following the `*` marker.
+- Inbound DCC CHAT lines now wake a model through `irc.attention`. Every DCC
+  event was journaled with direction `internal`, but the attention filter only
+  admits message classes whose direction is `inbound`, so an established chat's
+  incoming lines never qualified — the peer could type and an idle agent would
+  never be told. A chat line is now journaled with its real inbound/outbound
+  direction, and the agent's own outgoing line is marked authored-by-me so it
+  does not wake the agent with its own words.
+- `irc.status` and the state resource no longer report bogus channel-mode
+  entries. A live MODE change was reduced twice — once by the ISUPPORT-aware
+  wire reducer that owns channel modes, and again by the semantic reducer,
+  which inserted the raw MODE parameters verbatim, so `+o Kuebiko` left stray
+  `+o` and `Kuebiko` keys beside the correct `o` entry. The semantic reducer no
+  longer touches channel modes.
 - `thread/start`/`thread/resume` now send the thread-level sandbox as the
   kebab-case mode string `workspace-write` that Codex CLI 0.147.0 requires.
   The camelCase spelling App Server echoes in its own responses is rejected
