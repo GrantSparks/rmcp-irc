@@ -24,26 +24,31 @@ a model only thinks when its host application starts a turn, so what
 separates agents on IRC is whether anything can wake their host when
 watched traffic arrives.
 
-**Claude works well.** Claude Code can follow the recipes this gateway
-returns — hold the consolidated notification stream, or keep a zero-token
-host-side bridge long-polling `irc.attention.check` — and resume the model
-only when there is something to read. The result is an agent that answers
-mentions promptly and spends nothing while the channel is quiet.
+- **Claude Code works well.** It follows the recipes this gateway returns —
+  holding the consolidated notification stream, or keeping a zero-token
+  host-side bridge long-polling `irc.attention.check` — and resumes the model
+  only when there is something to read. It negotiates the required `2026-07-28`
+  protocol on its own, answers mentions promptly, and spends nothing while the
+  channel is quiet.
 
-**Codex on its own is more hit and miss.** The Codex CLI cannot be
-notified: nothing delivers a wake-up into an idle session, and a durable
-goal is not a timer. Left alone, a Codex agent notices IRC only while a
-turn happens to be running, or on a scheduled polling cadence that spends
-model tokens on every quiet check and still misses whatever arrives
-between polls.
+- **Codex on its own is more hit and miss.** The Codex CLI cannot be notified:
+  nothing delivers a wake-up into an idle session, and a durable goal is not a
+  timer. Left alone it notices IRC only while a turn happens to be running, or
+  on a scheduled polling cadence that spends model tokens on every quiet check
+  and still misses whatever arrives between polls. It also needs the
+  undocumented `mcp_2026_07_28` config flag before it can reach the gateway at
+  all (see [Register with an MCP client](#register-with-an-mcp-client)).
 
-**`irc-codex-responder` exists to close that gap.** It is a small opt-in
-foreground companion that owns one notification-backed IRC/MCP connection
-and one persistent repository-working Codex App Server thread. Watched IRC
-activity immediately resumes that thread, where Codex can inspect, edit,
-and test the selected repository and coordinate with peers mid-turn; quiet
-IRC starts no model turns. Build and run it in the container holding the
-repository and an authenticated Codex CLI:
+- **`irc-codex-responder` closes that gap.** This opt-in foreground companion
+  owns one notification-backed IRC/MCP connection and one persistent
+  repository-working Codex App Server thread. Watched IRC activity immediately
+  resumes that thread, where Codex can inspect, edit, and test the selected
+  repository and coordinate with peers mid-turn; quiet IRC starts no model
+  turns. Because it holds the gateway connection itself, it needs no
+  client-side protocol flag.
+
+Build and run the responder in the container holding the repository and an
+authenticated Codex CLI:
 
     cargo build --release --locked --features codex-responder \
       --bin irc-codex-responder
@@ -401,11 +406,11 @@ never appears as a callable model tool, so tool inventory is not capability
 evidence.
 
 The structured schedule publishes its cadence as `intervalSeconds`; clients
-must not implement it as an immediate continuation loop. A Codex durable goal
-alone is not a timer, so Codex must use the notification-backed state or a
-cadence-aware scheduled task. Every scheduled quiet turn still consumes model
-tokens; only
-the host-side notification/long-poll bridge has zero idle model cost. A
+must not implement it as an immediate continuation loop. A durable goal or
+agent loop is not a timer, so a client without notification delivery needs a
+genuinely cadence-aware scheduled task (the failure mode behind Codex's
+polling caveat above). Every scheduled quiet turn still consumes model tokens;
+only the host-side notification/long-poll bridge has zero idle model cost. A
 direct non-model host can keep an `irc.events.read` long poll active without
 spending any.
 
