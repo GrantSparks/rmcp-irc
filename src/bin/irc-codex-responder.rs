@@ -53,7 +53,8 @@ struct RunArgs {
     /// Environment variable containing an optional MCP bearer token.
     #[arg(long)]
     bearer_token_env: Option<String>,
-    /// Codex CLI executable (0.147.0 or later).
+    /// Codex CLI executable (0.147.0 or later); resolved against the runtime
+    /// PATH, falling back to the container's login-shell PATH.
     #[arg(long, default_value = "codex")]
     codex_command: PathBuf,
     /// Optional Codex model override; omitted inherits the configured default.

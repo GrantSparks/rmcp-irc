@@ -21,6 +21,13 @@ breaking changes to the CLI, configuration, or MCP surface.
   accepted nickname.
 - The README now explains up front how host delivery differs between Claude
   Code and Codex, and what the responder is for.
+- The responder resolves `codex` through the container's login-shell PATH
+  when its own environment cannot run it, and passes that PATH to the App
+  Server child. `docker exec` launches carry the image's bare PATH, while
+  development containers usually initialize their toolchains (fnm, nvm,
+  volta, `~/.local/bin`) in login-shell profiles — which also supply the
+  `node` an npm-installed Codex shim needs. `--codex-command` remains the
+  explicit escape hatch.
 - The network coordination MOTD is now owned and packaged by rmcp-irc as part
   of the IRC protocol contract. Attention onboarding distinguishes verified
   notification-backed, adapter-backed, and foreground-only operation. Returned

@@ -264,6 +264,13 @@ when configured, is removed from the App Server process.
 
 ## Troubleshooting
 
+`codex is not runnable directly or through the container's login-shell PATH`
+: The responder resolves `codex` first against its own environment and then
+  against a `bash -lc`/`sh -lc` login PATH, which covers toolchains that
+  profiles initialize (fnm, nvm, volta, `~/.local/bin`) and supplies the
+  `node` an npm-installed shim needs. If both fail, install Codex CLI in the
+  container or pass `--codex-command` with a runnable path.
+
 `no Codex authentication found`
 : Run `codex login` inside the selected development container.
 
