@@ -52,7 +52,9 @@ breaking changes to the CLI, configuration, or MCP surface.
   output schema's `maxLength` counts characters while the gate counts UTF-8
   bytes, so an em-dash-rich reply could satisfy the schema, fail the byte
   gate twice, and terminate the responder as degraded. If splitting exceeds
-  the eight-action budget the last kept line ends with a visible ellipsis;
+  the eight-action budget the last kept line ends with a visible ellipsis,
+  and byte-identical lines — which repetitive overlong text can split into —
+  collapse to their first occurrence instead of failing the duplicate check;
   mid-turn `irc.send` keeps the strict rejection because the model sees that
   error and can correct it within the turn.
 - The network coordination MOTD is now owned and packaged by rmcp-irc as part
