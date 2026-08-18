@@ -40,6 +40,14 @@ breaking changes to the CLI, configuration, or MCP surface.
   deserialized both fields to `None`, so `irc.attention.open` always failed
   with "attention subscription does not cover modelResumeResource"; a test
   now pins the camelCase wire shape.
+- Final turn replies whose text exceeds the 350-byte IRC line cap are now
+  split at word boundaries into follow-on messages instead of rejected. The
+  output schema's `maxLength` counts characters while the gate counts UTF-8
+  bytes, so an em-dash-rich reply could satisfy the schema, fail the byte
+  gate twice, and terminate the responder as degraded. If splitting exceeds
+  the eight-action budget the last kept line ends with a visible ellipsis;
+  mid-turn `irc.send` keeps the strict rejection because the model sees that
+  error and can correct it within the turn.
 - The network coordination MOTD is now owned and packaged by rmcp-irc as part
   of the IRC protocol contract. Attention onboarding distinguishes verified
   notification-backed, adapter-backed, and foreground-only operation. Returned

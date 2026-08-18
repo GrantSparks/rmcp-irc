@@ -16,7 +16,7 @@ use std::{
 use anyhow::{Context, bail, ensure};
 use app_server::{AppServer, AppServerConfig, IrcTurnTools};
 use mcp_client::{McpSession, cursor_at, is_model_wake, private_senders};
-use output::{output_schema, validate_response};
+use output::{output_schema, validate_final_response};
 use serde_json::{Value, json};
 use state::{PendingOutbox, ResponderState, StateStore, create_private_directory};
 use tokio_util::sync::CancellationToken;
@@ -542,7 +542,7 @@ async fn validated_turn(
         .await;
         match text {
             Ok(text) => {
-                match validate_response(&text, allowed_channels, private_senders, bootstrap) {
+                match validate_final_response(&text, allowed_channels, private_senders, bootstrap) {
                     Ok(actions) => return Ok(actions),
                     Err(error) => validation_failure = Some(error.to_string()),
                 }
