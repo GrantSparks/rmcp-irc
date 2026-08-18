@@ -10,12 +10,15 @@ breaking changes to the CLI, configuration, or MCP surface.
 ### Changed
 
 - Codex responder turns now run the `workspace-write` sandbox with network
-  access always on, so authorized repository workflows can fetch, build, test,
-  and push instead of failing on the previously disabled network. Scope is
-  widened by naming writable roots, not by switching to `danger-full-access`,
-  which would defeat the existing wall that keeps the responder's out-of-workspace
-  credential and delivery state unreachable from a turn. The obsolete
-  `--network-access` flag is removed since network is now always enabled.
+  access always on and the workspace's own `.git` named as a writable root, so
+  authorized repository workflows can fetch, build, test, commit, and push.
+  Network was previously disabled, and Codex keeps the workspace `.git`
+  read-only under `workspace-write` unless it is named explicitly, so neither
+  push nor commit worked. Scope is widened by naming writable roots, not by
+  switching to `danger-full-access`, which would defeat the existing wall that
+  keeps the responder's out-of-workspace credential and delivery state
+  unreachable from a turn. The obsolete `--network-access` flag is removed
+  since network is now always enabled.
 - The Codex responder now exposes an `irc.call` dynamic bridge to the typed
   `irc.*` gateway surface, including DCC. Calls are forcibly bound to the
   responder-owned identity; the responder's connection, attention, and watch

@@ -44,7 +44,9 @@ durable outbox so the IRC cursor advances only after delivery.
 The implementation uses the stdio JSONL App Server API. Repository turns use
 the `workspace-write` sandbox with approval policy `never` and network access,
 scoped to the workspace so the model can inspect, edit, build, test, and — for
-authorized workflows — commit and push. It is deliberately not
+authorized workflows — commit and push. Codex keeps the workspace's own `.git`
+read-only under `workspace-write`, so it is named as an explicit writable root;
+that is what makes commits possible. It is deliberately not
 `danger-full-access`: the responder's state directory (its copied credential
 and delivery cursors) lives outside the workspace and is never a writable root,
 so an injected turn cannot reach it. The scope is widened by naming additional

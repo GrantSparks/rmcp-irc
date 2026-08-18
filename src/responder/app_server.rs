@@ -596,14 +596,18 @@ fn notification_turn_matches(params: &Value, turn_id: &str) -> bool {
 /// Turn-level sandbox policy: `workspace-write` scoped to the repository plus
 /// network access for fetch and push.
 ///
-/// Deliberately not `danger-full-access`: the responder's state directory (its
-/// copied credential and delivery cursors) lives outside the workspace and is
-/// never a writable root, so an injected turn cannot reach it. The scope is
-/// widened by naming additional writable roots here, not by removing the wall.
+/// Codex's `workspace-write` sandbox mounts the workspace's own `.git`
+/// read-only to protect history, even though the workspace itself is writable,
+/// so a turn cannot commit until `.git` is named as an explicit writable root.
+/// This is the "targeted writable root" that widens capability without
+/// `danger-full-access`: the responder's state directory (its copied credential
+/// and delivery cursors) lives outside the workspace and is never named here,
+/// so an injected turn still cannot reach it. Non-worktree layout; a worktree's
+/// `.git` is a file pointing elsewhere and would need its common dir resolved.
 fn turn_sandbox_policy(cwd: &Path) -> Value {
     json!({
         "type": "workspaceWrite",
-        "writableRoots": [cwd],
+        "writableRoots": [cwd, cwd.join(".git")],
         "networkAccess": true
     })
 }
@@ -1262,7 +1266,11 @@ done
         let policy = turn_sandbox_policy(Path::new("/workspace/project"));
         assert_eq!(policy["type"], "workspaceWrite");
         assert_eq!(policy["networkAccess"], true);
-        assert_eq!(policy["writableRoots"][0], "/workspace/project");
+        let roots = policy["writableRoots"].as_array().expect("writable roots");
+        assert!(roots.iter().any(|root| root == "/workspace/project"));
+        // The workspace .git must be named explicitly or commits fail: Codex
+        // keeps it read-only under workspace-write.
+        assert!(roots.iter().any(|root| root == "/workspace/project/.git"));
         // The wall the responder relies on: not full access, so its
         // out-of-workspace state directory is never a writable root.
         assert_ne!(policy["type"], "dangerFullAccess");
