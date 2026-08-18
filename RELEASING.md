@@ -47,7 +47,7 @@ interoperability, transports, reconnects, or DCC. These are not part of CI.
 
 After the release pull request is merged and required checks pass on `main`:
 
-    git tag -s vX.Y.Z -m "rmcp-irc X.Y.Z"
+    git tag -a vX.Y.Z -m "rmcp-irc X.Y.Z"
     git push origin vX.Y.Z
 
 The tag workflow then:
@@ -62,7 +62,7 @@ The publish step is idempotent: if the version is already on crates.io, it is
 skipped rather than retried.
 
 After success, verify the crates.io page, then create the GitHub release from
-the signed tag using the matching changelog section.
+the tag using the matching changelog section.
 
 ## 4. Failure recovery
 
