@@ -55,8 +55,6 @@ pub struct RunConfig {
     pub model: Option<String>,
     /// Reasoning effort.
     pub effort: String,
-    /// Whether Codex repository turns may access the network.
-    pub network_access: bool,
     /// Maximum duration of one repository-working model turn.
     pub turn_timeout: Duration,
 }
@@ -908,7 +906,6 @@ fn prepare_codex(config: &RunConfig, state_dir: &Path) -> anyhow::Result<AppServ
         cwd: config.workspace.clone(),
         model: config.model.clone(),
         effort: config.effort.clone(),
-        network_access: config.network_access,
         excluded_secret_env: config.bearer_token_env.clone(),
     })
 }
@@ -1224,7 +1221,6 @@ mod tests {
             codex_command: "codex".into(),
             model: None,
             effort: "low".into(),
-            network_access: false,
             turn_timeout: Duration::from_secs(30 * 60),
         }
     }

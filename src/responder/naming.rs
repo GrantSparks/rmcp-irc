@@ -332,7 +332,6 @@ mod tests {
                 codex_command: "codex".into(),
                 model: None,
                 effort: "low".into(),
-                network_access: false,
                 turn_timeout: Duration::from_secs(60),
             }
         }

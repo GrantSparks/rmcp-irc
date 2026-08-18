@@ -48,8 +48,6 @@ pub struct AppServerConfig {
     pub model: Option<String>,
     /// Reasoning effort applied to every turn.
     pub effort: String,
-    /// Whether repository turns may access the network.
-    pub network_access: bool,
     /// Environment variable whose MCP bearer secret must not reach Codex.
     pub excluded_secret_env: Option<String>,
 }
@@ -294,11 +292,7 @@ impl AppServer {
             "input": [{"type": "text", "text": input}],
             "cwd": self.config.cwd,
             "approvalPolicy": "never",
-            "sandboxPolicy": {
-                "type": "workspaceWrite",
-                "writableRoots": [self.config.cwd],
-                "networkAccess": self.config.network_access
-            },
+            "sandboxPolicy": turn_sandbox_policy(&self.config.cwd),
             "effort": self.config.effort,
             "outputSchema": output_schema
         });
@@ -407,9 +401,9 @@ impl AppServer {
     }
 
     fn thread_settings(&self) -> Value {
-        // Unlike turn/start's sandboxPolicy object, the thread-level sandbox
-        // is a kebab-case mode string; the camelCase spelling that App Server
-        // itself echoes in responses is rejected in requests.
+        // The thread-level sandbox is a kebab-case mode string; the camelCase
+        // spelling that turn/start's sandboxPolicy object uses is rejected
+        // here. Turn/start carries the writable roots and network access.
         let mut settings = json!({
             "cwd": self.config.cwd,
             "approvalPolicy": "never",
@@ -597,6 +591,21 @@ fn turn_matches(params: &Value, turn_id: &str) -> bool {
 fn notification_turn_matches(params: &Value, turn_id: &str) -> bool {
     params.get("turnId").and_then(Value::as_str) == Some(turn_id)
         || params.pointer("/turn/id").and_then(Value::as_str) == Some(turn_id)
+}
+
+/// Turn-level sandbox policy: `workspace-write` scoped to the repository plus
+/// network access for fetch and push.
+///
+/// Deliberately not `danger-full-access`: the responder's state directory (its
+/// copied credential and delivery cursors) lives outside the workspace and is
+/// never a writable root, so an injected turn cannot reach it. The scope is
+/// widened by naming additional writable roots here, not by removing the wall.
+fn turn_sandbox_policy(cwd: &Path) -> Value {
+    json!({
+        "type": "workspaceWrite",
+        "writableRoots": [cwd],
+        "networkAccess": true
+    })
 }
 
 fn dynamic_tools() -> Value {
@@ -859,7 +868,6 @@ pub(super) mod test_support {
                 cwd,
                 model: None,
                 effort: "low".into(),
-                network_access: false,
                 excluded_secret_env: None,
             },
         )
@@ -1066,7 +1074,7 @@ while IFS= read -r line; do
       printf '%s\n' '{"id":4,"error":{"code":-32602,"message":"dynamicTools is not a thread/resume parameter"}}' ;;
     *'"method":"thread/resume"'*'"sandbox":"workspace-write"'*)
       printf '%s\n' '{"id":4,"result":{"thread":{"id":"thr_responder"}}}' ;;
-    *'"method":"turn/start"'*'"networkAccess":false'*)
+    *'"method":"turn/start"'*'"type":"workspaceWrite"'*)
       printf '%s\n' '{"id":5,"result":{"turn":{"id":"turn_1","status":"inProgress"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"turnId":"turn_1","item":{"type":"agentMessage","id":"item_1","text":"{\"actions\":[]}"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thr_responder","turn":{"id":"turn_1","status":"completed","items":[{"type":"agentMessage","id":"item_1","text":"{\"actions\":[]}"}]}}}' ;;
@@ -1247,5 +1255,16 @@ done
             tools[0]["tools"][1]["inputSchema"]["properties"]["tool"]["pattern"],
             "^irc\\."
         );
+    }
+
+    #[test]
+    fn turn_sandbox_policy_is_scoped_workspace_write_with_network() {
+        let policy = turn_sandbox_policy(Path::new("/workspace/project"));
+        assert_eq!(policy["type"], "workspaceWrite");
+        assert_eq!(policy["networkAccess"], true);
+        assert_eq!(policy["writableRoots"][0], "/workspace/project");
+        // The wall the responder relies on: not full access, so its
+        // out-of-workspace state directory is never a writable root.
+        assert_ne!(policy["type"], "dangerFullAccess");
     }
 }

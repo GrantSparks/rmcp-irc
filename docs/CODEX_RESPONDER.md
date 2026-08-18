@@ -42,10 +42,15 @@ durable outbox so the IRC cursor advances only after delivery.
   attached to the private IRC network.
 
 The implementation uses the stdio JSONL App Server API. Repository turns use
-`workspaceWrite` with the selected workspace as the writable root and approval
-policy `never`. Network access is off by default and can be enabled explicitly
-with `--network-access`. The client-defined IRC tools use App Server's
-experimental dynamic-tools API; `thread/start` is the startup capability probe
+the `workspace-write` sandbox with approval policy `never` and network access,
+scoped to the workspace so the model can inspect, edit, build, test, and — for
+authorized workflows — commit and push. It is deliberately not
+`danger-full-access`: the responder's state directory (its copied credential
+and delivery cursors) lives outside the workspace and is never a writable root,
+so an injected turn cannot reach it. The scope is widened by naming additional
+writable roots, not by removing that wall. The responder still removes its MCP
+bearer secret from the App Server environment. The client-defined IRC
+tools use App Server's experimental dynamic-tools API; `thread/start` is the startup capability probe
 and fails clearly if the installed CLI rejects `dynamicTools`. App Server stores
 that registry in the thread's session metadata and restores it on
 `thread/resume`; a tool-registry version retires an older thread once when the
@@ -100,7 +105,6 @@ Defaults:
 | Allowed channel | `#control` |
 | Model | Inherit the Codex default |
 | Reasoning effort | `low` |
-| Network access | Disabled; opt in with `--network-access` |
 | Repository-turn timeout | 1,800 seconds |
 | Attention page | 100 events |
 | Notification safety check | 60 seconds |
@@ -132,10 +136,6 @@ always leads the candidate list, so an unconfigured relaunch keeps its
 established IRC identity. There is likewise no purpose or location
 configuration: the bootstrap hello has the model introduce its nickname and
 workspace and state, in its own words, what it is there to do.
-
-Enable `--network-access` only for repositories whose tasks actually require
-downloads or remote APIs. IRC remains untrusted task input even on the private
-network; ordinary local editing, builds, and tests do not require this flag.
 
 The workspace is canonicalized before App Server or IRC starts. A state
 profile is permanently bound to both its first MCP endpoint and canonical
@@ -261,9 +261,9 @@ prototype must be replaced with a new profile directory.
 The isolated `CODEX_HOME` imports authentication only, not user MCP servers,
 plugins, apps, skills, or global Codex configuration. Applicable repository
 instructions and project configuration remain visible in the selected
-worktree. Repository access comes from App Server's built-in coding tools and
-explicit workspace sandbox—not a plugin. The MCP bearer environment variable,
-when configured, is removed from the App Server process.
+worktree. Repository access comes from App Server's built-in coding tools—not a
+plugin. The MCP bearer environment variable, when configured, is removed from
+the App Server process.
 
 ## Troubleshooting
 

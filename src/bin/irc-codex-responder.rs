@@ -63,9 +63,6 @@ struct RunArgs {
     /// Codex reasoning effort.
     #[arg(long, default_value = "low")]
     effort: String,
-    /// Allow repository turns to access the network.
-    #[arg(long)]
-    network_access: bool,
     /// Maximum duration of one repository-working turn.
     #[arg(long, default_value_t = 1800)]
     turn_timeout_seconds: u64,
@@ -94,7 +91,6 @@ async fn main() -> anyhow::Result<()> {
                 codex_command: args.codex_command,
                 model: args.model,
                 effort: args.effort,
-                network_access: args.network_access,
                 turn_timeout: Duration::from_secs(args.turn_timeout_seconds),
             })
             .await
