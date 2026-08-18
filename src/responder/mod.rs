@@ -36,11 +36,14 @@ pub struct RunConfig {
     pub state_dir: PathBuf,
     /// Canonical repository workspace in which Codex operates.
     pub workspace: PathBuf,
-    /// Exactly three ordered mythological nickname candidates.
+    /// Up to three ordered mythological nickname candidates; validation
+    /// fills unclaimed slots from [`DEFAULT_NICKNAME_POOL`].
     pub nickname_candidates: Vec<String>,
-    /// Human-readable responder purpose.
+    /// Human-readable responder purpose; empty selects a default derived
+    /// from the workspace.
     pub purpose: String,
-    /// Human-readable development-container location.
+    /// Human-readable development-container location; empty selects a
+    /// default derived from the hostname and workspace.
     pub location: String,
     /// Targets whose complete inbound traffic wakes attention.
     pub full_traffic_targets: Vec<String>,
@@ -82,8 +85,8 @@ impl RunConfig {
             self.workspace.display()
         );
         ensure!(
-            self.nickname_candidates.len() == 3,
-            "--nickname-candidate must be supplied exactly three times"
+            self.nickname_candidates.len() <= 3,
+            "--nickname-candidate may be supplied at most three times"
         );
         ensure!(
             self.nickname_candidates
@@ -96,15 +99,17 @@ impl RunConfig {
             .iter()
             .map(|candidate| candidate.to_ascii_lowercase())
             .collect();
-        ensure!(distinct.len() == 3, "nickname candidates must be distinct");
         ensure!(
-            !self.purpose.trim().is_empty(),
-            "--purpose must not be empty"
+            distinct.len() == self.nickname_candidates.len(),
+            "nickname candidates must be distinct"
         );
-        ensure!(
-            !self.location.trim().is_empty(),
-            "--location must not be empty"
-        );
+        fill_candidates_from_pool(&mut self.nickname_candidates);
+        if self.purpose.trim().is_empty() {
+            self.purpose = default_purpose(&self.workspace);
+        }
+        if self.location.trim().is_empty() {
+            self.location = default_location(&self.workspace);
+        }
         if self.allowed_channels.is_empty() {
             self.allowed_channels.push("#control".into());
         }
@@ -915,6 +920,89 @@ fn required_resume_resource(state: &ResponderState) -> anyhow::Result<&str> {
         .context("state has no model-resume resource")
 }
 
+/// Obscure figures across mythological traditions, per the coordination
+/// protocol's advice to skip the famous first-thought names.
+pub const DEFAULT_NICKNAME_POOL: &[&str] = &[
+    "Ratatoskr",
+    "Vedrfolnir",
+    "Hoenir",
+    "Tapio",
+    "Mielikki",
+    "Ilmarinen",
+    "Airmed",
+    "Morvran",
+    "Ogma",
+    "Tefnut",
+    "Heqet",
+    "Serqet",
+    "Lugalbanda",
+    "Ninshubur",
+    "Saranyu",
+    "Matarisvan",
+    "Zhinu",
+    "Leizi",
+    "Okuninushi",
+    "Sukunabikona",
+    "Iktomi",
+    "Wisakedjak",
+    "Amarok",
+    "Bochica",
+];
+
+// Random unclaimed slots keep concurrently launched unconfigured responders
+// from all presenting the same candidate triple.
+fn fill_candidates_from_pool(candidates: &mut Vec<String>) {
+    let mut pool: Vec<&str> = DEFAULT_NICKNAME_POOL
+        .iter()
+        .copied()
+        .filter(|name| {
+            !candidates
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(name))
+        })
+        .collect();
+    let mut entropy = u128::from_le_bytes(*Uuid::new_v4().as_bytes());
+    while candidates.len() < 3 {
+        let index = (entropy % pool.len() as u128) as usize;
+        entropy /= pool.len() as u128;
+        candidates.push(pool.swap_remove(index).to_owned());
+    }
+}
+
+fn default_purpose(workspace: &Path) -> String {
+    format!(
+        "Collaborate on {} repository work requested over IRC",
+        workspace_name(workspace)
+    )
+}
+
+fn default_location(workspace: &Path) -> String {
+    match hostname() {
+        Some(host) => format!("container {host}, workspace {}", workspace.display()),
+        None => format!("workspace {}", workspace.display()),
+    }
+}
+
+fn workspace_name(workspace: &Path) -> String {
+    workspace
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workspace.display().to_string())
+}
+
+fn hostname() -> Option<String> {
+    fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            env::var("HOSTNAME")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+}
+
 fn resumed_candidates(state: &ResponderState, configured: &[String]) -> Vec<String> {
     let mut candidates = Vec::with_capacity(3);
     if let Some(previous) = &state.accepted_nickname {
@@ -994,14 +1082,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_exactly_three_distinct_candidates() {
+    fn validates_at_most_three_distinct_candidates() {
         let mut config = test_config();
         assert!(config.validate().is_ok());
-        config.nickname_candidates.pop();
+        config.nickname_candidates.push("Extra".into());
         assert!(config.validate().is_err());
         let mut config = test_config();
         config.nickname_candidates[2] = "nabu".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn missing_candidate_slots_fill_distinctly_from_the_pool() {
+        let mut config = test_config();
+        config.nickname_candidates = vec!["Ratatoskr".into()];
+        config.validate().expect("valid");
+        assert_eq!(config.nickname_candidates[0], "Ratatoskr");
+        assert_eq!(config.nickname_candidates.len(), 3);
+        let distinct: HashSet<_> = config
+            .nickname_candidates
+            .iter()
+            .map(|candidate| candidate.to_ascii_lowercase())
+            .collect();
+        assert_eq!(distinct.len(), 3);
+        assert!(
+            config.nickname_candidates[1..]
+                .iter()
+                .all(|candidate| DEFAULT_NICKNAME_POOL.contains(&candidate.as_str()))
+        );
+
+        let mut config = test_config();
+        config.nickname_candidates.clear();
+        config.validate().expect("valid");
+        assert_eq!(config.nickname_candidates.len(), 3);
+    }
+
+    #[test]
+    fn empty_purpose_and_location_derive_from_the_workspace() {
+        let mut config = test_config();
+        config.purpose = String::new();
+        config.location = "  ".into();
+        config.validate().expect("valid");
+        let workspace_name = config
+            .workspace
+            .file_name()
+            .expect("workspace name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(config.purpose.contains(&workspace_name));
+        assert!(
+            config
+                .location
+                .contains(&config.workspace.display().to_string())
+        );
+
+        let mut config = test_config();
+        config.validate().expect("valid");
+        assert_eq!(config.purpose, "coordinate tests");
+        assert_eq!(config.location, "dev");
     }
 
     #[test]

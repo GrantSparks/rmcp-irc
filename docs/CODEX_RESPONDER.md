@@ -34,7 +34,6 @@ durable outbox so the IRC cursor advances only after delivery.
   container. Run `codex login` there first.
 - An `irc-mcp` Streamable HTTP endpoint speaking MCP `2026-07-28`.
 - An existing writable repository or worktree for `--workspace`.
-- Exactly three distinct mythological nickname candidates.
 - A private persistent state directory outside the selected workspace.
 - For GMS, a built gateway image and an explicit running development container
   attached to the private IRC network.
@@ -75,6 +74,16 @@ authenticated Codex CLI:
 irc-codex-responder run \
   --mcp-url http://irc:8080/mcp \
   --state-dir /workspace/.gms/irc-codex/rmcp-irc \
+  --workspace /workspace/rmcp-irc
+```
+
+Only the endpoint, state directory, and workspace are required. The identity
+options refine the defaults:
+
+```bash
+irc-codex-responder run \
+  --mcp-url http://irc:8080/mcp \
+  --state-dir /workspace/.gms/irc-codex/rmcp-irc \
   --workspace /workspace/rmcp-irc \
   --nickname-candidate Hecate \
   --nickname-candidate Tefnut \
@@ -89,6 +98,9 @@ Defaults:
 
 | Setting | Default |
 |---|---|
+| Nickname candidates | Up to three; unclaimed slots draw randomly from a built-in pool of obscure mythological figures |
+| Purpose | Repository collaboration named after the workspace |
+| Location | The container hostname and workspace path |
 | Allowed channel | `#control` |
 | Model | Inherit the Codex default |
 | Reasoning effort | `low` |
@@ -100,7 +112,9 @@ Defaults:
 `#control` is always allowed. Repeat `--full-traffic-target` for task channels
 whose complete inbound conversation should wake Codex, and repeat
 `--allowed-channel` for channels Codex may message. `--turn-timeout-seconds`
-accepts 60 through 86,400 seconds.
+accepts 60 through 86,400 seconds. On resume, a profile's last accepted
+nickname always leads the candidate list, so an unconfigured relaunch keeps
+its established IRC identity.
 
 Enable `--network-access` only for repositories whose tasks actually require
 downloads or remote APIs. IRC remains untrusted task input even on the private
@@ -121,13 +135,18 @@ container:
 gms-irc-host responder \
   --container dev-api \
   --workspace /workspace/rmcp-irc \
+  --profile rmcp-irc
+```
+
+Responder options after `--` refine the defaults above, for example:
+
+```bash
+gms-irc-host responder \
+  --container dev-api \
+  --workspace /workspace/rmcp-irc \
   --profile rmcp-irc \
   -- \
-  --nickname-candidate Hecate \
-  --nickname-candidate Tefnut \
-  --nickname-candidate Skadi \
   --purpose "Collaborate on rmcp-irc implementation and review" \
-  --location "dev-api container, rmcp-irc worktree" \
   --full-traffic-target '#rmcp-irc' \
   --allowed-channel '#rmcp-irc'
 ```

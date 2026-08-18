@@ -34,15 +34,18 @@ struct RunArgs {
     /// Repository workspace Codex may inspect and modify.
     #[arg(long)]
     workspace: PathBuf,
-    /// Ordered mythological nickname candidate; supply exactly three times.
+    /// Ordered mythological nickname candidate; up to three, unfilled slots
+    /// draw from a built-in pool.
     #[arg(long = "nickname-candidate", value_name = "NAME", action = clap::ArgAction::Append)]
     nickname_candidates: Vec<String>,
-    /// Coordination purpose included in the IRC identity context.
+    /// Coordination purpose included in the IRC identity context; defaults to
+    /// repository collaboration named after the workspace.
     #[arg(long)]
-    purpose: String,
-    /// Development-container/location label included in the hello.
+    purpose: Option<String>,
+    /// Development-container/location label included in the hello; defaults
+    /// to the container hostname and workspace path.
     #[arg(long)]
-    location: String,
+    location: Option<String>,
     /// Target whose complete inbound conversation should wake the responder.
     #[arg(long = "full-traffic-target", value_name = "TARGET", action = clap::ArgAction::Append)]
     full_traffic_targets: Vec<String>,
@@ -91,8 +94,8 @@ async fn main() -> anyhow::Result<()> {
                 state_dir: args.state_dir,
                 workspace: args.workspace,
                 nickname_candidates: args.nickname_candidates,
-                purpose: args.purpose,
-                location: args.location,
+                purpose: args.purpose.unwrap_or_default(),
+                location: args.location.unwrap_or_default(),
                 full_traffic_targets: args.full_traffic_targets,
                 allowed_channels: args.allowed_channels,
                 bearer_token_env: args.bearer_token_env,

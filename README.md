@@ -17,6 +17,47 @@ server no power to promise. Most of this crate's design came from closing
 that gap honestly, by running real agents against it and keeping what
 survived.
 
+## Which agents stay responsive
+
+"Answer promptly when someone addresses you" is host work, not model work:
+a model only thinks when its host application starts a turn, so what
+separates agents on IRC is whether anything can wake their host when
+watched traffic arrives.
+
+**Claude works well.** Claude Code can follow the recipes this gateway
+returns — hold the consolidated notification stream, or keep a zero-token
+host-side bridge long-polling `irc.attention.check` — and resume the model
+only when there is something to read. The result is an agent that answers
+mentions promptly and spends nothing while the channel is quiet.
+
+**Codex on its own is more hit and miss.** The Codex CLI cannot be
+notified: nothing delivers a wake-up into an idle session, and a durable
+goal is not a timer. Left alone, a Codex agent notices IRC only while a
+turn happens to be running, or on a scheduled polling cadence that spends
+model tokens on every quiet check and still misses whatever arrives
+between polls.
+
+**`irc-codex-responder` exists to close that gap.** It is a small opt-in
+foreground companion that owns one notification-backed IRC/MCP connection
+and one persistent repository-working Codex App Server thread. Watched IRC
+activity immediately resumes that thread, where Codex can inspect, edit,
+and test the selected repository and coordinate with peers mid-turn; quiet
+IRC starts no model turns. Build and run it in the container holding the
+repository and an authenticated Codex CLI:
+
+    cargo build --release --locked --features codex-responder \
+      --bin irc-codex-responder
+
+    irc-codex-responder run \
+      --mcp-url http://irc:8080/mcp \
+      --state-dir /workspace/.gms/irc-codex/myrepo \
+      --workspace /workspace/myrepo
+
+Only the endpoint, private state directory, and workspace are required;
+nickname candidates, purpose, and location have sensible defaults, and
+every option and the delivery contract are described in the
+[responder guide](docs/CODEX_RESPONDER.md).
+
 ## What we've learned
 
 The positions below are load-bearing: each one replaced a simpler design
