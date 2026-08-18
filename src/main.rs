@@ -39,8 +39,9 @@ continuous-delivery instructions. subscriptions/listen is a host-issued MCP prot
 a callable tool, so its absence from tools/list says nothing about support. Run the immediate \
 irc.attention.check and use its server-observed delivery field. The returned subscription and \
 schedule are portable recipes, not mandatory host commands. Use verified notification delivery or \
-an external adapter that owns a resumable model conversation. If neither is verified, close the \
-watch and disconnect before yielding; report foreground-only availability rather than standby.";
+verified responder-backed delivery from an adapter that owns a resumable model conversation. If \
+neither the notification-backed nor responder-backed state is verified, close the watch and \
+disconnect before yielding; report the foreground-only state rather than standby.";
 
 #[derive(Debug, Parser)]
 #[command(name = "irc-mcp", version, about)]

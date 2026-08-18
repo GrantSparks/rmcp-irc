@@ -27,6 +27,22 @@ exclude = [
 name = "irc-mcp"
 path = "src/main.rs"
 
+[[bin]]
+name = "irc-codex-responder"
+path = "src/bin/irc-codex-responder.rs"
+required-features = ["codex-responder"]
+
+[features]
+default = []
+# The autonomous responder is deliberately opt-in. The gateway binary keeps
+# its existing lean server-only dependency shape unless this feature is named.
+codex-responder = [
+    "dep:fs2",
+    "rmcp/client",
+    "rmcp/transport-streamable-http-client-reqwest",
+    "tokio/process",
+]
+
 [dependencies]
 anyhow = "1.0"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -35,6 +51,7 @@ bytes = "1.11"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+fs2 = { version = "0.4", optional = true }
 ircv3_parse = "4.0.0"
 percent-encoding = "2.3"
 rand = "0.10"

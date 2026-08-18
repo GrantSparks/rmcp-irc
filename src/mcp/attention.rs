@@ -37,17 +37,21 @@ pub const ATTENTION_MAX_INTERVAL_SECONDS: u64 = 60;
 
 /// Model-facing lifecycle rule shared by onboarding and tool results.
 pub const ATTENTION_ONBOARDING: &str = "Before ending a turn while this IRC agent remains active, \
-open attention with irc.attention.open and follow its returned delivery instructions. Keep one \
-subscriptions/listen stream open and resume this conversation when modelResumeResource changes, or \
-run the returned prompt immediately and then every 60 seconds in this same conversation. Do not use \
+open attention with irc.attention.open and follow its returned delivery instructions. In the \
+notification-backed state, keep one subscriptions/listen stream open and resume this conversation \
+when modelResumeResource changes. In the responder-backed state, a foreground adapter owns both \
+that subscription and its resumable model conversation, with a 60-second host-side safety check \
+that starts no quiet model turn. Other adapters may run the returned prompt immediately and then \
+every 60 seconds in this same conversation. Do not use \
 an immediate continuation loop; in Codex, a durable goal alone is not a timer. subscriptions/listen \
 is a host-issued MCP protocol request, never a callable tool, so its absence from tools/list says \
 nothing about client support. The immediate attention check reports server-observed delivery truth: \
-cancel recurring checks only after it confirms notification mode; a polling result may be an \
+cancel recurring checks only after it confirms the notification-backed state; a polling result may be an \
 activation race, so keep checking. The returned recipes are portable guidance, not commands the MCP \
-host is required to interpret. An external adapter may use a documented host API to resume this \
-conversation on the recurring cadence. If neither notification delivery nor an adapter is verified, \
-remain foreground-only: before yielding, close the watch and disconnect rather than claim standby. \
+host is required to interpret. A responder-backed adapter may use a documented host API to own and \
+resume its model conversation on the recurring cadence. If neither notification-backed nor verified \
+responder-backed delivery is active, use the foreground-only state: before yielding, close the watch and \
+disconnect rather than claim standby. \
 Stop delivery, close the watch, and disconnect when the task is done or abandoned.";
 
 /// Input accepted by `irc.attention.open`.
@@ -137,7 +141,7 @@ impl AttentionSchedule {
                  handles. After the immediate first check, run each later check 60 seconds after the \
                  previous check; do not use an immediate continuation loop. In Codex, a durable goal \
                  alone is not a cadence-aware scheduler and can fire repeatedly without waiting, so \
-                 use notification mode or an actual scheduled task that honors this interval. Each \
+                 use the notification-backed state or an actual scheduled task that honors this interval. Each \
                  check's delivery field is server-observed. Cancel this recurring task only after \
                  delivery.mode is notification; polling can be a host activation race and means keep \
                  checking. Close the watch and disconnect when the work is done or \
@@ -145,13 +149,14 @@ impl AttentionSchedule {
                 watch.agent_id, watch.watch_id, initial_cursor.stream_id, initial_cursor.sequence,
             ),
             delivery_modes: vec![
-                "Notification mode: keep the returned subscriptions/listen filter active and resume this same conversation when modelResumeResource changes",
-                "Recurring-check mode: run this prompt immediately, then every 60 seconds in this same conversation; do not use an immediate continuation loop",
+                "Notification-backed state: keep the returned subscriptions/listen filter active and resume this same conversation when modelResumeResource changes",
+                "Responder-backed state: a foreground adapter owns both the subscription and its resumable model conversation; its safety check runs every 60 seconds without starting a quiet model turn",
+                "Recurring-check recipe for other adapters: run this prompt immediately, then every 60 seconds in this same conversation; do not use an immediate continuation loop",
                 "subscriptions/listen is a host-issued MCP request, not a tool; absence from tools/list is not evidence of missing support",
                 "Cancel recurring checks only after attention.check reports delivery.mode notification; polling may be an activation race",
-                "Codex: a durable goal alone is not a timer; use notification mode or a cadence-aware scheduled task that honors intervalSeconds",
+                "Codex: a durable goal alone is not a timer; use the notification-backed state or a cadence-aware scheduled task that honors intervalSeconds",
                 "The schedule is an adapter recipe, not a required MCP host command",
-                "Without verified notification or adapter delivery, disconnect before yielding and report foreground-only availability",
+                "Foreground-only state: without verified notification-backed or responder-backed delivery, disconnect before yielding and report limited availability",
             ],
             cancel_when: vec!["task_done", "task_abandoned", "agent_disconnected"],
         }
@@ -655,13 +660,13 @@ mod tests {
             schedule
                 .delivery_modes
                 .iter()
-                .any(|mode| mode.contains("Notification mode"))
+                .any(|mode| mode.contains("Notification-backed state"))
         );
         assert!(
             schedule
                 .delivery_modes
                 .iter()
-                .any(|mode| mode.contains("Recurring-check mode"))
+                .any(|mode| mode.contains("Recurring-check recipe"))
         );
         assert!(
             schedule

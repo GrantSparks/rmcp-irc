@@ -1013,9 +1013,10 @@ stream covers the watch's model-resume URI. `mode: polling` means the fallback
 must continue; it may simply have raced stream activation and does not prove
 the client lacks notification support. Host facilities do not become
 model-callable tools, so tool inventory cannot establish capability. An
-external adapter may own and resume a model conversation through a documented
-API; without verified notification or adapter delivery the client must close
-the watch and disconnect before yielding.
+foreground responder may own and resume a model conversation through a
+documented API; without verified notification-backed or responder-backed
+delivery the client must use the foreground-only state, close the watch, and
+disconnect before yielding.
 
 The returned `resume_cursor` is attention-specific. When another selected page
 remains it is the last delivered match; when the immutable selection is fully
@@ -1032,7 +1033,7 @@ seconds. `intervalSeconds` carries that recommended cadence and
 `maxIntervalSeconds` is the responsiveness ceiling. Clients must not translate
 the recipe into an immediate continuation loop. In particular, a Codex durable
 goal alone is not a cadence-aware scheduler and can run successive turns without
-waiting; Codex must use notification mode or an actual scheduled task that
+waiting; Codex must use the notification-backed state or an actual scheduled task that
 honors `intervalSeconds`. Such a quiet recurring turn still invokes a model and
 consumes tokens; the compact result only minimizes that cost. The result's
 `deliveryModes` explains both choices without assuming a particular client.

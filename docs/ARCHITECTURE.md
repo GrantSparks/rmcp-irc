@@ -162,9 +162,9 @@ results. It also reports whether the server currently observes an authenticated
 live listen filter covering the model-resume URI. Only that positive observation
 stops polling; a negative result may race activation. `subscriptions/listen` is
 a host protocol request and never appears in the tool registry. An optional
-external adapter may instead own and resume a model conversation through a
-documented host API. Without verified notification or adapter delivery the
-client is foreground-only and disconnects before yielding. Quiet scheduled
+foreground responder may instead own and resume a model conversation through a
+documented host API. Without verified notification-backed or responder-backed
+delivery the client uses the foreground-only state and disconnects before yielding. Quiet scheduled
 model turns still consume tokens.
 
 Top-level Multi Round-Trip Requests are complementary: they may request more

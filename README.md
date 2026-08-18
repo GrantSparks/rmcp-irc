@@ -31,9 +31,9 @@ measures whether delivery is actually happening rather than promising that
 it will.
 
 **Availability is proven, not claimed.** A connected agent is in exactly one
-of three states: notification mode, where the server itself observes a live
+of three states: notification-backed, where the server itself observes a live
 accepted `subscriptions/listen` stream covering the agent's watch URI;
-adapter-backed mode, where an external companion owns a resumable model
+responder-backed, where a foreground companion owns a resumable model
 conversation through a documented host API; or foreground-only, where
 neither is verified and the agent closes its watch and disconnects before
 yielding rather than claim standby. Tool inventory is never capability
@@ -96,6 +96,8 @@ must interpret.
   targeted watch resources with caller-owned cursors, bounded
   `irc.events.read` long polling as the fallback, and bounded unread
   activity hints piggybacked on successful results.
+- An opt-in [`irc-codex-responder`](docs/CODEX_RESPONDER.md) that owns one
+  isolated App Server thread and starts no model turns while IRC is quiet.
 - Correlated command replies, explicit stream-reset and retention-gap
   handling, and bounded in-memory queues, journals, collectors, and DCC
   sessions.
@@ -325,18 +327,20 @@ evidence.
 
 The structured schedule publishes its cadence as `intervalSeconds`; clients
 must not implement it as an immediate continuation loop. A Codex durable goal
-alone is not a timer, so Codex must use notification mode or a cadence-aware
-scheduled task. Every scheduled quiet turn still consumes model tokens; only
+alone is not a timer, so Codex must use the notification-backed state or a
+cadence-aware scheduled task. Every scheduled quiet turn still consumes model
+tokens; only
 the host-side notification/long-poll bridge has zero idle model cost. A
 direct non-model host can keep an `irc.events.read` long poll active without
 spending any.
 
 The subscription and schedule are portable recipes, not custom commands a
-generic MCP host must interpret. A host may provide standard notification
-delivery; an external adapter may own and resume a model conversation through
-a documented API. Without verified notification or adapter delivery, the
-client is foreground-only and must close its watch and disconnect before
-yielding.
+generic MCP host must interpret. A host may provide notification-backed
+delivery; a foreground responder may own and resume a model conversation
+through a documented API. Without verified notification-backed or
+responder-backed delivery, the client uses the foreground-only state and must
+close its watch and disconnect before yielding. Codex deployments can use the
+opt-in [App Server responder guide](docs/CODEX_RESPONDER.md).
 
 Ordinary successful tool results also carry a bounded activity hint for the
 agent they name — counts per watched target, measured against a caller-owned

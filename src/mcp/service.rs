@@ -268,7 +268,7 @@ impl IrcMcpService {
         vec![PromptMessage::new_text(
             Role::User,
             format!(
-                "For IRC agent `{}`, call `irc.attention.open`. {targets} Follow the returned delivery instructions and establish one mode before claiming to watch or stand by. `subscriptions/listen` is a host-issued MCP request, never a tool, so its absence from tools/list says nothing about support. Notification mode keeps the returned filter merged into one stream and resumes this conversation when modelResumeResource changes. Recurring-check mode runs the immediate check, then every 60 seconds while its server-observed delivery.mode is polling; polling may be an activation race. Cancel recurring checks only after delivery.mode is notification. Treat intervalSeconds as the cadence and never use an immediate continuation loop; in Codex, a durable goal alone is not a timer. Persist resume_cursor only after handling events, drain while has_more, and stop delivery, close the watch, and disconnect when work ends. Quiet recurring checks consume model tokens; notification mode does not.",
+                "For IRC agent `{}`, call `irc.attention.open`. {targets} Follow the returned delivery instructions and establish one state before claiming to watch or stand by. `subscriptions/listen` is a host-issued MCP request, never a tool, so its absence from tools/list says nothing about support. The notification-backed state keeps the returned filter merged into one stream and resumes this conversation when modelResumeResource changes. The responder-backed state uses a foreground adapter that owns both that subscription and its resumable model conversation; its host-side safety check every 60 seconds starts no quiet model turn. Other adapters may use the recurring-check recipe while server-observed delivery.mode is polling, but quiet scheduled turns consume model tokens; polling may be an activation race. Treat intervalSeconds as the cadence and never use an immediate continuation loop; in Codex, a durable goal alone is not a timer. Persist resume_cursor only after handling events, drain while has_more, and stop delivery, close the watch, and disconnect when work ends. Without either verified backing mechanism, use the foreground-only state and disconnect before yielding.",
                 input.agent_id,
             ),
         )]
@@ -493,7 +493,7 @@ impl IrcMcpService {
         description = "Open model attention for one IRC guest and return a host-level \
                        subscriptions/listen recipe plus recurring checks. subscriptions/listen is \
                        an MCP protocol request, not a callable tool; use attention.check delivery \
-                       state rather than tools/list to determine whether notification mode is live.",
+                       state rather than tools/list to determine whether the notification-backed state is live.",
         output_schema = envelope_schema::<AttentionOpenOutput>(),
         annotations(
             title = "Open IRC model attention",
@@ -517,11 +517,12 @@ impl IrcMcpService {
                      subscriptions/listen; it is not a tool and absence from tools/list proves \
                      nothing. Run the returned prompt immediately and every 60 seconds while \
                      attention.check reports delivery.mode polling. Cancel recurring checks only \
-                     after the server observes notification mode. Do not use an immediate \
+                     after the server observes the notification-backed state. Do not use an immediate \
                      continuation loop; in Codex, a durable goal alone is not a timer. The schedule \
-                     is an optional adapter recipe, not an MCP host command. Without verified \
-                     notification or adapter delivery, close the watch and disconnect before \
-                     yielding; report foreground-only availability rather than standby.",
+                     is an optional adapter recipe, not an MCP host command. A responder-backed \
+                     adapter instead owns both this subscription and its resumable conversation. \
+                     Without verified notification-backed or responder-backed delivery, close the watch and disconnect before \
+                     yielding; report the foreground-only state rather than standby.",
                     created.watch.agent_id, created.watch.uri,
                 );
                 let link = ContentBlock::ResourceLink(watch_resource_entry(&created.watch));
@@ -5375,8 +5376,8 @@ mod tests {
             "irc.attention.open",
             "subscriptions/listen",
             "modelResumeResource",
-            "Notification mode",
-            "Recurring-check mode",
+            "notification-backed state",
+            "responder-backed state",
             "60 seconds",
             "consume model tokens",
         ] {
