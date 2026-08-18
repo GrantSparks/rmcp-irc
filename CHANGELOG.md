@@ -35,6 +35,11 @@ breaking changes to the CLI, configuration, or MCP surface.
   kebab-case mode string `workspace-write` that Codex CLI 0.147.0 requires.
   The camelCase spelling App Server echoes in its own responses is rejected
   in requests, and the scripted test server now rejects it the same way.
+- The responder now parses the gateway's camelCase `filterAddition`
+  subscription recipe. Its snake_case persistence mirror silently
+  deserialized both fields to `None`, so `irc.attention.open` always failed
+  with "attention subscription does not cover modelResumeResource"; a test
+  now pins the camelCase wire shape.
 - The network coordination MOTD is now owned and packaged by rmcp-irc as part
   of the IRC protocol contract. Attention onboarding distinguishes verified
   notification-backed, adapter-backed, and foreground-only operation. Returned

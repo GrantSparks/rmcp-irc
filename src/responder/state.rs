@@ -26,7 +26,12 @@ pub struct Cursor {
 }
 
 /// Subscription fields returned by `irc.attention.open`.
+///
+/// The gateway's `filterAddition` recipe and the `subscriptions/listen` wire
+/// shape are camelCase, so this persistence mirror must be too — snake_case
+/// field names would silently deserialize both fields to `None`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StoredSubscriptionFilter {
     /// Whether resource-list changes were accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,6 +334,29 @@ mod tests {
         assert!(
             error.to_string().contains("bound to workspace"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn subscription_filter_uses_the_gateway_camel_case_wire_shape() {
+        // Mirrors the exact filterAddition irc.attention.open returns.
+        let filter: StoredSubscriptionFilter = serde_json::from_value(serde_json::json!({
+            "resourcesListChanged": true,
+            "resourceSubscriptions": ["irc://watches/example", "irc://agents/a/status"]
+        }))
+        .expect("parse gateway filterAddition");
+        assert_eq!(filter.resources_list_changed, Some(true));
+        assert!(
+            filter
+                .resource_subscriptions
+                .as_deref()
+                .expect("subscribed URIs")
+                .contains(&"irc://watches/example".to_owned())
+        );
+        let round_trip = serde_json::to_value(&filter).expect("serialize filter");
+        assert_eq!(
+            round_trip["resourceSubscriptions"][0],
+            "irc://watches/example"
         );
     }
 
