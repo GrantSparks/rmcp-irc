@@ -15,8 +15,11 @@ use super::output::ReplyAction;
 
 /// Current on-disk state schema.
 pub const STATE_SCHEMA_VERSION: u32 = 2;
-/// Dynamic-tool registry installed in newly created App Server threads.
-pub const TOOL_REGISTRY_VERSION: u32 = 2;
+/// Contract baked into a newly created App Server thread — its dynamic-tool
+/// registry and its developer instructions. Both are fixed at thread creation,
+/// so bumping this retires an existing thread once and recreates it to pick up
+/// the current contract.
+pub const TOOL_REGISTRY_VERSION: u32 = 3;
 
 /// An MCP journal cursor kept opaque except for its stable wire fields.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

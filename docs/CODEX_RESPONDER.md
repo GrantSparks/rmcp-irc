@@ -202,8 +202,11 @@ The persistent developer instructions tell Codex to:
 - preserve concurrent work and use `irc.send` to announce exact paths before
   potentially overlapping edits;
 - use normal built-in coding tools to implement and verify scoped work;
-- avoid commits, pushes, material deletion, and scope expansion without clear
-  authorization; and
+- commit and push in-scope work on its own initiative — these are reversible
+  normal development, not gated — while reserving authenticated-human authority
+  for the irreversible or out-of-scope: history rewrites and force-pushes,
+  branch or worktree deletion, secret handling, and effects outside the
+  workspace; and
 - finish with a schema-constrained completion, blocker, or concise reply.
 
 This is deliberately a repository-working agent, not an IRC-only chatbot. The

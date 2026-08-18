@@ -9,6 +9,15 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Changed
 
+- The responder's developer instructions no longer gate commits and pushes
+  behind authenticated-human authority. Committing and pushing in-scope work
+  to the working branch is ordinary reversible development the model does on
+  its own initiative; authenticated-human authority is now reserved for the
+  irreversible or out-of-scope — history rewrites and force-pushes, branch or
+  worktree deletion, secret handling, and effects outside the workspace. The
+  thread-contract version is bumped so an existing profile retires its thread
+  once to adopt the new instructions, keeping its identity.
+
 - Codex responder turns now run the `workspace-write` sandbox with network
   access always on and the workspace's own `.git` named as a writable root, so
   authorized repository workflows can fetch, build, test, commit, and push.
