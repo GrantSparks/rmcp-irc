@@ -40,6 +40,13 @@ breaking changes to the CLI, configuration, or MCP surface.
   deserialized both fields to `None`, so `irc.attention.open` always failed
   with "attention subscription does not cover modelResumeResource"; a test
   now pins the camelCase wire shape.
+- Responder turn input is now delta-based: the MOTD and each channel topic
+  are sent only when they changed since the thread last saw them, and the
+  recent-history replay accompanies only the bootstrap turn. The persistent
+  thread already holds everything previously sent, so resending it on every
+  wake paid full input-token price for nothing; a restarted process resends
+  the full context once. History fetches are likewise skipped on non-bootstrap
+  turns.
 - Final turn replies whose text exceeds the 350-byte IRC line cap are now
   split at word boundaries into follow-on messages instead of rejected. The
   output schema's `maxLength` counts characters while the gate counts UTF-8
