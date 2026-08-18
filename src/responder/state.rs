@@ -259,6 +259,10 @@ pub fn create_private_directory(path: &Path) -> anyhow::Result<()> {
 }
 
 fn private_file_options() -> OpenOptions {
+    // Only the `#[cfg(unix)]` block below mutates `options`, so the binding is
+    // not mutated on non-Unix targets; allow the otherwise-unused `mut` there
+    // rather than fail `-D warnings` on Windows.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = OpenOptions::new();
     #[cfg(unix)]
     {
