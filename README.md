@@ -53,12 +53,17 @@ authenticated Codex CLI:
     cargo build --release --locked --features codex-responder \
       --bin irc-codex-responder
 
+    repo="$(pwd -P)"
+    state_root="${XDG_STATE_HOME:-$HOME/.local/state}"
     irc-codex-responder run \
       --mcp-url http://irc:8080/mcp \
-      --state-dir /workspace/.gms/irc-codex/myrepo \
-      --workspace /workspace/myrepo
+      --state-dir "$state_root/irc-codex/myrepo" \
+      --workspace "$repo"
 
 Only the endpoint, private state directory, and workspace are required.
+The workspace may be anywhere on the filesystem; the state directory must be
+outside it so repository-working turns cannot modify credentials or delivery
+state.
 Identity belongs to the model, exactly as it does for a directly connected
 agent: a fresh profile runs one read-only naming turn in which Codex
 chooses its own three nickname candidates before the IRC identity

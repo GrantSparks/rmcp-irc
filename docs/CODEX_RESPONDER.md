@@ -89,20 +89,23 @@ Run the binary in the same container that contains the repository and the
 authenticated Codex CLI:
 
 ```bash
+workspace="$(pwd -P)"
+state_root="${XDG_STATE_HOME:-$HOME/.local/state}"
 irc-codex-responder run \
   --mcp-url http://irc:8080/mcp \
-  --state-dir /workspace/.gms/irc-codex/rmcp-irc \
-  --workspace /workspace/rmcp-irc
+  --state-dir "$state_root/irc-codex/rmcp-irc" \
+  --workspace "$workspace"
 ```
 
 Only the endpoint, state directory, and workspace are required. The remaining
-options refine the defaults:
+options refine the defaults. No workspace path prefix is required; the private
+state directory must simply remain outside the workspace:
 
 ```bash
 irc-codex-responder run \
   --mcp-url http://irc:8080/mcp \
-  --state-dir /workspace/.gms/irc-codex/rmcp-irc \
-  --workspace /workspace/rmcp-irc \
+  --state-dir "$state_root/irc-codex/rmcp-irc" \
+  --workspace "$workspace" \
   --full-traffic-target '#rmcp-irc' \
   --allowed-channel '#rmcp-irc'
 ```
@@ -161,7 +164,7 @@ container:
 ```bash
 gms-irc-host responder \
   --container dev-api \
-  --workspace /workspace/rmcp-irc \
+  --workspace /srv/src/rmcp-irc \
   --profile rmcp-irc
 ```
 
@@ -170,7 +173,7 @@ Responder options after `--` refine the defaults above, for example:
 ```bash
 gms-irc-host responder \
   --container dev-api \
-  --workspace /workspace/rmcp-irc \
+  --workspace /srv/src/rmcp-irc \
   --profile rmcp-irc \
   -- \
   --full-traffic-target '#rmcp-irc' \
@@ -184,7 +187,7 @@ The host command:
 3. extracts the version-matched responder from the gateway image;
 4. copies it to a disposable path in the development container;
 5. runs it in the foreground with the internal MCP URL, validated workspace,
-   and `/workspace/.gms/irc-codex/<profile>` state; and
+   and private state outside that workspace; and
 6. removes the disposable executable after shutdown.
 
 Nothing is installed permanently on the Docker host or into the development
@@ -192,6 +195,14 @@ image. After a host launch, the process itself runs inside the development
 container, so App Server sees that container's repository, toolchain, Codex
 authentication, and filesystem. Re-run the same host command to reinstall the
 disposable binary and resume the same thread.
+
+The GMS launcher accepts repositories anywhere in the selected container. By
+default it keeps a fresh profile beside the repository's parent at
+`<workspace-parent>/.gms/irc-codex/<profile>`, falling back to the container's
+XDG/home state directory when necessary. It reuses profiles already stored at
+the legacy `/workspace/.gms/irc-codex/<profile>` path. Pass
+`--state-dir /absolute/container/path` before `--` when profile state belongs on
+a particular persistent mount.
 
 Use one foreground terminal and a distinct profile and workspace per
 concurrent coding identity; each names itself independently. The foreground
