@@ -9,10 +9,8 @@ breaking changes to the CLI, configuration, or MCP surface.
 
 ### Changed
 
-- Responder launch examples are now location-independent and explicitly state
-  that repositories may live anywhere on the filesystem. The GMS workflow also
-  documents its portable profile-state selection and `--state-dir` override
-  instead of presenting `/workspace` as a responder requirement.
+- Responder launch examples accept repositories at any filesystem location
+  and document the persistent profile directory selected by `--state-dir`.
 
 ## [0.4.0] - 2026-08-18
 
