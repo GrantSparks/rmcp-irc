@@ -38,8 +38,6 @@ durable outbox so the IRC cursor advances only after delivery.
 - An `irc-mcp` Streamable HTTP endpoint speaking MCP `2026-07-28`.
 - An existing writable repository or worktree for `--workspace`.
 - A private persistent state directory outside the selected workspace.
-- For GMS, a built gateway image and an explicit running development container
-  attached to the private IRC network.
 
 The implementation uses the stdio JSONL App Server API. Repository turns use
 the `workspace-write` sandbox with approval policy `never` and network access,
@@ -155,60 +153,18 @@ profile is permanently bound to both its first MCP endpoint and canonical
 workspace, preventing a persistent coding thread from being accidentally
 resumed against a different checkout.
 
-## GMS host workflow
+## Container deployment
 
-Run the launcher on the Docker host because only the host can extract the
-binary from the pinned image and copy it into the chosen development
-container:
+Run the version-matched responder in the development container that holds
+the selected repository, toolchain, and authenticated Codex CLI. Pass the
+gateway endpoint reachable from that container, the repository path through
+`--workspace`, and a persistent mount outside the workspace through
+`--state-dir`. Relaunch with the same state directory to resume the thread.
 
-```bash
-gms-irc-host responder \
-  --container dev-api \
-  --workspace /srv/src/rmcp-irc \
-  --profile rmcp-irc
-```
-
-Responder options after `--` refine the defaults above, for example:
-
-```bash
-gms-irc-host responder \
-  --container dev-api \
-  --workspace /srv/src/rmcp-irc \
-  --profile rmcp-irc \
-  -- \
-  --full-traffic-target '#rmcp-irc' \
-  --allowed-channel '#rmcp-irc'
-```
-
-The host command:
-
-1. verifies the pinned gateway and selected development container;
-2. canonicalizes the requested writable repository inside that container;
-3. extracts the version-matched responder from the gateway image;
-4. copies it to a disposable path in the development container;
-5. runs it in the foreground with the internal MCP URL, validated workspace,
-   and private state outside that workspace; and
-6. removes the disposable executable after shutdown.
-
-Nothing is installed permanently on the Docker host or into the development
-image. After a host launch, the process itself runs inside the development
-container, so App Server sees that container's repository, toolchain, Codex
-authentication, and filesystem. Re-run the same host command to reinstall the
-disposable binary and resume the same thread.
-
-The GMS launcher accepts repositories anywhere in the selected container. By
-default it keeps a fresh profile beside the repository's parent at
-`<workspace-parent>/.gms/irc-codex/<profile>`, falling back to the container's
-XDG/home state directory when necessary. It reuses profiles already stored at
-the legacy `/workspace/.gms/irc-codex/<profile>` path. Pass
-`--state-dir /absolute/container/path` before `--` when profile state belongs on
-a particular persistent mount.
-
-Use one foreground terminal and a distinct profile and workspace per
-concurrent coding identity; each names itself independently. The foreground
-lifecycle is intentional: Ctrl-C
-interrupts the turn, announces loss of continuous monitoring, closes the
-attention watch, disconnects IRC, and preserves the thread profile.
+Use a distinct workspace and state directory for each concurrent coding
+identity. Run the responder in the foreground. Ctrl-C interrupts the turn,
+announces loss of continuous monitoring, closes the attention watch, and
+disconnects IRC while preserving the thread profile.
 
 ## Coding and coordination contract
 
